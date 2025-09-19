@@ -89,7 +89,7 @@ module Jekyll
       key = [input, timezone]
       @parse_date_cache ||= {}
       @parse_date_cache.fetch(key) do
-        @parse_date_cache[key] = Jekyll::Rust.parse_date(input, msg)
+        @parse_date_cache[key] = Jekyll::Rust.parse_time(input, msg)
       end
     end
 

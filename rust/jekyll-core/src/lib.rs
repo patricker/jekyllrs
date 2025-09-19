@@ -1,5 +1,6 @@
 mod dates;
 mod document;
+mod document_reader;
 mod entry_filter;
 mod file_opts;
 mod liquid;
@@ -7,6 +8,8 @@ mod merge;
 mod path_manager;
 mod ruby_utils;
 mod slugify;
+mod static_file;
+mod time_utils;
 mod url;
 mod utils;
 mod yaml_header;
@@ -41,6 +44,9 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     url::define_into(&bridge)?;
     entry_filter::define_into(&bridge)?;
     document::define_into(&bridge)?;
+    document_reader::define_into(&bridge)?;
+    time_utils::define_into(&bridge)?;
+    static_file::define_into(&bridge)?;
 
     Ok(())
 }

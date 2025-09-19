@@ -134,7 +134,7 @@ fn glob_with_dir(ruby: &Ruby, dir: &str, pattern: &str, flags: i64) -> Result<Ve
     Ok(final_results)
 }
 
-fn pluralized_array_from_hash(
+pub(crate) fn pluralized_array_from_hash(
     hash: Value,
     singular_key: Value,
     plural_key: Value,

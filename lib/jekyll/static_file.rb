@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative "rust"
+
 module Jekyll
   class StaticFile
     extend Forwardable
@@ -123,7 +125,7 @@ module Jekyll
     # Generate "basename without extension" and strip away any trailing periods.
     # NOTE: `String#gsub` removes all trailing periods (in comparison to `String#chomp`)
     def basename
-      @basename ||= File.basename(name, extname).gsub(%r!\.*\z!, "")
+      @basename ||= Jekyll::Rust.static_file_basename(name, extname)
     end
 
     def placeholders
@@ -149,12 +151,11 @@ module Jekyll
     #
     # Returns the cleaned relative path of the static file.
     def cleaned_relative_path
-      @cleaned_relative_path ||= begin
-        cleaned = relative_path[0..-extname.length - 1]
-        cleaned.gsub!(%r!\.*\z!, "")
-        cleaned.sub!(@collection.relative_directory, "") if @collection
-        cleaned
-      end
+      @cleaned_relative_path ||= Jekyll::Rust.static_file_cleaned_relative_path(
+        relative_path,
+        extname,
+        @collection&.relative_directory
+      )
     end
 
     # Applies a similar URL-building technique as Jekyll::Document that takes

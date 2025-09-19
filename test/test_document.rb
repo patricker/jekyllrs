@@ -3,6 +3,30 @@
 require "helper"
 
 class TestDocument < JekyllUnitTest
+  should "compute title parts for dated paths" do
+    parts = Jekyll::Rust.document_title_parts(
+      "_posts/2018-10-12-trailing-dots...markdown",
+      "trailing-dots.."
+    )
+    assert_equal "trailing-dots", parts["slug"]
+    assert_equal ".markdown", parts["ext"]
+    assert_equal "2018-10-12", parts["date"]
+  end
+
+  should "compute title parts for dateless filenames" do
+    parts = Jekyll::Rust.document_title_parts("docs/guide.md", "guide")
+    assert_equal "guide", parts["slug"]
+    assert_equal ".md", parts["ext"]
+    assert_nil parts["date"]
+  end
+
+  should "fallback to basename when no extension is present" do
+    parts = Jekyll::Rust.document_title_parts("README", "README")
+    assert_equal "README", parts["slug"]
+    assert_nil parts["ext"]
+    assert_nil parts["date"]
+  end
+
   def assert_equal_value(key, one, other)
     assert_equal(one[key], other[key])
   end
@@ -156,8 +180,62 @@ class TestDocument < JekyllUnitTest
       assert_equal "methods", @document.to_liquid["collection"]
     end
 
+    should "populate slug and title without trailing dots" do
+      document = Document.new(
+        @site.in_source_dir("_methods/trailing-dots...md"),
+        :site       => @site,
+        :collection => @site.collections["methods"]
+      )
+
+      document.instance_eval { populate_title }
+
+      assert_equal "trailing-dots", document.data["slug"]
+      assert_equal "Trailing Dots", document.data["title"]
+      assert_equal ".md", document.data["ext"]
+    end
     should "output its relative path as path in Liquid" do
       assert_equal "_methods/configuration.md", @document.to_liquid["path"]
+    end
+
+    should "merge categories from data and singular keys" do
+      document = Document.new(
+        @site.in_source_dir("_methods/configuration.md"),
+        :site       => @site,
+        :collection => @site.collections["methods"]
+      )
+
+      document.data["categories"] = %w(existing news)
+      document.data["category"] = "news"
+      document.populate_categories
+
+      assert_equal(%w(existing news), document.data["categories"])
+    end
+
+    should "prefer singular tag when present" do
+      document = Document.new(
+        @site.in_source_dir("_methods/configuration.md"),
+        :site       => @site,
+        :collection => @site.collections["methods"]
+      )
+
+      document.data["tags"] = %w(build site)
+      document.data["tag"] = "jekyll"
+      document.populate_tags
+
+      assert_equal(["jekyll"], document.data["tags"])
+    end
+
+    should "flatten nested tag arrays" do
+      document = Document.new(
+        @site.in_source_dir("_methods/configuration.md"),
+        :site       => @site,
+        :collection => @site.collections["methods"]
+      )
+
+      document.data["tags"] = ["jekyll", ["site", "build"]]
+      document.populate_tags
+
+      assert_equal(%w(jekyll site build), document.data["tags"])
     end
 
     context "when rendered with Liquid" do

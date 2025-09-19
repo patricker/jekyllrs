@@ -40,6 +40,26 @@ module Jekyll
         Bridge.document_categories_from_path(relative_path, special_dir, basename)
       end
 
+      def document_populate_categories(data)
+        ensure_loaded!
+        Bridge.document_populate_categories(data)
+      end
+
+      def document_populate_tags(data)
+        ensure_loaded!
+        Bridge.document_populate_tags(data)
+      end
+
+      def document_title_parts(relative_path, basename_without_ext)
+        ensure_loaded!
+        Bridge.document_title_parts(relative_path, basename_without_ext)
+      end
+
+      def document_read(path, file_opts)
+        ensure_loaded!
+        Bridge.document_read(path, file_opts)
+      end
+
       def safe_glob(dir, patterns, flags)
         ensure_loaded!
         Bridge.safe_glob(dir, patterns, flags)
@@ -47,7 +67,22 @@ module Jekyll
 
       def parse_date(input, message = nil)
         ensure_loaded!
-        Bridge.parse_date(input, message)
+        Bridge.parse_time(input, message)
+      end
+
+      def parse_time(input, message = nil)
+        ensure_loaded!
+        Bridge.parse_time(input, message)
+      end
+
+      def static_file_basename(name, extname)
+        ensure_loaded!
+        Bridge.static_file_basename(name, extname)
+      end
+
+      def static_file_cleaned_relative_path(relative_path, extname, collection_dir)
+        ensure_loaded!
+        Bridge.static_file_cleaned_relative_path(relative_path, extname, collection_dir)
       end
 
       def deep_merge_hashes(master_hash, other_hash)

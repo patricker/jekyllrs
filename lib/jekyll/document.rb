@@ -424,20 +424,12 @@ module Jekyll
     end
 
     def populate_categories
-      categories = Array(data["categories"]) + Utils.pluralized_array_from_hash(
-        data, "category", "categories"
-      )
-      categories.map!(&:to_s)
-      categories.flatten!
-      categories.uniq!
-
+      categories = Jekyll::Rust.document_populate_categories(data)
       merge_data!({ "categories" => categories })
     end
 
     def populate_tags
-      tags = Utils.pluralized_array_from_hash(data, "tag", "tags")
-      tags.flatten!
-
+      tags = Jekyll::Rust.document_populate_tags(data)
       merge_data!({ "tags" => tags })
     end
 
@@ -468,12 +460,11 @@ module Jekyll
     end
 
     def read_content(**opts)
-      self.content = File.read(path, **Utils.merged_file_read_opts(site, opts))
-      if content =~ YAML_FRONT_MATTER_REGEXP
-        self.content = Regexp.last_match.post_match
-        data_file = SafeYAML.load(Regexp.last_match(1))
-        merge_data!(data_file, :source => "YAML front matter") if data_file
-      end
+      result = Jekyll::Rust.document_read(path, Utils.merged_file_read_opts(site, opts))
+      self.content = result["content"]
+
+      data_file = result["data"]
+      merge_data!(data_file, :source => "YAML front matter") if data_file
     end
 
     def read_post_data
@@ -496,26 +487,16 @@ module Jekyll
     end
 
     def populate_title
-      if relative_path =~ DATE_FILENAME_MATCHER
-        date, slug, ext = Regexp.last_match.captures
-        modify_date(date)
-      elsif relative_path =~ DATELESS_FILENAME_MATCHER
-        slug, ext = Regexp.last_match.captures
-      end
-      # `slug` will be nil for documents without an extension since the regex patterns
-      # above tests for an extension as well.
-      # In such cases, assign `basename_without_ext` as the slug.
-      slug ||= basename_without_ext
+      parts = Jekyll::Rust.document_title_parts(relative_path, basename_without_ext)
+      date = parts["date"]
+      modify_date(date) if date
 
-      # slugs shouldn't end with a period
-      # `String#gsub!` removes all trailing periods (in comparison to `String#chomp!`)
-      slug.gsub!(%r!\.*\z!, "")
+      slug = parts["slug"]
+      ext = parts["ext"]
 
-      # Try to ensure the user gets a title.
       data["title"] ||= Utils.titleize_slug(slug)
-      # Only overwrite slug & ext if they aren't specified.
-      data["slug"]  ||= slug
-      data["ext"]   ||= ext
+      data["slug"] ||= slug
+      data["ext"] ||= ext
     end
 
     def modify_date(date)
