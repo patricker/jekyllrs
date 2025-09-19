@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+(cd "$ROOT_DIR" && script/rust-build >/dev/null)
+
+export JEKYLL_RUST_LIB="$ROOT_DIR/rust/target/debug/libjekyll_core.so"
+
+cd "$ROOT_DIR"
+
+bundle exec cucumber "$@"

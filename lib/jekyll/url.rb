@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 # Public: Methods that generate a URL for a resource such as a Post or a Page.
+
+require_relative "rust"
 #
 # Examples
 #
@@ -58,7 +60,7 @@ module Jekyll
     #
     # Returns the unsanitized String URL
     def generate_url(template)
-      if @placeholders.is_a? Drops::UrlDrop
+      if @placeholders.is_a?(Drops::UrlDrop)
         generate_url_from_drop(template)
       else
         generate_url_from_hash(template)
@@ -66,16 +68,7 @@ module Jekyll
     end
 
     def generate_url_from_hash(template)
-      @placeholders.inject(template) do |result, token|
-        break result if result.index(":").nil?
-
-        if token.last.nil?
-          # Remove leading "/" to avoid generating urls with `//`
-          result.gsub("/:#{token.first}", "")
-        else
-          result.gsub(":#{token.first}", self.class.escape_path(token.last))
-        end
-      end
+      Jekyll::Rust.url_generate_from_hash(template, @placeholders)
     end
 
     # We include underscores in keys to allow for 'i_month' and so forth.
@@ -93,32 +86,13 @@ module Jekyll
     end
 
     def generate_url_from_drop(template)
-      template.gsub(%r!:([a-z_]+)!) do |match|
-        name = Regexp.last_match(1)
-        pool = name.end_with?("_") ? [name, name.chomp!("_")] : [name]
-
-        winner = pool.find { |key| @placeholders.key?(key) }
-        if winner.nil?
-          raise NoMethodError,
-                "The URL template doesn't have #{pool.join(" or ")} keys. " \
-                "Check your permalink template!"
-        end
-
-        value = @placeholders[winner]
-        value = "" if value.nil?
-        replacement = self.class.escape_path(value)
-
-        match.sub!(":#{winner}", replacement)
-      end
+      Jekyll::Rust.url_generate_from_drop(template, @placeholders)
     end
 
     # Returns a sanitized String URL, stripping "../../" and multiples of "/",
     # as well as the beginning "/" so we can enforce and ensure it.
     def sanitize_url(str)
-      "/#{str}".gsub("..", "/").tap do |result|
-        result.gsub!("./", "")
-        result.squeeze!("/")
-      end
+      Jekyll::Rust.sanitize_url(str.to_s)
     end
 
     # Escapes a path to be a valid URL path segment
@@ -132,25 +106,7 @@ module Jekyll
     #
     # Returns the escaped path.
     def self.escape_path(path)
-      return path if path.empty? || %r!^[a-zA-Z0-9./-]+$!.match?(path)
-
-      # Because URI.escape doesn't escape "?", "[" and "]" by default,
-      # specify unsafe string (except unreserved, sub-delims, ":", "@" and "/").
-      #
-      # URI path segment is defined in RFC 3986 as follows:
-      #   segment       = *pchar
-      #   pchar         = unreserved / pct-encoded / sub-delims / ":" / "@"
-      #   unreserved    = ALPHA / DIGIT / "-" / "." / "_" / "~"
-      #   pct-encoded   = "%" HEXDIG HEXDIG
-      #   sub-delims    = "!" / "$" / "&" / "'" / "(" / ")"
-      #                 / "*" / "+" / "," / ";" / "="
-      #
-      # `Addressable::URI::CharacterClassesRegexps::PATH` is used to encode
-      # non-alphanumeric characters such as "[", "]", etc.
-      Addressable::URI.encode_component(
-        path,
-        Addressable::URI::CharacterClassesRegexps::PATH
-      ).encode("utf-8").sub("#", "%23")
+      Jekyll::Rust.escape_path(path.to_s)
     end
 
     # Unescapes a URL path segment
@@ -167,7 +123,7 @@ module Jekyll
       path = path.encode("utf-8")
       return path unless path.include?("%")
 
-      Addressable::URI.unencode(path)
+      Jekyll::Rust.unescape_path(path)
     end
   end
 end

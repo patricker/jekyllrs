@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative "rust"
+
 module Jekyll
   # A singleton class that caches frozen instances of path strings returned from its methods.
   #
@@ -18,56 +20,17 @@ module Jekyll
 
     class << self
       # Wraps `File.join` to cache the frozen result.
-      # Reassigns `nil`, empty strings and empty arrays to a frozen empty string beforehand.
-      #
-      # Returns a frozen string.
+      # The heavy lifting is handled by the Rust implementation to minimise
+      # repeated allocations.
       def join(base, item)
-        base = "" if base.nil? || base.empty?
-        item = "" if item.nil? || item.empty?
-        @join ||= {}
-        @join[base] ||= {}
-        @join[base][item] ||= File.join(base, item).freeze
+        Jekyll::Rust.path_manager_join(base, item)
       end
 
-      # Ensures the questionable path is prefixed with the base directory
-      # and prepends the questionable path with the base directory if false.
-      #
-      # Returns a frozen string.
+      # Ensures the questionable path is prefixed with the base directory and
+      # returns a frozen string. Delegates to the Rust implementation for path
+      # normalisation and caching semantics.
       def sanitized_path(base_directory, questionable_path)
-        @sanitized_path ||= {}
-        @sanitized_path[base_directory] ||= {}
-        @sanitized_path[base_directory][questionable_path] ||= if questionable_path.nil?
-                                                                 base_directory.freeze
-                                                               else
-                                                                 sanitize_and_join(
-                                                                   base_directory, questionable_path
-                                                                 ).freeze
-                                                               end
-      end
-
-      private
-
-      def sanitize_and_join(base_directory, questionable_path)
-        clean_path = if questionable_path.start_with?("~")
-                       questionable_path.dup.insert(0, "/")
-                     else
-                       questionable_path
-                     end
-        clean_path = File.expand_path(clean_path, "/")
-        return clean_path if clean_path.eql?(base_directory)
-
-        # remove any remaining extra leading slashes not stripped away by calling
-        # `File.expand_path` above.
-        clean_path.squeeze!("/")
-        return clean_path if clean_path.start_with?(slashed_dir_cache(base_directory))
-
-        clean_path.sub!(%r!\A\w:/!, "/")
-        join(base_directory, clean_path)
-      end
-
-      def slashed_dir_cache(base_directory)
-        @slashed_dir_cache ||= {}
-        @slashed_dir_cache[base_directory] ||= base_directory.sub(%r!\z!, "/")
+        Jekyll::Rust.path_manager_sanitized_path(base_directory, questionable_path)
       end
     end
   end

@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative "rust"
+
 module Jekyll
   module Utils
     extend self
@@ -19,45 +21,31 @@ module Jekyll
 
     # Takes a slug and turns it into a simple title.
     def titleize_slug(slug)
-      slug.split("-").map!(&:capitalize).join(" ")
+      Jekyll::Rust.titleize_slug(slug)
     end
 
     # Non-destructive version of deep_merge_hashes! See that method.
     #
     # Returns the merged hashes.
-    def deep_merge_hashes(master_hash, other_hash)
-      deep_merge_hashes!(master_hash.dup, other_hash)
-    end
-
-    # Merges a master hash with another hash, recursively.
-    #
-    # master_hash - the "parent" hash whose values will be overridden
-    # other_hash  - the other hash whose values will be persisted after the merge
-    #
-    # This code was lovingly stolen from some random gem:
-    # http://gemjack.com/gems/tartan-0.1.1/classes/Hash.html
-    #
-    # Thanks to whoever made it.
-    def deep_merge_hashes!(target, overwrite)
-      merge_values(target, overwrite)
-      merge_default_proc(target, overwrite)
-      duplicate_frozen_values(target)
-
-      target
-    end
-
     def mergable?(value)
-      value.is_a?(Hash) || value.is_a?(Drops::Drop)
+      Jekyll::Rust.mergable?(value)
     end
 
     def duplicable?(obj)
-      case obj
-      when nil, false, true, Symbol, Numeric
-        false
-      else
-        true
-      end
+      Jekyll::Rust.duplicable?(obj)
     end
+
+    def deep_merge_hashes(master_hash, other_hash)
+      Jekyll::Rust.deep_merge_hashes(master_hash, other_hash)
+    end
+
+    # Merges a master hash with another hash, recursively.
+    # target - the "parent" hash whose values will be overridden
+    # overwrite - the other hash whose values will be persisted after the merge
+    def deep_merge_hashes!(target, overwrite)
+      Jekyll::Rust.deep_merge_hashes_bang(target, overwrite)
+    end
+
 
     # Read array from the supplied hash favouring the singular key
     # and then the plural key, and handling any nil entries.
@@ -68,38 +56,7 @@ module Jekyll
     #
     # Returns an array
     def pluralized_array_from_hash(hash, singular_key, plural_key)
-      array = []
-      value = value_from_singular_key(hash, singular_key)
-      value ||= value_from_plural_key(hash, plural_key)
-
-      array << value
-      array.flatten!
-      array.compact!
-      array
-    end
-
-    def value_from_singular_key(hash, key)
-      hash[key] if hash.key?(key) || (hash.default_proc && hash[key])
-    end
-
-    def value_from_plural_key(hash, key)
-      if hash.key?(key) || (hash.default_proc && hash[key])
-        val = hash[key]
-        case val
-        when String
-          val.split
-        when Array
-          val.compact
-        end
-      end
-    end
-
-    def transform_keys(hash)
-      result = {}
-      hash.each_key do |key|
-        result[yield(key)] = hash[key]
-      end
-      result
+      Jekyll::Rust.pluralized_array_from_hash(hash, singular_key, plural_key)
     end
 
     # Apply #to_sym to all keys in the hash
@@ -108,7 +65,7 @@ module Jekyll
     #
     # Returns a new hash with symbolized keys
     def symbolize_hash_keys(hash)
-      transform_keys(hash) { |key| key.to_sym rescue key }
+      Jekyll::Rust.symbolize_hash_keys(hash)
     end
 
     # Apply #to_s to all keys in the Hash
@@ -117,7 +74,7 @@ module Jekyll
     #
     # Returns a new hash with stringified keys
     def stringify_hash_keys(hash)
-      transform_keys(hash) { |key| key.to_s rescue key }
+      Jekyll::Rust.stringify_hash_keys(hash)
     end
 
     # Parse a date/time and throw an error if invalid
@@ -128,10 +85,12 @@ module Jekyll
     # Returns the parsed date if successful, throws a FatalException
     # if not
     def parse_date(input, msg = "Input could not be parsed.")
+      timezone = ENV["TZ"]
+      key = [input, timezone]
       @parse_date_cache ||= {}
-      @parse_date_cache[input] ||= Time.parse(input).localtime
-    rescue ArgumentError
-      raise Errors::InvalidDateError, "Invalid date '#{input}': #{msg}"
+      @parse_date_cache.fetch(key) do
+        @parse_date_cache[key] = Jekyll::Rust.parse_date(input, msg)
+      end
     end
 
     # Determines whether a given file has
@@ -139,18 +98,14 @@ module Jekyll
     # Returns true if the YAML front matter is present.
     # rubocop: disable Naming/PredicateName
     def has_yaml_header?(file)
-      File.open(file, "rb", &:readline).match? %r!\A---\s*\r?\n!
-    rescue EOFError
-      false
+      Jekyll::Rust.has_yaml_header?(file)
     end
 
     # Determine whether the given content string contains Liquid Tags or Variables
     #
     # Returns true is the string contains sequences of `{%` or `{{`
     def has_liquid_construct?(content)
-      return false if content.nil? || content.empty?
-
-      content.include?("{%") || content.include?("{{")
+      Jekyll::Rust.has_liquid_construct?(content)
     end
     # rubocop: enable Naming/PredicateName
 
@@ -200,27 +155,9 @@ module Jekyll
     #
     # Returns the slugified string.
     def slugify(string, mode: nil, cased: false)
-      mode ||= "default"
       return nil if string.nil?
 
-      unless SLUGIFY_MODES.include?(mode)
-        return cased ? string : string.downcase
-      end
-
-      # Drop accent marks from latin characters. Everything else turns to ?
-      if mode == "latin"
-        I18n.config.available_locales = :en if I18n.config.available_locales.empty?
-        string = I18n.transliterate(string)
-      end
-
-      slug = replace_character_sequence_with_hyphen(string, :mode => mode)
-
-      # Remove leading/trailing hyphen
-      slug.gsub!(%r!^-|-$!i, "")
-
-      slug.downcase! unless cased
-      Jekyll.logger.warn("Warning:", "Empty `slug` generated for '#{string}'.") if slug.empty?
-      slug
+      Jekyll::Rust.slugify(string, mode, cased)
     end
 
     # Add an appropriate suffix to template so that it matches the specified
@@ -251,19 +188,7 @@ module Jekyll
     #
     # Returns the updated permalink template
     def add_permalink_suffix(template, permalink_style)
-      template = template.dup
-
-      case permalink_style
-      when :pretty
-        template << "/"
-      when :date, :ordinal, :none
-        template << ":output_ext"
-      else
-        template << "/" if permalink_style.to_s.end_with?("/")
-        template << ":output_ext" if permalink_style.to_s.end_with?(":output_ext")
-      end
-
-      template
+      Jekyll::Rust.add_permalink_suffix(template, permalink_style)
     end
 
     # Work the same way as Dir.glob but separating the input into two parts
@@ -292,55 +217,16 @@ module Jekyll
     def safe_glob(dir, patterns, flags = 0)
       return [] unless Dir.exist?(dir)
 
-      pattern = File.join(Array(patterns))
-      return [dir] if pattern.empty?
-
-      Dir.chdir(dir) do
-        Dir.glob(pattern, flags).map { |f| File.join(dir, f) }
-      end
+      Jekyll::Rust.safe_glob(dir, patterns, flags)
     end
 
     # Returns merged option hash for File.read of self.site (if exists)
     # and a given param
     def merged_file_read_opts(site, opts)
-      merged = (site ? site.file_read_opts : {}).merge(opts)
-
-      # always use BOM when reading UTF-encoded files
-      if merged[:encoding]&.downcase&.start_with?("utf-")
-        merged[:encoding] = "bom|#{merged[:encoding]}"
-      end
-      if merged["encoding"]&.downcase&.start_with?("utf-")
-        merged["encoding"] = "bom|#{merged["encoding"]}"
-      end
-
-      merged
+      Jekyll::Rust.merged_file_read_opts(site, opts)
     end
 
     private
-
-    def merge_values(target, overwrite)
-      target.merge!(overwrite) do |_key, old_val, new_val|
-        if new_val.nil?
-          old_val
-        elsif mergable?(old_val) && mergable?(new_val)
-          deep_merge_hashes(old_val, new_val)
-        else
-          new_val
-        end
-      end
-    end
-
-    def merge_default_proc(target, overwrite)
-      if target.is_a?(Hash) && overwrite.is_a?(Hash) && target.default_proc.nil?
-        target.default_proc = overwrite.default_proc
-      end
-    end
-
-    def duplicate_frozen_values(target)
-      target.each do |key, val|
-        target[key] = val.dup if val.frozen? && duplicable?(val)
-      end
-    end
 
     # Replace each character sequence with a hyphen.
     #

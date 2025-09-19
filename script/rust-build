@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PROFILE=${RUST_PROFILE:-debug}
+
+pushd "$REPO_ROOT/rust" > /dev/null
+if [[ "$PROFILE" == "release" ]]; then
+  cargo build --locked --release
+  PROFILE_DIR=release
+else
+  cargo build --locked
+  PROFILE_DIR=debug
+fi
+popd > /dev/null
+
+LIB_NAME="libjekyll_core"
+LIB_PATH="$REPO_ROOT/rust/target/$PROFILE_DIR/$LIB_NAME.so"
+
+if [[ ! -f "$LIB_PATH" ]]; then
+  echo "error: expected $LIB_PATH to exist" >&2
+  exit 1
+fi
+
+echo "Rust build complete. Export this before running Ruby tests:"
+echo "  export JEKYLL_RUST_LIB=$LIB_PATH"

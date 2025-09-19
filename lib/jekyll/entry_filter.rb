@@ -29,26 +29,10 @@ module Jekyll
     end
 
     def filter(entries)
-      entries.reject do |e|
-        # Reject this entry if it is just a "dot" representation.
-        #   e.g.: '.', '..', '_movies/.', 'music/..', etc
-        next true if e.end_with?(".")
-
-        # Check if the current entry is explicitly included and cache the result
-        included = included?(e)
-
-        # Reject current entry if it is excluded but not explicitly included as well.
-        next true if excluded?(e) && !included
-
-        # Reject current entry if it is a symlink.
-        next true if symlink?(e)
-
-        # Do not reject current entry if it is explicitly included.
-        next false if included
-
-        # Reject current entry if it is special or a backup file.
-        special?(e) || backup?(e)
-      end
+      Array(Jekyll::Rust.entry_filter(site, entries, base_directory))
+    rescue StandardError => e
+      Jekyll.logger.debug "EntryFilter:", "Rust filter failed (#{e.message}); falling back" if Jekyll.logger
+      filter_with_ruby(entries)
     end
 
     def included?(entry)
@@ -111,6 +95,22 @@ module Jekyll
         else
           false
         end
+      end
+    end
+
+    private
+
+    def filter_with_ruby(entries)
+      entries.reject do |e|
+        next true if e.end_with?(".")
+
+        included = included?(e)
+
+        next true if excluded?(e) && !included
+        next true if symlink?(e)
+        next false if included
+
+        special?(e) || backup?(e)
       end
     end
   end

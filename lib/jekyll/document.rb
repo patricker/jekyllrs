@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative "rust"
+
 module Jekyll
   class Document
     include Comparable
@@ -16,18 +18,6 @@ module Jekyll
 
     SASS_FILE_EXTS = %w(.sass .scss).freeze
     YAML_FILE_EXTS = %w(.yaml .yml).freeze
-
-    #
-
-    # Class-wide cache to stash and retrieve regexp to detect "super-directories"
-    # of a particular Jekyll::Document object.
-    #
-    # dirname - The *special directory* for the Document.
-    #           e.g. "_posts" or "_drafts" for Documents from the `site.posts` collection.
-    def self.superdirs_regex(dirname)
-      @superdirs_regex ||= {}
-      @superdirs_regex[dirname] ||= %r!#{dirname}.*!
-    end
 
     #
 
@@ -123,14 +113,14 @@ module Jekyll
     #
     # Returns the basename without the file extname.
     def basename_without_ext
-      @basename_without_ext ||= File.basename(path, ".*")
+      @basename_without_ext ||= Jekyll::Rust.document_basename_without_ext(path)
     end
 
     # The base filename of the document.
     #
     # Returns the base filename of the document.
     def basename
-      @basename ||= File.basename(path)
+      @basename ||= Jekyll::Rust.document_basename(path)
     end
 
     def renderer
@@ -151,10 +141,11 @@ module Jekyll
     #
     # Returns the cleaned relative path of the document.
     def cleaned_relative_path
-      @cleaned_relative_path ||=
-        relative_path[0..-extname.length - 1]
-          .sub(collection.relative_directory, "")
-          .gsub(%r!\.*\z!, "")
+      @cleaned_relative_path ||= Jekyll::Rust.document_cleaned_relative_path(
+        relative_path,
+        extname,
+        collection.relative_directory
+      )
     end
 
     # Determine whether the document is a YAML file.
@@ -424,15 +415,12 @@ module Jekyll
     #
     # Returns nothing.
     def categories_from_path(special_dir)
-      if relative_path.start_with?(special_dir)
-        superdirs = []
-      else
-        superdirs = relative_path.sub(Document.superdirs_regex(special_dir), "")
-        superdirs = superdirs.split(File::SEPARATOR)
-        superdirs.reject! { |c| c.empty? || c == special_dir || c == basename }
-      end
-
-      merge_data!({ "categories" => superdirs }, :source => "file path")
+      categories = Jekyll::Rust.document_categories_from_path(
+        relative_path,
+        special_dir,
+        basename
+      )
+      merge_data!({ "categories" => categories }, :source => "file path")
     end
 
     def populate_categories
