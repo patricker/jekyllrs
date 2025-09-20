@@ -39,17 +39,8 @@ module Jekyll
     #
     # Returns a Set with the file paths
     def existing_files
-      files = Set.new
-      regex = keep_file_regex
-      dirs = keep_dirs
-
-      Utils.safe_glob(site.in_dest_dir, ["**", "*"], File::FNM_DOTMATCH).each do |file|
-        next if HIDDEN_FILE_REGEX.match?(file) || regex.match?(file) || dirs.include?(file)
-
-        files << file
-      end
-
-      files
+      files = Jekyll::Rust.cleaner_existing_files(site.in_dest_dir, site.keep_files)
+      files.to_set
     end
 
     # Private: The list of files to be created when site is built.

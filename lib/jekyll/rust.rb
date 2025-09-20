@@ -205,6 +205,24 @@ module Jekyll
         Bridge.has_yaml_header?(path)
       end
 
+      # Front matter defaults helpers
+      def frontmatter_applies_path(path, scope_path, site_source, collections_dir)
+        ensure_loaded!
+        Bridge.frontmatter_applies_path(path, scope_path, site_source, collections_dir)
+      end
+
+      def frontmatter_has_precedence(old_scope, new_scope)
+        ensure_loaded!
+        Bridge.frontmatter_has_precedence(old_scope, new_scope)
+      end
+
+      # Cleaner helpers
+      def cleaner_existing_files(site_dest, keep_files)
+        ensure_loaded!
+        Bridge.cleaner_existing_files(site_dest, keep_files)
+      end
+
+
       private
 
       def ensure_loaded!

@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative "rust"
+
 module Jekyll
   # This class handles custom defaults for YAML frontmatter settings.
   # These are set in _config.yml and apply both to internal use (e.g. layout)
@@ -103,16 +105,12 @@ module Jekyll
     end
 
     def applies_path?(scope, path)
-      rel_scope_path = scope["path"]
-      return true if !rel_scope_path.is_a?(String) || rel_scope_path.empty?
-
-      sanitized_path = sanitize_path(path)
-
-      if rel_scope_path.include?("*")
-        glob_scope(sanitized_path, rel_scope_path)
-      else
-        path_is_subpath?(sanitized_path, strip_collections_dir(rel_scope_path))
-      end
+      Jekyll::Rust.frontmatter_applies_path(
+        path,
+        scope["path"],
+        @site.source,
+        @site.config["collections_dir"] || ""
+      )
     end
 
     def glob_scope(sanitized_path, rel_scope_path)
@@ -177,18 +175,7 @@ module Jekyll
     # Returns true if the new scope has precedence over the older
     # rubocop: disable Naming/PredicateName
     def has_precedence?(old_scope, new_scope)
-      return true if old_scope.nil?
-
-      new_path = sanitize_path(new_scope["path"])
-      old_path = sanitize_path(old_scope["path"])
-
-      if new_path.length != old_path.length
-        new_path.length >= old_path.length
-      elsif new_scope.key?("type")
-        true
-      else
-        !old_scope.key? "type"
-      end
+      Jekyll::Rust.frontmatter_has_precedence(old_scope, new_scope)
     end
     # rubocop: enable Naming/PredicateName
 

@@ -9,6 +9,8 @@ mod path_manager;
 mod ruby_utils;
 mod slugify;
 mod static_file;
+mod frontmatter;
+mod cleaner;
 mod time_utils;
 mod url;
 mod utils;
@@ -47,6 +49,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     document_reader::define_into(&bridge)?;
     time_utils::define_into(&bridge)?;
     static_file::define_into(&bridge)?;
+    frontmatter::define_into(&bridge)?;
+    cleaner::define_into(&bridge)?;
 
     Ok(())
 }

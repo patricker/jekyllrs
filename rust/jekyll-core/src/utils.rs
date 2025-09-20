@@ -430,4 +430,34 @@ mod tests {
             )
         );
     }
+
+
+    #[test]
+    fn add_permalink_suffix_handles_nil_and_unknown_symbol() {
+        // Internal helper expects parsed style; simulate by calling internal with Other("")
+        assert_eq!(
+            "/:basename",
+            add_permalink_suffix_internal("/:basename", PermalinkStyle::Other(String::new()))
+        );
+
+        // Unknown symbol becomes a string via to_s and should not modify template
+        assert_eq!(
+            "/:basename",
+            add_permalink_suffix_internal(
+                "/:basename",
+                PermalinkStyle::Other("foo".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn add_permalink_suffix_handles_extra_trailing_slashes_in_style() {
+        assert_eq!(
+            "/:basename/",
+            add_permalink_suffix_internal(
+                "/:basename",
+                PermalinkStyle::Other("/:title///".to_string())
+            )
+        );
+    }
 }
