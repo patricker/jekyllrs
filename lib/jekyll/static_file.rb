@@ -15,10 +15,11 @@ module Jekyll
     class << self
       # The cache of last modification times [path] -> mtime.
       def mtimes
-        @mtimes ||= {}
+        @mtimes ||= Jekyll::Rust.static_file_mtimes_snapshot
       end
 
       def reset_cache
+        Jekyll::Rust.static_file_mtimes_reset
         @mtimes = nil
       end
     end
@@ -62,11 +63,7 @@ module Jekyll
     end
 
     def destination_rel_dir
-      if @collection
-        File.dirname(url)
-      else
-        @dir
-      end
+      Jekyll::Rust.static_file_destination_rel_dir(url, @dir, !@collection.nil?)
     end
 
     def modified_time
@@ -82,7 +79,10 @@ module Jekyll
     #
     # Returns true if modified since last write.
     def modified?
-      self.class.mtimes[path] != mtime
+      stored = Jekyll::Rust.static_file_mtime_get(path)
+      return true if stored.nil?
+
+      stored != mtime
     end
 
     # Whether to write the file to the filesystem
@@ -105,13 +105,17 @@ module Jekyll
       dest_path = destination(dest)
       return false if File.exist?(dest_path) && !modified?
 
-      self.class.mtimes[path] = mtime
+      current_mtime = mtime
+      Jekyll::Rust.static_file_mtime_set(path, current_mtime)
+      self.class.mtimes[path] = current_mtime
 
-      FileUtils.mkdir_p(File.dirname(dest_path))
-      FileUtils.rm(dest_path) if File.exist?(dest_path)
-      copy_file(dest_path)
-
-      true
+      Jekyll::Rust.static_file_write(
+        path,
+        dest_path,
+        current_mtime,
+        @site.safe,
+        Jekyll.env == "production"
+      )
     end
 
     def data
@@ -189,16 +193,5 @@ module Jekyll
 
     private
 
-    def copy_file(dest_path)
-      if @site.safe || Jekyll.env == "production"
-        FileUtils.cp(path, dest_path)
-      else
-        FileUtils.copy_entry(path, dest_path)
-      end
-
-      unless File.symlink?(dest_path)
-        File.utime(self.class.mtimes[path], self.class.mtimes[path], dest_path)
-      end
-    end
   end
 end

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "helper"
+require "date"
 
 class TestUtils < JekyllUnitTest
   context "The `Utils.deep_merge_hashes` method" do
@@ -92,6 +93,34 @@ class TestUtils < JekyllUnitTest
   context "The `Utils.parse_date` method" do
     should "parse a properly formatted date" do
       assert_kind_of Time, Utils.parse_date("2014-08-02 14:43:06 PDT")
+    end
+
+    should "parse ISO8601 dates without time" do
+      with_env("TZ", "UTC") do
+        time = Utils.parse_date("2015-10-03")
+        assert_equal Time.new(2015, 10, 3, 0, 0, 0, 0), time
+      end
+    end
+
+    should "parse ISO8601 timestamps with numeric offsets" do
+      with_env("TZ", "UTC") do
+        time = Utils.parse_date("2015-10-03 10:20:30 +02:00")
+        assert_equal Time.new(2015, 10, 3, 8, 20, 30, 0), time
+      end
+    end
+
+    should "parse timestamps with timezone abbreviations" do
+      with_env("TZ", "UTC") do
+        time = Utils.parse_date("2015-10-03 10:20:30 PST")
+        assert_equal Time.new(2015, 10, 3, 18, 20, 30, 0), time
+      end
+    end
+
+    should "accept Date objects" do
+      with_env("TZ", "UTC") do
+        time = Utils.parse_date(Date.new(2015, 10, 3))
+        assert_equal Time.new(2015, 10, 3, 0, 0, 0, 0), time
+      end
     end
 
     should "throw an error if the input contains no date data" do

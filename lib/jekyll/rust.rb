@@ -85,6 +85,36 @@ module Jekyll
         Bridge.static_file_cleaned_relative_path(relative_path, extname, collection_dir)
       end
 
+      def static_file_write(src_path, dest_path, mtime, safe, production)
+        ensure_loaded!
+        Bridge.static_file_write(src_path, dest_path, mtime, safe, production)
+      end
+
+      def static_file_destination_rel_dir(url, dir, has_collection)
+        ensure_loaded!
+        Bridge.static_file_destination_rel_dir(url, dir, has_collection)
+      end
+
+      def static_file_mtime_get(path)
+        ensure_loaded!
+        Bridge.static_file_mtime_get(path)
+      end
+
+      def static_file_mtime_set(path, mtime)
+        ensure_loaded!
+        Bridge.static_file_mtime_set(path, mtime)
+      end
+
+      def static_file_mtimes_reset
+        ensure_loaded!
+        Bridge.static_file_mtimes_reset
+      end
+
+      def static_file_mtimes_snapshot
+        ensure_loaded!
+        Bridge.static_file_mtimes_snapshot
+      end
+
       def deep_merge_hashes(master_hash, other_hash)
         ensure_loaded!
         Bridge.deep_merge_hashes(master_hash, other_hash)
