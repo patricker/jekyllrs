@@ -27,6 +27,7 @@ pub fn define_into(bridge: &RModule) -> Result<(), Error> {
         function!(document_populate_tags, 1),
     )?;
     bridge.define_singleton_method("document_title_parts", function!(document_title_parts, 2))?;
+    bridge.define_singleton_method("document_metadata", function!(document_metadata, 3))?;
     Ok(())
 }
 
@@ -435,4 +436,41 @@ mod tests {
         assert!(ext.is_none());
         assert!(date.is_none());
     }
+}
+
+
+fn document_metadata(
+    path: String,
+    relative_path: String,
+    special_dir: String,
+) -> Result<Value, Error> {
+    let ruby = ruby_handle()?;
+    let basename = document_basename(path.clone());
+    let basename_wo = document_basename_without_ext(path.clone());
+    let TitleParts { slug, ext, date } = title_parts(&relative_path, &basename_wo);
+    let categories = categories_from_path(&relative_path, &special_dir, &basename);
+
+    let hash = ruby.hash_new();
+    hash.aset(ruby.str_new("basename"), ruby.str_new(&basename))?;
+    hash.aset(
+        ruby.str_new("basename_without_ext"),
+        ruby.str_new(&basename_wo),
+    )?;
+    hash.aset(ruby.str_new("slug"), ruby.str_new(&slug))?;
+    match ext {
+        Some(ext) => hash.aset(ruby.str_new("ext"), ruby.str_new(&ext))?,
+        None => hash.aset(ruby.str_new("ext"), ruby.qnil())?,
+    }
+    match date {
+        Some(date) => hash.aset(ruby.str_new("date"), ruby.str_new(&date))?,
+        None => hash.aset(ruby.str_new("date"), ruby.qnil())?,
+    }
+
+    let array = ruby.ary_new_capa(categories.len());
+    for c in categories {
+        array.push(c)?;
+    }
+    hash.aset(ruby.str_new("categories"), array)?;
+
+    Ok(hash.into_value_with(&ruby))
 }

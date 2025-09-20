@@ -11,10 +11,14 @@ mod slugify;
 mod static_file;
 mod frontmatter;
 mod cleaner;
+mod theme_reader;
+mod regenerator_io;
 mod time_utils;
 mod url;
 mod utils;
 mod yaml_header;
+mod engine;
+mod cli_build;
 
 use magnus::{prelude::*, Error, RModule, Ruby};
 
@@ -51,6 +55,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     static_file::define_into(&bridge)?;
     frontmatter::define_into(&bridge)?;
     cleaner::define_into(&bridge)?;
+    theme_reader::define_into(&bridge)?;
+    regenerator_io::define_into(&bridge)?;
+    engine::define_into(&bridge)?;
+    cli_build::define_into(&bridge)?;
 
     Ok(())
 }

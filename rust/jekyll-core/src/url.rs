@@ -21,6 +21,14 @@ pub fn define_into(bridge: &RModule) -> Result<(), Error> {
         "url_generate_from_drop",
         function!(url_generate_from_drop, 2),
     )?;
+    bridge.define_singleton_method(
+        "url_filters_strip_index",
+        function!(url_filters_strip_index, 1),
+    )?;
+    bridge.define_singleton_method(
+        "url_filters_join_relative",
+        function!(url_filters_join_relative, 2),
+    )?;
     Ok(())
 }
 
@@ -315,6 +323,58 @@ fn apply_replacement(matched: &str, key: &str, escaped: &str) -> Result<String, 
         Ok(replaced)
     } else {
         Ok(escaped.to_string())
+    }
+}
+
+
+fn url_filters_strip_index(input: Value) -> Result<Value, Error> {
+    let ruby = ruby_handle()?;
+    if input.is_nil() {
+        return Ok(ruby.qnil().into_value_with(&ruby));
+    }
+    let s = input.funcall::<_, _, RString>("to_s", ())?.to_string()?;
+    let out = if s.ends_with("/index.html") {
+        let mut base = s;
+        let new_len = base.len() - "/index.html".len();
+        base.truncate(new_len);
+        base.push('/');
+        base
+    } else if s.ends_with("/index.htm") {
+        let mut base = s;
+        let new_len = base.len() - "/index.htm".len();
+        base.truncate(new_len);
+        base.push('/');
+        base
+    } else {
+        s
+    };
+    Ok(ruby.str_new(&out).into_value_with(&ruby))
+}
+
+fn url_filters_join_relative(baseurl: Value, input: Value) -> Result<Value, Error> {
+    let ruby = ruby_handle()?;
+    // baseurl: nil => ""
+    let mut base = if baseurl.is_nil() {
+        String::new()
+    } else {
+        baseurl.funcall::<_, _, RString>("to_s", ())?.to_string()?
+    };
+    // chomp a single trailing '/'
+
+    let inp = input.funcall::<_, _, RString>("to_s", ())?.to_string()?;
+
+    let joined = ensure_leading_slash(&base) + &ensure_leading_slash(&inp);
+    Ok(ruby.str_new(&joined).into_value_with(&ruby))
+}
+
+fn ensure_leading_slash(s: &str) -> String {
+    if s.is_empty() || s.starts_with('/') {
+        s.to_string()
+    } else {
+        let mut out = String::with_capacity(s.len() + 1);
+        out.push('/');
+        out.push_str(s);
+        out
     }
 }
 

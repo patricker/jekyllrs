@@ -27,6 +27,8 @@ pub fn define_into(bridge: &RModule) -> Result<(), Error> {
     bridge.define_singleton_method("duplicable?", function!(duplicable, 1))?;
     bridge.define_singleton_method("titleize_slug", function!(titleize_slug, 1))?;
     bridge.define_singleton_method("add_permalink_suffix", function!(add_permalink_suffix, 2))?;
+    bridge.define_singleton_method("normalize_whitespace", function!(normalize_whitespace, 1))?;
+    bridge.define_singleton_method("number_of_words", function!(number_of_words, 2))?;
     Ok(())
 }
 
@@ -372,6 +374,53 @@ fn add_permalink_suffix_internal(template: &str, style: PermalinkStyle) -> Strin
         }
     }
     updated
+}
+
+
+fn normalize_whitespace(input: Value) -> Result<Value, Error> {
+    let ruby = ruby_handle()?;
+    let s = input.funcall::<_, _, RString>("to_s", ())?.to_string()?;
+    let mut out = String::with_capacity(s.len());
+    let mut in_ws = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !in_ws {
+                out.push(' ');
+                in_ws = true;
+            }
+        } else {
+            out.push(ch);
+            in_ws = false;
+        }
+    }
+    let trimmed = out.trim().to_string();
+    Ok(ruby.str_new(&trimmed).into_value_with(&ruby))
+}
+
+fn number_of_words(input: Value, mode: Option<Value>) -> Result<Value, Error> {
+    let ruby = ruby_handle()?;
+    let s = input.funcall::<_, _, RString>("to_s", ())?.to_string()?;
+    let use_cjk = match mode {
+        Some(v) => {
+            if v.is_nil() { false } else { true }
+        }
+        None => false,
+    };
+
+    if use_cjk {
+        let cjk_re = regex::Regex::new(r"[\p{Han}\p{Katakana}\p{Hiragana}\p{Hangul}]").unwrap();
+        let word_re = regex::Regex::new(r"[^\p{Han}\p{Katakana}\p{Hiragana}\p{Hangul}\s]+").unwrap();
+        let cjk_count = cjk_re.find_iter(&s).count();
+        let count = if cjk_count == 0 {
+            s.split_whitespace().count()
+        } else {
+            cjk_count + word_re.find_iter(&s).count()
+        };
+        Ok((count as i64).into_value_with(&ruby))
+    } else {
+        let count = s.split_whitespace().count();
+        Ok((count as i64).into_value_with(&ruby))
+    }
 }
 
 #[cfg(test)]

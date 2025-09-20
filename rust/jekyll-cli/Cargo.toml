@@ -1,0 +1,11 @@
+[package]
+name = "jekyll-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "jekyllrs"
+path = "src/main.rs"
+
+[dependencies]
+magnus = { version = "0.6", features = ["embed"] }

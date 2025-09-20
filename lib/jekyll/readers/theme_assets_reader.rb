@@ -11,9 +11,7 @@ module Jekyll
     def read
       return unless site.theme&.assets_path
 
-      Find.find(site.theme.assets_path) do |path|
-        next if File.directory?(path)
-
+      Jekyll::Rust.theme_assets_list(site.theme.assets_path).each do |path|
         if File.symlink?(path)
           Jekyll.logger.warn "Theme reader:", "Ignored symlinked asset: #{path}"
         else

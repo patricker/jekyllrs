@@ -74,7 +74,7 @@ module Jekyll
     #
     # returns a boolean
     def source_modified_or_dest_missing?(source_path, dest_path)
-      modified?(source_path) || (dest_path && !File.exist?(dest_path))
+      Jekyll::Rust.regenerator_source_modified_or_dest_missing(self, source_path, dest_path)
     end
 
     # Checks if a path's (or one of its dependencies)
@@ -117,10 +117,7 @@ module Jekyll
     #
     # Returns nothing.
     def write_metadata
-      unless disabled?
-        Jekyll.logger.debug "Writing Metadata:", ".jekyll-metadata"
-        File.binwrite(metadata_file, Marshal.dump(metadata))
-      end
+      Jekyll::Rust.regenerator_write_metadata(metadata_file, metadata, disabled?)
     end
 
     # Produce the absolute path of the metadata file
@@ -145,21 +142,7 @@ module Jekyll
     #
     # Returns the read metadata.
     def read_metadata
-      @metadata =
-        if !disabled? && File.file?(metadata_file)
-          content = File.binread(metadata_file)
-
-          begin
-            Marshal.load(content)
-          rescue TypeError
-            SafeYAML.load(content)
-          rescue ArgumentError => e
-            Jekyll.logger.warn("Failed to load #{metadata_file}: #{e}")
-            {}
-          end
-        else
-          {}
-        end
+      @metadata = Jekyll::Rust.regenerator_read_metadata(metadata_file, disabled?)
     end
 
     def regenerate_page?(document)
@@ -177,19 +160,7 @@ module Jekyll
     end
 
     def existing_file_modified?(path)
-      # If one of this file dependencies have been modified,
-      # set the regeneration bit for both the dependency and the file to true
-      metadata[path]["deps"].each do |dependency|
-        return cache[dependency] = cache[path] = true if modified?(dependency)
-      end
-
-      if File.exist?(path) && metadata[path]["mtime"].eql?(File.mtime(path))
-        # If this file has not been modified, set the regeneration bit to false
-        cache[path] = false
-      else
-        # If it has been modified, set it to true
-        add(path)
-      end
+      Jekyll::Rust.regenerator_existing_file_modified(self, path)
     end
   end
 end

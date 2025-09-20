@@ -116,8 +116,17 @@ module Jekyll
 
         partial = load_cached_partial(path, context)
 
-        context.stack do
-          context["include"] = parse_params(context) if @params
+        # Include output cache keyed by include path, page identity, and params
+        cache = (context.registers[:include_output_cache] ||= {})
+        include_vars = @params ? parse_params(context) : {}
+        cache_key = include_output_cache_key(context, path, include_vars)
+
+        if cache.key?(cache_key)
+          return cache[cache_key]
+        end
+
+        output = context.stack do
+          context["include"] = include_vars unless include_vars.empty?
           begin
             partial.render!(context)
           rescue Liquid::Error => e
@@ -126,6 +135,8 @@ module Jekyll
             raise e
           end
         end
+        cache[cache_key] = output
+        output
       end
 
       def add_include_to_dependency(site, path, context)
@@ -187,6 +198,22 @@ module Jekyll
                     ", if it is a symlink, does not point outside your site source."
                   end
       end
+
+      def include_output_cache_key(context, path, include_vars)
+        page = context.registers[:page]
+        site = context.registers[:site]
+        page_key = if page&.key?("path")
+                     if page["collection"]
+                       site.in_source_dir(site.config["collections_dir"], page["path"])
+                     else
+                       site.in_source_dir(page["path"])
+                     end
+                   else
+                     "__no_page__"
+                   end
+        params_key = include_vars.sort_by { |k, _| k.to_s }.map { |k, v| "#{k}=#{v}" }.join("&")
+        "#{path}|#{page_key}|#{params_key}"
+      end
     end
 
     # Do not inherit from this class.
@@ -246,6 +273,22 @@ module Jekyll
 
         @site.regenerator.add_dependency(absolute_path, inclusion.path)
       end
+
+      def include_output_cache_key(context, path, include_vars)
+        page = context.registers[:page]
+        site = context.registers[:site]
+        page_key = if page&.key?("path")
+                     if page["collection"]
+                       site.in_source_dir(site.config["collections_dir"], page["path"])
+                     else
+                       site.in_source_dir(page["path"])
+                     end
+                   else
+                     "__no_page__"
+                   end
+        params_key = include_vars.sort_by { |k, _| k.to_s }.map { |k, v| "#{k}=#{v}" }.join("&")
+        "#{path}|#{page_key}|#{params_key}"
+      end
     end
 
     class IncludeRelativeTag < IncludeTag
@@ -282,6 +325,22 @@ module Jekyll
         e.template_name = path
         e.markup_context = "included " if e.markup_context.nil?
         raise e
+      end
+
+      def include_output_cache_key(context, path, include_vars)
+        page = context.registers[:page]
+        site = context.registers[:site]
+        page_key = if page&.key?("path")
+                     if page["collection"]
+                       site.in_source_dir(site.config["collections_dir"], page["path"])
+                     else
+                       site.in_source_dir(page["path"])
+                     end
+                   else
+                     "__no_page__"
+                   end
+        params_key = include_vars.sort_by { |k, _| k.to_s }.map { |k, v| "#{k}=#{v}" }.join("&")
+        "#{path}|#{page_key}|#{params_key}"
       end
     end
   end

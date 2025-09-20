@@ -54,6 +54,11 @@ module Jekyll
         ensure_loaded!
         Bridge.document_title_parts(relative_path, basename_without_ext)
       end
+      def document_metadata(path, relative_path, special_dir)
+        ensure_loaded!
+        Bridge.document_metadata(path, relative_path, special_dir)
+      end
+
 
       def document_read(path, file_opts)
         ensure_loaded!
@@ -94,6 +99,11 @@ module Jekyll
         ensure_loaded!
         Bridge.static_file_destination_rel_dir(url, dir, has_collection)
       end
+      def static_file_write_batch(jobs, safe, production)
+        ensure_loaded!
+        Bridge.static_file_write_batch(jobs, safe, production)
+      end
+
 
       def static_file_mtime_get(path)
         ensure_loaded!
@@ -190,6 +200,30 @@ module Jekyll
         Bridge.url_generate_from_drop(template, drop)
       end
 
+      # Engine entrypoint
+      def engine_build_site(site)
+        ensure_loaded!
+        Bridge.engine_build_site(site)
+      end
+
+      def engine_build_process(options)
+        ensure_loaded!
+        Bridge.engine_build_process(options)
+      end
+
+
+      # URL filters helpers
+      def url_filters_strip_index(input)
+        ensure_loaded!
+        Bridge.url_filters_strip_index(input)
+      end
+
+      def url_filters_join_relative(baseurl, input)
+        ensure_loaded!
+        Bridge.url_filters_join_relative(baseurl, input)
+      end
+
+
       def entry_filter(site, entries, base_directory)
         ensure_loaded!
         Bridge.entry_filter(site, entries, base_directory)
@@ -222,7 +256,48 @@ module Jekyll
         Bridge.cleaner_existing_files(site_dest, keep_files)
       end
 
+      # Theme assets reader helpers
+      def theme_assets_list(root)
+        ensure_loaded!
+        Bridge.theme_assets_list(root)
+      end
 
+
+
+
+      # Regenerator IO helpers
+      def regenerator_read_metadata(metadata_file, disabled)
+        ensure_loaded!
+        Bridge.regenerator_read_metadata(metadata_file, disabled)
+      end
+
+      def regenerator_write_metadata(metadata_file, metadata, disabled)
+        ensure_loaded!
+        Bridge.regenerator_write_metadata(metadata_file, metadata, disabled)
+      end
+
+
+      def regenerator_existing_file_modified(this_obj, path)
+        ensure_loaded!
+        Bridge.regenerator_existing_file_modified(this_obj, path)
+      end
+
+
+      def regenerator_source_modified_or_dest_missing(this_obj, source_path, dest_path)
+        ensure_loaded!
+        Bridge.regenerator_source_modified_or_dest_missing(this_obj, source_path, dest_path)
+      end
+
+
+      def normalize_whitespace(input)
+        ensure_loaded!
+        Bridge.normalize_whitespace(input)
+      end
+
+      def number_of_words(input, mode = nil)
+        ensure_loaded!
+        Bridge.number_of_words(input, mode)
+      end
       private
 
       def ensure_loaded!

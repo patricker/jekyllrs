@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative "../rust"
+
 module Jekyll
   module Filters
     module URLFilters
@@ -52,7 +54,7 @@ module Jekyll
       def strip_index(input)
         return if input.nil? || input.to_s.empty?
 
-        input.sub(%r!/index\.html?$!, "/")
+        Jekyll::Rust.url_filters_strip_index(input)
       end
 
       private
@@ -76,7 +78,7 @@ module Jekyll
 
         parts = [sanitized_baseurl, input]
         Addressable::URI.parse(
-          parts.map! { |part| ensure_leading_slash(part.to_s) }.join
+          Jekyll::Rust.url_filters_join_relative(sanitized_baseurl, input)
         ).normalize.to_s
       end
 

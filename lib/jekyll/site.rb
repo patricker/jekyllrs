@@ -227,9 +227,32 @@ module Jekyll
     # Returns nothing.
     def write
       Jekyll::Commands::Doctor.conflicting_urls(self)
+
+      # Batch copy static files in parallel via Rust
+      static_to_write = []
+      static_jobs = []
+      static_files.each do |file|
+        next unless file.write?
+        next unless regenerator.regenerate?(file)
+
+        dest_path = file.destination(dest)
+        current_mtime = file.mtime
+        Jekyll::Rust.static_file_mtime_set(file.path, current_mtime)
+        Jekyll::StaticFile.mtimes[file.path] = current_mtime
+        static_jobs << [file.path, dest_path, current_mtime]
+        static_to_write << file
+      end
+
+      unless static_jobs.empty?
+        Jekyll::Rust.static_file_write_batch(static_jobs, safe, Jekyll.env == "production")
+      end
+
+      # Write remaining items (pages, docs, and any static files not batched)
       each_site_file do |item|
+        next if item.is_a?(Jekyll::StaticFile) && static_to_write.include?(item)
         item.write(dest) if regenerator.regenerate?(item)
       end
+
       regenerator.write_metadata
       Jekyll::Hooks.trigger :site, :post_write, self
       nil

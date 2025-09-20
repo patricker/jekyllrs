@@ -1,3 +1,3 @@
 [workspace]
-members = ["jekyll-core"]
+members = ["jekyll-core", "jekyll-cli"]
 resolver = "2"

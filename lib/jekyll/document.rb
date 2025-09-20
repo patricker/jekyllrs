@@ -38,10 +38,22 @@ module Jekyll
 
       @has_yaml_header = nil
 
-      if draft?
-        categories_from_path("_drafts")
-      else
-        categories_from_path(collection.relative_directory)
+      special_dir = draft? ? "_drafts" : collection.relative_directory
+      begin
+        meta = Jekyll::Rust.document_metadata(path, relative_path, special_dir)
+        @basename = meta["basename"]
+        @basename_without_ext = meta["basename_without_ext"]
+        @__rust_slug = meta["slug"]
+        @__rust_ext = meta["ext"]
+        @__rust_date = meta["date"]
+        cats = meta["categories"]
+        merge_data!({ "categories" => cats }, :source => "file path") if cats
+      rescue StandardError
+        if draft?
+          categories_from_path("_drafts")
+        else
+          categories_from_path(collection.relative_directory)
+        end
       end
 
       data.default_proc = proc do |_, key|
@@ -487,16 +499,21 @@ module Jekyll
     end
 
     def populate_title
-      parts = Jekyll::Rust.document_title_parts(relative_path, basename_without_ext)
-      date = parts["date"]
-      modify_date(date) if date
-
-      slug = parts["slug"]
-      ext = parts["ext"]
-
-      data["title"] ||= Utils.titleize_slug(slug)
-      data["slug"] ||= slug
-      data["ext"] ||= ext
+      if defined?(@__rust_slug) && @__rust_slug
+        modify_date(@__rust_date) if @__rust_date
+        data["title"] ||= Utils.titleize_slug(@__rust_slug)
+        data["slug"] ||= @__rust_slug
+        data["ext"] ||= @__rust_ext
+      else
+        parts = Jekyll::Rust.document_title_parts(relative_path, basename_without_ext)
+        date = parts["date"]
+        modify_date(date) if date
+        slug = parts["slug"]
+        ext = parts["ext"]
+        data["title"] ||= Utils.titleize_slug(slug)
+        data["slug"] ||= slug
+        data["ext"] ||= ext
+      end
     end
 
     def modify_date(date)

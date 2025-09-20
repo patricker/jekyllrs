@@ -1,5 +1,9 @@
 use magnus::{function, prelude::*, Error, RModule, RString, Ruby, Value};
-use std::path::{Path, PathBuf};
+use once_cell::sync::Lazy;
+use magnus::IntoValue;
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Mutex;
 
 use crate::ruby_utils::ruby_handle;
 
@@ -14,6 +18,9 @@ pub fn define_into(bridge: &RModule) -> Result<(), Error> {
     )?;
     Ok(())
 }
+
+// Cache for globbed absolute scope paths -> Vec<String>
+static GLOB_CACHE: Lazy<Mutex<HashMap<String, Vec<String>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 fn frontmatter_applies_path(
     path: RString,
@@ -45,9 +52,20 @@ fn frontmatter_applies_path(
         let abs_scope_path = Path::new(&site_source).join(rel_scope_path);
         let abs_scope_str = abs_scope_path.to_string_lossy().to_string();
 
-        let dir_module: Value = ruby.class_object().const_get("Dir")?;
-        let glob_value: Value = dir_module.funcall("glob", (ruby.str_new(&abs_scope_str),))?;
-        let entries = Vec::<String>::try_convert(glob_value).unwrap_or_default();
+        let entries = {
+            let cache = GLOB_CACHE.lock().expect("glob cache poisoned");
+            cache.get(&abs_scope_str).cloned()
+        }
+        .unwrap_or_else(|| {
+            let dir_module: Value = ruby.class_object().const_get("Dir").unwrap();
+            let glob_value: Value = dir_module
+                .funcall("glob", (ruby.str_new(&abs_scope_str),))
+                .unwrap_or_else(|_| ruby.ary_new().into_value_with(&ruby));
+            let entries = Vec::<String>::try_convert(glob_value).unwrap_or_default();
+            let mut cache = GLOB_CACHE.lock().expect("glob cache poisoned");
+            cache.insert(abs_scope_str.clone(), entries.clone());
+            entries
+        });
 
         for entry in entries {
             // Compute path relative to site_source

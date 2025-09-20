@@ -113,7 +113,7 @@ module Jekyll
     #
     # Returns the formatted String
     def normalize_whitespace(input)
-      input.to_s.gsub(%r!\s+!, " ").tap(&:strip!)
+      Jekyll::Rust.normalize_whitespace(input)
     end
 
     # Count the number of words in the input string.
@@ -122,6 +122,7 @@ module Jekyll
     #
     # Returns the Integer word count.
     def number_of_words(input, mode = nil)
+      return Jekyll::Rust.number_of_words(input, mode)
       cjk_charset = '\p{Han}\p{Katakana}\p{Hiragana}\p{Hangul}'
       cjk_regex = %r![#{cjk_charset}]!o
       word_regex = %r![^#{cjk_charset}\s]+!o

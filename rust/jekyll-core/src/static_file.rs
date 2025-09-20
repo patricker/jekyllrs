@@ -27,6 +27,10 @@ pub fn define_into(bridge: &RModule) -> Result<(), Error> {
         "static_file_mtimes_snapshot",
         function!(static_file_mtimes_snapshot, 0),
     )?;
+    bridge.define_singleton_method(
+        "static_file_write_batch",
+        function!(static_file_write_batch, 3),
+    )?;
     Ok(())
 }
 
@@ -107,7 +111,7 @@ fn perform_copy(
     dest: &str,
     mtime: i64,
     _safe: bool,
-    _production: bool,
+    production: bool,
 ) -> Result<(), Error> {
     let dest_path = Path::new(dest);
 
@@ -126,6 +130,13 @@ fn perform_copy(
     }
 
     fs::copy(src, dest_path).map_err(|err| io_error(ruby, dest, &err))?;
+
+    if production {
+        if let Ok(src_meta) = std::fs::metadata(src) {
+            let perms = src_meta.permissions();
+            let _ = std::fs::set_permissions(dest_path, perms);
+        }
+    }
 
     apply_times(ruby, dest, mtime)?;
     Ok(())
@@ -203,6 +214,71 @@ fn io_error(ruby: &Ruby, path: &str, err: &io::Error) -> Error {
         .const_get("IOError")
         .expect("IOError constant");
     Error::new(error_class, format!("Error handling '{}': {}", path, err))
+}
+
+
+fn simple_copy(src: &str, dest: &str, production: bool) -> io::Result<()> {
+    let dest_path = Path::new(dest);
+    if let Some(parent) = dest_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::remove_file(dest_path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) if err.kind() == io::ErrorKind::IsADirectory => {
+            fs::remove_dir_all(dest_path)?;
+        }
+        Err(err) => return Err(err),
+    }
+    fs::copy(src, dest_path)?;
+    if production {
+        if let Ok(meta) = fs::metadata(src) {
+            let _ = fs::set_permissions(dest_path, meta.permissions());
+        }
+    }
+    Ok(())
+}
+
+fn static_file_write_batch(jobs: Value, _safe: bool, production: bool) -> Result<bool, Error> {
+    let ruby = ruby_handle()?;
+    let mut list: Vec<(String, String, i64)> = Vec::new();
+
+    if let Some(ary) = magnus::RArray::from_value(jobs) {
+        for elem in ary.each() {
+            let elem = elem?;
+            let job = magnus::RArray::from_value(elem)
+                .ok_or_else(|| Error::new(ruby.exception_type_error(), "job must be an array"))?;
+            let src: String = String::try_convert(job.entry(0)?)?;
+            let dest: String = String::try_convert(job.entry(1)?)?;
+            let mtime: i64 = i64::try_convert(job.entry(2)?).unwrap_or(0);
+            list.push((src, dest, mtime));
+        }
+    } else {
+        return Err(Error::new(
+            ruby.exception_type_error(),
+            "jobs must be an array of [src, dest, mtime]",
+        ));
+    }
+
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let chunk_size = (list.len() / threads).max(1);
+    let mut handles = Vec::new();
+    for chunk in list.chunks(chunk_size) {
+        let jobs = chunk.to_owned();
+        let prod = production;
+        let handle = std::thread::spawn(move || {
+            for (src, dest, _mtime) in jobs {
+                let _ = simple_copy(&src, &dest, prod);
+            }
+        });
+        handles.push(handle);
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
