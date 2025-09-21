@@ -1,4 +1,4 @@
-use magnus::{function, prelude::*, Error, IntoValue, RArray, RHash, RModule, Ruby, Value};
+use magnus::{function, prelude::*, Error, IntoValue, RArray, RHash, RModule, Value};
 
 use crate::ruby_utils::ruby_handle;
 
@@ -152,7 +152,7 @@ fn regenerator_source_modified_or_dest_missing(
     dest_path: Value,
 ) -> Result<bool, Error> {
     let ruby = ruby_handle()?;
-    let mut source_changed = false;
+    let source_changed: bool;
     if source_path.is_nil() {
         source_changed = true;
     } else {

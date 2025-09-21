@@ -1,4 +1,4 @@
-use magnus::{function, prelude::*, Error, RModule, Ruby, Value};
+use magnus::{function, prelude::*, Error, RModule, Value, IntoValue, TryConvert};
 
 use crate::ruby_utils::ruby_handle;
 
@@ -18,7 +18,7 @@ fn rb_expand_path(path: Value) -> Result<String, Error> {
     let ruby = ruby_handle()?;
     let file: Value = ruby.class_object().const_get("File")?;
     let exp: Value = file.funcall("expand_path", (path,))?;
-    exp.try_convert()
+    String::try_convert(exp)
 }
 
 fn engine_build_site_with_profile(site: Value, profile_enabled: bool) -> Result<(), Error> {
@@ -88,11 +88,25 @@ fn engine_build_process(options: Value) -> Result<(), Error> {
 
     // Watch handling
     // When invoked from `serve`, skip watch handling and logs; Serve manages it.
-    let serving = fetch_bool(config, "serving", false)?;
+    let serving = fetch_bool(options, "serving", false)?;
     let detach = fetch_bool(config, "detach", false)?;
     let watch = fetch_bool(config, "watch", false)?;
     if serving {
-        // Skip watch handling entirely; Serve manages regeneration.
+        if watch {
+            let external: RModule = jekyll.const_get("External")?;
+            let _: Value = external.funcall("require_with_graceful_fail", ("jekyll-watch",))?;
+            let _watcher: RModule = jekyll.const_get("Watcher")?;
+            let thread_class: Value = ruby.class_object().const_get("Thread")?;
+            // Spawn watcher in a Ruby thread so server can start. Pass (config, site) as args.
+            let block = ruby.proc_from_fn(|args: &[Value], _block: Option<magnus::block::Proc>| {
+                let ruby = crate::ruby_utils::ruby_handle()?;
+                let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
+                let watcher: RModule = jekyll.const_get("Watcher")?;
+                let _: Value = watcher.funcall("watch", (args[0], args[1]))?;
+                Ok(ruby.qnil().into_value_with(&ruby))
+            });
+            let _t: Value = thread_class.funcall_with_block("new", (config, site), block)?;
+        }
     } else if detach {
         let _: Value = logger.funcall(
             "info",

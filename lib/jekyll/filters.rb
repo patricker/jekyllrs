@@ -324,6 +324,17 @@ module Jekyll
                                "'#{nils}' is not a valid nils order. It must be 'first' or 'last'."
         end
 
+        # Try Rust fast-path for simple Array<Hash> + flat property
+        if Jekyll::Rust.respond_to?(:sort_filter_fast) &&
+           input.is_a?(Array) && input.all? { |e| e.is_a?(Hash) } && !property.to_s.include?(".")
+          begin
+            fast = Jekyll::Rust.sort_filter_fast(input, property, nils)
+            return fast if fast.is_a?(Array)
+          rescue StandardError
+            # ignore and fall back
+          end
+        end
+
         sort_input(input, property, order)
       end
     end

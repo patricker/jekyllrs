@@ -1,4 +1,4 @@
-use magnus::{function, prelude::*, Error, RModule, Ruby, Value, IntoValue};
+use magnus::{function, prelude::*, Error, RModule, Value, IntoValue};
 
 use crate::ruby_utils::ruby_handle;
 
@@ -16,7 +16,6 @@ fn rb_join(a: Value, b: Value) -> Result<Value, Error> {
 fn engine_clean_process(options: Value) -> Result<(), Error> {
     let ruby = ruby_handle()?;
     let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
-    let logger: Value = jekyll.funcall("logger", ())?;
 
     // Resolve configuration from options
     let command: Value = jekyll.const_get("Command")?;

@@ -354,7 +354,7 @@ fn url_filters_strip_index(input: Value) -> Result<Value, Error> {
 fn url_filters_join_relative(baseurl: Value, input: Value) -> Result<Value, Error> {
     let ruby = ruby_handle()?;
     // baseurl: nil => ""
-    let mut base = if baseurl.is_nil() {
+    let base = if baseurl.is_nil() {
         String::new()
     } else {
         baseurl.funcall::<_, _, RString>("to_s", ())?.to_string()?

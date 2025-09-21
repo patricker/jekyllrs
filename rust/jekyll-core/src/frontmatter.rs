@@ -1,4 +1,4 @@
-use magnus::{function, prelude::*, Error, RModule, RString, Ruby, Value};
+use magnus::{function, prelude::*, Error, RModule, RString, Value};
 use once_cell::sync::Lazy;
 use magnus::IntoValue;
 use std::collections::HashMap;

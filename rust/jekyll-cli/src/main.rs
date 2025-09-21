@@ -291,6 +291,7 @@ fn print_help_serve() {
     println!("    -H, --host [HOST]              Host to bind to");
     println!("    -P, --port [PORT]              Port to listen on");
     println!("    -o, --open-url                 Launch your site in a browser");
+    println!("        --no-open-url              Do not open a browser");
     println!("    -B, --detach                   Run the server in the background");
     println!("    -l, --livereload               Use LiveReload to automatically refresh browsers");
     println!("        --livereload-ignore GLOBS  Files for LiveReload to ignore (comma-separated)");
@@ -307,7 +308,7 @@ fn run_serve(args: &[String], trace: bool) -> Result<(), Error> {
     eval::<Value>("require 'jekyll'")?;
     let _ = eval::<Value>("STDOUT.sync = true; STDERR.sync = true");
 
-    let mut options = parse_serve_args(args)?;
+    let options = parse_serve_args(args)?;
     if options.aref::<_, Value>("serving")?.is_nil() { options.aset("serving", true)?; }
     if options.aref::<_, Value>("watch")?.is_nil() { options.aset("watch", true)?; }
 
@@ -352,6 +353,7 @@ fn parse_serve_args(args: &[String]) -> Result<RHash, Error> {
                 }
             }
             "-o" | "--open-url" => { hash.aset("open_url", true)?; }
+            "--no-open-url" => { hash.aset("open_url", false)?; }
             "-B" | "--detach" => { hash.aset("detach", true)?; }
             "-l" | "--livereload" => { hash.aset("livereload", true)?; }
             "--livereload-ignore" => {

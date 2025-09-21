@@ -308,6 +308,11 @@ module Jekyll
         Bridge.where_filter_fast(input, property, target)
       end
 
+      def sort_filter_fast(input, property, nils)
+        ensure_loaded!
+        Bridge.sort_filter_fast(input, property, nils)
+      end
+
       private
 
       def ensure_loaded!

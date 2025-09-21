@@ -30,6 +30,7 @@ pub fn define_into(bridge: &RModule) -> Result<(), Error> {
     bridge.define_singleton_method("normalize_whitespace", function!(normalize_whitespace, 1))?;
     bridge.define_singleton_method("number_of_words", function!(number_of_words, 2))?;
     bridge.define_singleton_method("where_filter_fast", function!(where_filter_fast2, 3))?;
+    bridge.define_singleton_method("sort_filter_fast", function!(sort_filter_fast, 3))?;
     Ok(())
 }
 
@@ -541,6 +542,94 @@ fn where_filter_fast2(input: Value, property: Value, target: Value) -> Result<Va
         } else {
             return Ok(ruby.qnil().into_value_with(&ruby));
         }
+    }
+    Ok(out.into_value_with(&ruby))
+}
+
+
+#[derive(Debug, Clone)]
+enum SortKey {
+    Num(f64),
+    Str(String),
+}
+
+fn parse_sort_key(val: Value) -> Option<SortKey> {
+    if let Ok(n) = f64::try_convert(val) {
+        return Some(SortKey::Num(n));
+    }
+    if let Some(rs) = RString::from_value(val) {
+        if let Ok(s0) = rs.to_string() {
+            let st = s0.trim();
+            static INT_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+                regex::Regex::new(r"^\s*-?\d+\s*$").unwrap()
+            });
+            static FLOAT_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+                regex::Regex::new(r"^\s*-?(?:\d+\.?\d*|\.\d+)\s*$").unwrap()
+            });
+            if INT_RE.is_match(&s0) {
+                if let Ok(i) = st.parse::<f64>() { return Some(SortKey::Num(i)); }
+            }
+            if FLOAT_RE.is_match(&s0) {
+                if let Ok(f) = st.parse::<f64>() { return Some(SortKey::Num(f)); }
+            }
+            return Some(SortKey::Str(s0));
+        }
+    }
+    None
+}
+
+fn sort_filter_fast(input: Value, property: Value, nils: Value) -> Result<Value, Error> {
+    let ruby = ruby_handle()?;
+    let arr = match RArray::from_value(input) {
+        Some(a) => a,
+        None => return Ok(ruby.qnil().into_value_with(&ruby)),
+    };
+    let prop_rs: RString = property.funcall("to_s", ())?;
+    let prop = prop_rs.to_string()?;
+    if prop.contains('.') {
+        return Ok(ruby.qnil().into_value_with(&ruby));
+    }
+    let nils_s: String = nils.funcall::<_, _, RString>("to_s", ())?.to_string()?;
+    let order = match nils_s.as_str() {
+        "first" => -1,
+        "last" => 1,
+        _ => -1,
+    };
+    let key_sym = ruby.to_symbol(&prop);
+    let key_str = ruby.str_new(&prop);
+
+    let len: i64 = i64::try_convert(arr.funcall("length", ())?)?;
+    let mut items: Vec<(Option<SortKey>, Value)> = Vec::with_capacity(len as usize);
+    for i in 0..len {
+        let obj: Value = arr.funcall("[]", (i,))?;
+        if let Some(h) = RHash::from_value(obj) {
+            let mut v: Value = h.funcall("[]", (key_sym,))?;
+            if v.is_nil() { v = h.funcall("[]", (key_str,))?; }
+            let key = if v.is_nil() { None } else { parse_sort_key(v) };
+            if !v.is_nil() && key.is_none() {
+                return Ok(ruby.qnil().into_value_with(&ruby));
+            }
+            items.push((key, obj));
+        } else {
+            return Ok(ruby.qnil().into_value_with(&ruby));
+        }
+    }
+    items.sort_unstable_by(|a, b| {
+        match (&a.0, &b.0) {
+            (Some(_), None) => if order < 0 { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater },
+            (None, Some(_)) => if order < 0 { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less },
+            (None, None) => std::cmp::Ordering::Equal,
+            (Some(ka), Some(kb)) => match (ka, kb) {
+                (SortKey::Num(x), SortKey::Num(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+                (SortKey::Str(sa), SortKey::Str(sb)) => sa.cmp(sb),
+                (SortKey::Num(x), SortKey::Str(sb)) => x.to_string().cmp(sb),
+                (SortKey::Str(sa), SortKey::Num(y)) => sa.cmp(&y.to_string()),
+            },
+        }
+    });
+    let out = ruby.ary_new();
+    for (_, obj) in items.into_iter() {
+        out.push(obj).unwrap();
     }
     Ok(out.into_value_with(&ruby))
 }

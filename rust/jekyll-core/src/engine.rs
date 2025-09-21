@@ -1,4 +1,4 @@
-use magnus::{function, prelude::*, Error, RModule, Ruby, Value};
+use magnus::{function, prelude::*, Error, RModule, Value};
 
 use crate::ruby_utils::ruby_handle;
 
