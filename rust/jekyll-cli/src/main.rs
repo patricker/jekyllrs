@@ -44,6 +44,7 @@ fn print_help_global() {
     println!("\nSubcommands:");
     println!("  build    Build your site");
     println!("  clean    Clean the site output and metadata");
+    println!("  serve    Serve your site locally");
 }
 
 fn print_help_build() {
@@ -78,14 +79,24 @@ fn run_build(args: &[String], trace: bool) -> Result<(), Error> {
     let options = parse_build_args(args)?;
 
     let jekyll: RModule = eval("Jekyll")?;
-    let command_mod: Value = jekyll.const_get("Command")?;
-    let cmd: Value = if trace {
-        eval("o = Object.new; def o.trace; true; end; def o.name; 'build'; end; o")?
-    } else {
-        eval("o = Object.new; def o.trace; false; end; def o.name; 'build'; end; o")?
-    };
-    let build_klass: Value = eval("Jekyll::Commands::Build")?;
-    let _: Value = command_mod.funcall("process_with_graceful_fail", (cmd, options, build_klass))?;
+    let rust_mod: RModule = jekyll.const_get("Rust")?;
+    let res = rust_mod.funcall::<_,_,Value>("engine_build_process", (options,));
+    match res {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if trace { return Err(e); }
+            let _ = eval::<Value>(r#"
+              msg = " Please append `--trace` to the `build` command "
+              dashes = "-" * msg.length
+              Jekyll.logger.error "", dashes
+              Jekyll.logger.error "Jekyll #{Jekyll::VERSION} ", msg
+              Jekyll.logger.error "", " for any additional information or backtrace. "
+              Jekyll.logger.abort_with "", dashes
+            "#);
+            // Return original error to signal failure
+            Err(e)
+        }
+    }?;
     Ok(())
 }
 
@@ -127,8 +138,17 @@ fn run_core(argv: Vec<String>) -> Result<(), Error> {
                 Ok(())
             }
         }
-                other => {
-            eprintln!("unsupported subcommand: {} (currently only 'build')", other);
+        "serve" | "s" | "server" => {
+            if args.iter().any(|a| a == "-h" || a == "--help" || a == "help") {
+                print_help_serve();
+                Ok(())
+            } else {
+                run_serve(&args, trace)
+            }
+        }
+        other => {
+
+            eprintln!("unsupported subcommand: {} (supported: build|clean|serve)", other);
             Err(Error::new(exception::arg_error(), "unsupported subcommand"))
         }
     }
@@ -193,6 +213,7 @@ fn parse_build_args(args: &[String]) -> Result<RHash, Error> {
             "--profile" => { hash.aset("profile", true)?; }
             "--incremental" => { hash.aset("incremental", true)?; }
             "--watch" => { hash.aset("watch", true)?; }
+            "--no-watch" => { hash.aset("watch", false)?; }
             "--future" => { hash.aset("future", true)?; }
             "--force_polling" => { hash.aset("force_polling", true)?; }
             "--lsi" => { hash.aset("lsi", true)?; }
@@ -256,5 +277,105 @@ fn parse_build_args(args: &[String]) -> Result<RHash, Error> {
         i += 1;
     }
 
+    Ok(hash)
+}
+
+fn print_help_serve() {
+    println!("Usage: jekyllrs serve [options]\n");
+    println!("Options:");
+    println!("    -s, --source [DIR]             Source directory (defaults to ./)");
+    println!("    -d, --destination [DIR]        Destination directory (defaults to ./_site)");
+    println!("        --safe                     Safe mode (defaults to false)");
+    println!("    -p, --plugins PLUGINS_DIRS     Plugins directory (defaults to ./_plugins)");
+    println!("        --layouts DIR              Layouts directory (defaults to ./_layouts)");
+    println!("    -H, --host [HOST]              Host to bind to");
+    println!("    -P, --port [PORT]              Port to listen on");
+    println!("    -o, --open-url                 Launch your site in a browser");
+    println!("    -B, --detach                   Run the server in the background");
+    println!("    -l, --livereload               Use LiveReload to automatically refresh browsers");
+    println!("        --livereload-ignore GLOBS  Files for LiveReload to ignore (comma-separated)");
+    println!("        --livereload-min-delay N   Minimum reload delay");
+    println!("        --livereload-max-delay N   Maximum reload delay");
+    println!("        --livereload-port PORT     Port for LiveReload to listen on");
+    println!("        --show-dir-listing         Show directory listing");
+    println!("        --ssl-cert [CERT]          X.509 (SSL) certificate");
+    println!("        --ssl-key [KEY]            X.509 (SSL) private key");
+    println!("        --trace                    Show full backtrace on errors");
+}
+
+fn run_serve(args: &[String], trace: bool) -> Result<(), Error> {
+    eval::<Value>("require 'jekyll'")?;
+    let _ = eval::<Value>("STDOUT.sync = true; STDERR.sync = true");
+
+    let mut options = parse_serve_args(args)?;
+    if options.aref::<_, Value>("serving")?.is_nil() { options.aset("serving", true)?; }
+    if options.aref::<_, Value>("watch")?.is_nil() { options.aset("watch", true)?; }
+
+    let jekyll: RModule = eval("Jekyll")?;
+    let rust_mod: RModule = jekyll.const_get("Rust")?;
+    let res = rust_mod.funcall::<_,_,Value>("engine_build_process", (options,));
+    match res {
+        Ok(_) => {},
+        Err(e) => {
+            if trace { return Err(e); }
+            let _ = eval::<Value>(r#"
+              msg = " Please append `--trace` to the `serve` command "
+              dashes = "-" * msg.length
+              Jekyll.logger.error "", dashes
+              Jekyll.logger.error "Jekyll #{Jekyll::VERSION} ", msg
+              Jekyll.logger.error "", " for any additional information or backtrace. "
+              Jekyll.logger.abort_with "", dashes
+            "#);
+            return Err(e);
+        }
+    }
+
+    let serve_klass: Value = eval("Jekyll::Commands::Serve")?;
+    serve_klass.funcall::<_,_,Value>("process", (options,))?;
+    Ok(())
+}
+
+fn parse_serve_args(args: &[String]) -> Result<RHash, Error> {
+    use magnus::RArray;
+    let hash = parse_build_args(args)?;
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "-H" | "--host" => {
+                if i + 1 < args.len() { hash.aset("host", args[i+1].as_str())?; i += 1; }
+            }
+            "-P" | "--port" => {
+                if i + 1 < args.len() {
+                    if let Ok(n) = args[i+1].parse::<i64>() { hash.aset("port", n)?; } else { hash.aset("port", args[i+1].as_str())?; }
+                    i += 1;
+                }
+            }
+            "-o" | "--open-url" => { hash.aset("open_url", true)?; }
+            "-B" | "--detach" => { hash.aset("detach", true)?; }
+            "-l" | "--livereload" => { hash.aset("livereload", true)?; }
+            "--livereload-ignore" => {
+                if i + 1 < args.len() {
+                    let arr = RArray::new();
+                    for p in args[i+1].split(',') { arr.push(p.trim())?; }
+                    hash.aset("livereload_ignore", arr)?; i += 1;
+                }
+            }
+            "--livereload-min-delay" => {
+                if i + 1 < args.len() { if let Ok(n) = args[i+1].parse::<i64>() { hash.aset("livereload_min_delay", n)?; } i += 1; }
+            }
+            "--livereload-max-delay" => {
+                if i + 1 < args.len() { if let Ok(n) = args[i+1].parse::<i64>() { hash.aset("livereload_max_delay", n)?; } i += 1; }
+            }
+            "--livereload-port" => {
+                if i + 1 < args.len() { if let Ok(n) = args[i+1].parse::<i64>() { hash.aset("livereload_port", n)?; } i += 1; }
+            }
+            "--show-dir-listing" => { hash.aset("show_dir_listing", true)?; }
+            "--ssl-cert" => { if i + 1 < args.len() { hash.aset("ssl_cert", args[i+1].as_str())?; i += 1; } }
+            "--ssl-key" => { if i + 1 < args.len() { hash.aset("ssl_key", args[i+1].as_str())?; i += 1; } }
+            _ => {}
+        }
+        i += 1;
+    }
     Ok(hash)
 }

@@ -4,7 +4,7 @@ require "ruby-prof"
 require File.expand_path("../lib/jekyll", __dir__)
 
 result = RubyProf.profile do
-  Jekyll::Commands::Build.process({
+  Jekyll::Rust.engine_build_process({
     "source"      => File.expand_path("../docs", __dir__),
     "destination" => File.expand_path("../docs/_site", __dir__),
   })

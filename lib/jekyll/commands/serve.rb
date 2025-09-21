@@ -82,7 +82,20 @@ module Jekyll
               config = configuration_from_options(opts)
               config["url"] = default_url(config) if Jekyll.env == "development"
 
-              process_with_graceful_fail(cmd, config, Build, Serve)
+              # Initial build via Rust engine with graceful-fail banner
+              begin
+                Jekyll::Rust.engine_build_process(config)
+              rescue Exception => e
+                raise e if cmd.trace
+                msg = " Please append `--trace` to the `#{cmd.name}` command "
+                dashes = "-" * msg.length
+                Jekyll.logger.error "", dashes
+                Jekyll.logger.error "Jekyll #{Jekyll::VERSION} ", msg
+                Jekyll.logger.error "", " for any additional information or backtrace. "
+                Jekyll.logger.abort_with "", dashes
+              end
+
+              process_with_graceful_fail(cmd, config, Serve)
             end
           end
         end

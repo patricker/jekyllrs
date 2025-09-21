@@ -87,9 +87,13 @@ fn engine_build_process(options: Value) -> Result<(), Error> {
     }
 
     // Watch handling
+    // When invoked from `serve`, skip watch handling and logs; Serve manages it.
+    let serving = fetch_bool(config, "serving", false)?;
     let detach = fetch_bool(config, "detach", false)?;
     let watch = fetch_bool(config, "watch", false)?;
-    if detach {
+    if serving {
+        // Skip watch handling entirely; Serve manages regeneration.
+    } else if detach {
         let _: Value = logger.funcall(
             "info",
             ("Auto-regeneration:", "disabled when running server detached."),

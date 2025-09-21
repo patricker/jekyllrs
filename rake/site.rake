@@ -32,14 +32,14 @@ namespace :site do
       "watch"       => true,
       "serving"     => true,
     }
-    Jekyll::Commands::Build.process(options)
+    Jekyll::Rust.engine_build_process(options)
     Jekyll::Commands::Serve.process(options)
   end
 
   desc "Generate the site"
   task :generate => :generated_pages do
     require "jekyll"
-    Jekyll::Commands::Build.process({
+    Jekyll::Rust.engine_build_process({
       "profile"     => true,
       "source"      => File.expand_path(docs_folder),
       "destination" => File.expand_path("#{docs_folder}/_site"),

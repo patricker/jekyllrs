@@ -209,12 +209,11 @@ module Jekyll
       def engine_build_process(options)
         ensure_loaded!
         Bridge.engine_build_process(options)
-        
-        def engine_clean_process(options)
+      end
+
+      def engine_clean_process(options)
         ensure_loaded!
         Bridge.engine_clean_process(options)
-        end
-        
       end
 
 

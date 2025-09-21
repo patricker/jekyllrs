@@ -34,7 +34,7 @@ class TestCommandsServe < JekyllUnitTest
 
   def serve(opts)
     allow(Jekyll).to receive(:configuration).and_return(opts)
-    allow(Jekyll::Commands::Build).to receive(:process)
+    allow(Jekyll::Rust).to receive(:engine_build_process)
 
     start_server(opts)
 
@@ -144,7 +144,7 @@ class TestCommandsServe < JekyllUnitTest
       end
       Jekyll.sites.clear
       allow(SafeYAML).to receive(:load_file).and_return({})
-      allow(Jekyll::Commands::Build).to receive(:build).and_return("")
+      allow(Jekyll::Rust).to receive(:engine_build_process).and_return("")
     end
     teardown do
       Jekyll.sites.clear
@@ -218,8 +218,8 @@ class TestCommandsServe < JekyllUnitTest
           receive(:configuration_from_options).with(config).and_return(config)
         )
 
-        expect(Jekyll::Commands::Build).to(
-          receive(:process).with(config).and_call_original
+        expect(Jekyll::Rust).to(
+          receive(:engine_build_process).with(config).and_call_original
         )
         expect(Jekyll::Commands::Serve).to receive(:process).with(config)
         @merc.execute(:serve, options)

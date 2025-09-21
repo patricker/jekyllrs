@@ -20,7 +20,7 @@ unless File.exist?(PROF_OUTPUT_FILE)
     puts "GC Stats:", JSON.pretty_generate(GC.stat)
     GC.disable
 
-    Jekyll::Commands::Build.process({'source' => 'docs'})
+    Jekyll::Rust.engine_build_process({'source' => 'docs'})
 
     puts 'GC Stats:'
     GC.start(full_mark: true, immediate_sweep: false)
