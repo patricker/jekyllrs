@@ -185,7 +185,16 @@ module Jekyll
       return input if !property || value.is_a?(Array) || value.is_a?(Hash)
       return input unless input.respond_to?(:select)
 
-      input    = input.values if input.is_a?(Hash)
+      if Jekyll::Rust.respond_to?(:where_filter_fast) &&
+         input.is_a?(Array) && input.all? { |e| e.is_a?(Hash) } && !property.to_s.include?(".")
+        begin
+          fast = Jekyll::Rust.where_filter_fast(input, property, value)
+          return fast if fast.is_a?(Array)
+        rescue StandardError
+          # ignore and fall back
+        end
+      end
+
       input_id = input.hash
 
       # implement a hash based on method parameters to cache the end-result

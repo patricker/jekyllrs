@@ -16,7 +16,7 @@ fn fetch_bool(hash: Value, key: &str, default: bool) -> Result<bool, Error> {
 
 fn rb_expand_path(path: Value) -> Result<String, Error> {
     let ruby = ruby_handle()?;
-    let file: RModule = ruby.class_object().const_get("File")?;
+    let file: Value = ruby.class_object().const_get("File")?;
     let exp: Value = file.funcall("expand_path", (path,))?;
     exp.try_convert()
 }
@@ -45,7 +45,7 @@ fn engine_build_process(options: Value) -> Result<(), Error> {
     let _: Value = logger.funcall("adjust_verbosity", (options,))?;
 
     // Resolve configuration from options
-    let command: RModule = jekyll.const_get("Command")?;
+    let command: Value = jekyll.const_get("Command")?;
     let config: Value = command.funcall("configuration_from_options", (options,))?;
 
     // Instantiate site

@@ -1,6 +1,6 @@
 use magnus::r_hash::ForEach;
 use magnus::{
-    function, prelude::*, Error, IntoValue, RClass, RHash, RModule, RString, Ruby, Symbol,
+    function, prelude::*, Error, IntoValue, RArray, RClass, RHash, RModule, RString, Ruby, Symbol,
     TryConvert, Value,
 };
 use once_cell::sync::Lazy;
@@ -29,6 +29,7 @@ pub fn define_into(bridge: &RModule) -> Result<(), Error> {
     bridge.define_singleton_method("add_permalink_suffix", function!(add_permalink_suffix, 2))?;
     bridge.define_singleton_method("normalize_whitespace", function!(normalize_whitespace, 1))?;
     bridge.define_singleton_method("number_of_words", function!(number_of_words, 2))?;
+    bridge.define_singleton_method("where_filter_fast", function!(where_filter_fast2, 3))?;
     Ok(())
 }
 
@@ -509,4 +510,37 @@ mod tests {
             )
         );
     }
+}
+
+
+// appended new where_filter_fast
+fn where_filter_fast2(input: Value, property: Value, target: Value) -> Result<Value, Error> {
+    let ruby = ruby_handle()?;
+    let arr = match RArray::from_value(input) {
+        Some(a) => a,
+        None => return Ok(ruby.qnil().into_value_with(&ruby)),
+    };
+    let prop_str = property.funcall::<_, _, RString>("to_s", ())?.to_string()?;
+    if prop_str.contains('.') {
+        return Ok(ruby.qnil().into_value_with(&ruby));
+    }
+    let out = ruby.ary_new();
+    let key_sym = ruby.to_symbol(&prop_str);
+    let key_str = ruby.str_new(&prop_str);
+    let len_val: Value = arr.funcall("length", ())?;
+    let len: i64 = i64::try_convert(len_val)?;
+    for i in 0..len {
+        let obj: Value = arr.funcall("[]", (i,))?;
+        if let Some(h) = RHash::from_value(obj) {
+            let mut val: Value = h.funcall("[]", (key_sym,))?;
+            if val.is_nil() { val = h.funcall("[]", (key_str,))?; }
+            if !val.is_nil() {
+                let eq: bool = val.funcall("==", (target,))?;
+                if eq { out.push(obj)?; }
+            }
+        } else {
+            return Ok(ruby.qnil().into_value_with(&ruby));
+        }
+    }
+    Ok(out.into_value_with(&ruby))
 }

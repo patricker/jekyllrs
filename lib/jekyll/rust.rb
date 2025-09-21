@@ -209,6 +209,12 @@ module Jekyll
       def engine_build_process(options)
         ensure_loaded!
         Bridge.engine_build_process(options)
+        
+        def engine_clean_process(options)
+        ensure_loaded!
+        Bridge.engine_clean_process(options)
+        end
+        
       end
 
 
@@ -293,11 +299,16 @@ module Jekyll
         ensure_loaded!
         Bridge.normalize_whitespace(input)
       end
-
       def number_of_words(input, mode = nil)
         ensure_loaded!
         Bridge.number_of_words(input, mode)
       end
+
+      def where_filter_fast(input, property, target)
+        ensure_loaded!
+        Bridge.where_filter_fast(input, property, target)
+      end
+
       private
 
       def ensure_loaded!

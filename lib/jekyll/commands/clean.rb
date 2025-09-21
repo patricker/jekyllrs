@@ -18,16 +18,8 @@ module Jekyll
         end
 
         def process(options)
-          options = configuration_from_options(options)
-          destination = options["destination"]
-          metadata_file = File.join(options["source"], ".jekyll-metadata")
-          cache_dir = File.join(options["source"], options["cache_dir"])
-          sass_cache = ".sass-cache"
-
-          remove(destination, :checker_func => :directory?)
-          remove(metadata_file, :checker_func => :file?)
-          remove(cache_dir, :checker_func => :directory?)
-          remove(sass_cache, :checker_func => :directory?)
+          # Hand off to Rust implementation which mirrors behavior and logging
+          Jekyll::Rust.engine_clean_process(options)
         end
 
         def remove(filename, checker_func: :file?)

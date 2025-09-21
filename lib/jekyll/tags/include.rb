@@ -102,7 +102,6 @@ module Jekyll
         end
         raise IOError, could_not_locate_message(file, includes_dirs, safe)
       end
-
       def render(context)
         site = context.registers[:site]
 
@@ -115,15 +114,7 @@ module Jekyll
         add_include_to_dependency(site, path, context)
 
         partial = load_cached_partial(path, context)
-
-        # Include output cache keyed by include path, page identity, and params
-        cache = (context.registers[:include_output_cache] ||= {})
         include_vars = @params ? parse_params(context) : {}
-        cache_key = include_output_cache_key(context, path, include_vars)
-
-        if cache.key?(cache_key)
-          return cache[cache_key]
-        end
 
         output = context.stack do
           context["include"] = include_vars unless include_vars.empty?
@@ -135,10 +126,8 @@ module Jekyll
             raise e
           end
         end
-        cache[cache_key] = output
         output
       end
-
       def add_include_to_dependency(site, path, context)
         if context.registers[:page]&.key?("path")
           site.regenerator.add_dependency(

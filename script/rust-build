@@ -4,6 +4,20 @@ set -euo pipefail
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PROFILE=${RUST_PROFILE:-debug}
 
+# Try to embed Ruby's libdir as an rpath so `jekyllrs` can find libruby at runtime
+RUBY_LIBDIR=""
+if command -v ruby >/dev/null 2>&1; then
+  RUBY_LIBDIR=$(ruby -rrbconfig -e 'print RbConfig::CONFIG["libdir"]' 2>/dev/null || true)
+fi
+
+if [[ -n "${RUBY_LIBDIR}" && -d "${RUBY_LIBDIR}" ]]; then
+  # Use an rpath to Ruby's libdir; keep any existing RUSTFLAGS
+  export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-rpath,${RUBY_LIBDIR}"
+  echo "Embedding rpath to Ruby libdir: ${RUBY_LIBDIR}"
+else
+  echo "note: could not resolve Ruby libdir for rpath; falling back to default linker search path" >&2
+fi
+
 pushd "$REPO_ROOT/rust" > /dev/null
 if [[ "$PROFILE" == "release" ]]; then
   cargo build --locked --release

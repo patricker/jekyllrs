@@ -19,6 +19,7 @@ mod utils;
 mod yaml_header;
 mod engine;
 mod cli_build;
+mod cli_clean;
 
 use magnus::{prelude::*, Error, RModule, Ruby};
 
@@ -59,6 +60,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     regenerator_io::define_into(&bridge)?;
     engine::define_into(&bridge)?;
     cli_build::define_into(&bridge)?;
+    cli_clean::define_into(&bridge)?;
 
     Ok(())
 }
