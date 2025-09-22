@@ -45,6 +45,7 @@ Mercenary.program(:jekyll) do |p|
 
     Jekyll::Command.add_build_options(c)
 
+
     c.action do |_, options|
       options["serving"] = false
       begin
@@ -68,6 +69,7 @@ Mercenary.program(:jekyll) do |p|
     c.description "Clean the site (removes site output and metadata file) without building."
 
     Jekyll::Command.add_build_options(c)
+
 
     c.action do |_, options|
       begin

@@ -27,45 +27,12 @@ fn engine_build_site_with_profile(site: Value, profile_enabled: bool) -> Result<
         let _: Value = profiler.funcall("profile_process", ())?;
         return Ok(());
     }
-    // Non-profiled build with phase timings and a summary table
-    let mut phases: Vec<(&str, f64)> = Vec::with_capacity(6);
-
-    let t = std::time::Instant::now();
     let _: Value = site.funcall("reset", ())?;
-    phases.push(("RESET", t.elapsed().as_secs_f64()));
-
-    let t = std::time::Instant::now();
     let _: Value = site.funcall("read", ())?;
-    phases.push(("READ", t.elapsed().as_secs_f64()));
-
-    let t = std::time::Instant::now();
     let _: Value = site.funcall("generate", ())?;
-    phases.push(("GENERATE", t.elapsed().as_secs_f64()));
-
-    let t = std::time::Instant::now();
     let _: Value = site.funcall("render", ())?;
-    phases.push(("RENDER", t.elapsed().as_secs_f64()));
-
-    let t = std::time::Instant::now();
     let _: Value = site.funcall("cleanup", ())?;
-    phases.push(("CLEANUP", t.elapsed().as_secs_f64()));
-
-    let t = std::time::Instant::now();
     let _: Value = site.funcall("write", ())?;
-    phases.push(("WRITE", t.elapsed().as_secs_f64()));
-
-    // Print Build Process Summary to match Jekyll profile output style
-    let ruby = ruby_handle()?;
-    let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
-    let logger: Value = jekyll.funcall("logger", ())?;
-    let _: Value = logger.funcall("info", ("", "Build Process Summary:"))?;
-    let _: Value = logger.funcall("info", ("", ""))?;
-    let _: Value = logger.funcall("info", ("", "| PHASE    |    TIME |"))?;
-    let _: Value = logger.funcall("info", ("", "+----------+---------+"))?;
-    for (name, secs) in phases {
-        let row = format!("| {:<8} | {:>7.4} |", name, secs);
-        let _: Value = logger.funcall("info", ("", row))?;
-    }
     Ok(())
 }
 
@@ -121,6 +88,7 @@ fn engine_build_process(options: Value) -> Result<(), Error> {
         // Profile-aware engine run
         let profile_enabled = fetch_bool(config, "profile", false)?;
         engine_build_site_with_profile(site, profile_enabled)?;
+
 
         let secs = t0.elapsed().as_secs_f64();
         let _: Value = logger.funcall("info", ("", format!("done in {:.3} seconds.", secs)))?;

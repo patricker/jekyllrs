@@ -49,7 +49,6 @@ fn print_help_global() {
     println!("  doctor   Check your site for common problems");
 }
 
-
 fn print_help_new() {
     println!("Usage: jekyllrs new PATH [options]\n");
     println!("Options:");
@@ -76,6 +75,9 @@ fn print_help_build() {
     println!("        --profile                  Generate a Liquid rendering profile");
     println!("    -I, --incremental              Enable incremental rebuild");
     println!("    -w, --watch                    Watch for changes and rebuild");
+    println!(
+        "        --render-stats            Print Liquid 'Site Render Stats' without --profile"
+    );
     println!("        --trace                    Show full backtrace on errors");
 }
 
@@ -188,7 +190,10 @@ fn run_core(argv: Vec<String>) -> Result<(), Error> {
             }
         }
         "new" => {
-            if args.iter().any(|a| a == "-h" || a == "--help" || a == "help") {
+            if args
+                .iter()
+                .any(|a| a == "-h" || a == "--help" || a == "help")
+            {
                 print_help_new();
                 Ok(())
             } else {
@@ -196,7 +201,10 @@ fn run_core(argv: Vec<String>) -> Result<(), Error> {
             }
         }
         "doctor" => {
-            if args.iter().any(|a| a == "-h" || a == "--help" || a == "help") {
+            if args
+                .iter()
+                .any(|a| a == "-h" || a == "--help" || a == "help")
+            {
                 print_help_doctor();
                 Ok(())
             } else {
@@ -280,6 +288,7 @@ fn parse_build_args(args: &[String]) -> Result<RHash, Error> {
             "--profile" => {
                 hash.aset("profile", true)?;
             }
+
             "--incremental" => {
                 hash.aset("incremental", true)?;
             }
@@ -555,7 +564,6 @@ fn parse_serve_args(args: &[String]) -> Result<RHash, Error> {
     Ok(hash)
 }
 
-
 fn parse_new_args(args: &[String]) -> Result<(Vec<String>, RHash), Error> {
     let hash = RHash::new();
     let mut paths: Vec<String> = Vec::new();
@@ -563,9 +571,15 @@ fn parse_new_args(args: &[String]) -> Result<(Vec<String>, RHash), Error> {
     while i < args.len() {
         let a = args[i].as_str();
         match a {
-            "--force" => { hash.aset("force", true)?; }
-            "--blank" => { hash.aset("blank", true)?; }
-            "--skip-bundle" => { hash.aset("skip-bundle", true)?; }
+            "--force" => {
+                hash.aset("force", true)?;
+            }
+            "--blank" => {
+                hash.aset("blank", true)?;
+            }
+            "--skip-bundle" => {
+                hash.aset("skip-bundle", true)?;
+            }
             _ => {
                 if a.starts_with('-') {
                     // ignore unknown flags here
@@ -588,7 +602,9 @@ fn run_new(args: &[String], trace: bool) -> Result<(), Error> {
     match res {
         Ok(_) => Ok(()),
         Err(e) => {
-            if trace { return Err(e); }
+            if trace {
+                return Err(e);
+            }
             let _ = eval::<Value>(
                 r#"
               msg = " Please append `--trace` to the `new` command "
@@ -613,7 +629,9 @@ fn parse_doctor_args(args: &[String]) -> Result<RHash, Error> {
             "--config" => {
                 if i + 1 < args.len() {
                     let arr = magnus::RArray::new();
-                    for p in args[i + 1].split(',') { arr.push(p.trim())?; }
+                    for p in args[i + 1].split(',') {
+                        arr.push(p.trim())?;
+                    }
                     hash.aset("config", arr)?;
                     i += 1;
                 }
@@ -633,6 +651,12 @@ fn run_doctor(args: &[String], trace: bool) -> Result<(), Error> {
     let res = klass.funcall::<_, _, Value>("process", (options,));
     match res {
         Ok(_) => Ok(()),
-        Err(e) => { if trace { return Err(e); } else { Err(e) } }
+        Err(e) => {
+            if trace {
+                return Err(e);
+            } else {
+                Err(e)
+            }
+        }
     }
 }

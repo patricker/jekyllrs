@@ -528,7 +528,11 @@ fn where_filter_fast2(input: Value, property: Value, target: Value) -> Result<Va
     let key_sym = ruby.to_symbol(&prop_str);
     let key_str = ruby.str_new(&prop_str);
     let target_is_nil = target.is_nil();
-    let target_s: RString = if target_is_nil { ruby.str_new("") } else { target.funcall("to_s", ())? };
+    let target_s: RString = if target_is_nil {
+        ruby.str_new("")
+    } else {
+        target.funcall("to_s", ())?
+    };
     let target_str = target_s.to_string()?;
     let len_val: Value = arr.funcall("length", ())?;
     let len: i64 = i64::try_convert(len_val)?;

@@ -103,9 +103,11 @@ fn reader_walk(site: Value, rel_dir: RString) -> Result<Value, Error> {
                 let child_rel = if rel_prefix.is_empty() {
                     entry_str.clone()
                 } else {
-                let is_bad: bool = ef.funcall("symlink?", (ruby.str_new(&full_str),))?;
-                if is_bad { continue; }
-                format!("{}/{}", rel_prefix, entry_str)
+                    let is_bad: bool = ef.funcall("symlink?", (ruby.str_new(&full_str),))?;
+                    if is_bad {
+                        continue;
+                    }
+                    format!("{}/{}", rel_prefix, entry_str)
                 };
                 let child_base: RString =
                     file.funcall("join", (ruby.str_new(base_path), ruby.str_new(&entry_str)))?;
@@ -122,8 +124,10 @@ fn reader_walk(site: Value, rel_dir: RString) -> Result<Value, Error> {
                 )?;
             } else {
                 let is_bad: bool = ef.funcall("symlink?", (ruby.str_new(&full_str),))?;
-                if is_bad { continue; }
-let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
+                if is_bad {
+                    continue;
+                }
+                let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
                 let rust: RModule = jekyll.const_get("Rust")?;
                 let bridge2: RModule = rust.const_get("Bridge")?;
                 let has_header: bool =
@@ -148,7 +152,9 @@ let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
     let bridge: RModule = rust.const_get("Bridge")?;
     let ef_class: Value = jekyll.const_get("EntryFilter")?;
     let ef: Value = ef_class.funcall("new", (site,))?;
-    walk(&ruby, site, file, bridge, ef, &base_path, "", &pages, &statics)?;
+    walk(
+        &ruby, site, file, bridge, ef, &base_path, "", &pages, &statics,
+    )?;
 
     let result = RHash::new();
     result.aset(Symbol::new("pages"), pages)?;
@@ -181,7 +187,7 @@ fn reader_get_entries(site: Value, dir: RString, subfolder: RString) -> Result<V
     let filtered: Value = bridge.funcall("entry_filter", (site, glob_val, base))?;
     let entries = RArray::try_convert(filtered)?;
 
-    let mut out = ruby.ary_new();
+    let out = ruby.ary_new();
     for item in entries.each() {
         let e: RString = item?.funcall("to_s", ())?;
         let joined: RString = site.funcall("in_source_dir", (ruby.str_new(&base_str), e))?;
@@ -192,4 +198,3 @@ fn reader_get_entries(site: Value, dir: RString, subfolder: RString) -> Result<V
     }
     Ok(out.into_value_with(&ruby))
 }
-
