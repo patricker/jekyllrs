@@ -37,7 +37,7 @@ module Jekyll
     end
 
     def append_unless_exists(haystack, new_item)
-      if haystack.any? { |file| file.relative_path == new_item.relative_path }
+      if haystack.any? { |file| (file.relative_path == new_item.relative_path) || (file.relative_path.delete_prefix("/") == new_item.relative_path.delete_prefix("/")) }
         Jekyll.logger.debug "Theme:",
                             "Ignoring #{new_item.relative_path} in theme due to existing file " \
                             "with that path in site."

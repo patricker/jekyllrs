@@ -61,22 +61,38 @@ module Jekyll
       dot_pages = []
       dot_static_files = []
 
-      dot = Dir.chdir(base) { filter_entries(Dir.entries("."), base) }
-      dot.each do |entry|
-        file_path = @site.in_source_dir(base, entry)
-        if File.directory?(file_path)
-          dot_dirs << entry
-        elsif Utils.has_yaml_header?(file_path)
-          dot_pages << entry
-        else
-          dot_static_files << entry
-        end
-      end
+      classified = Jekyll::Rust.reader_classify(site, base)
+      dot_dirs = classified[:dirs]
+      dot_pages = []
+      dot_static_files = []
 
       retrieve_posts(dir)
       retrieve_dirs(base, dir, dot_dirs)
       retrieve_pages(dir, dot_pages)
       retrieve_static_files(dir, dot_static_files)
+
+      # Use Rust walker once at root to read pages and static files
+      if dir == ""
+        begin
+          walked = Jekyll::Rust.reader_walk(site, dir)
+          group_by_dir = lambda do |paths|
+            groups = Hash.new { |h, k| h[k] = [] }
+            Array(paths).each do |rel|
+              rel = rel.to_s
+              d  = File.dirname(rel)
+              d  = "" if d == "."
+              groups[d] << File.basename(rel)
+            end
+            groups
+          end
+          group_by_dir.call(walked[:pages]).each { |d, files| site.pages.concat(PageReader.new(site, d).read(files)) }
+          group_by_dir.call(walked[:static]).each { |d, files| static_dir = d == "" ? d : "/#{d}"; site.static_files.concat(StaticFileReader.new(site, static_dir).read(files)) }
+        rescue StandardError
+          # Fallback to the per-directory classified lists if walker fails
+          retrieve_pages(dir, classified[:pages])
+          retrieve_static_files(dir, classified[:static])
+        end
+      end
     end
 
     # Retrieves all the posts(posts/drafts) from the given directory
@@ -149,6 +165,10 @@ module Jekyll
     #
     # Returns the list of entries to process
     def get_entries(dir, subfolder)
+      if defined?(Jekyll::Rust) && Jekyll::Rust.respond_to?(:reader_get_entries)
+        return Array(Jekyll::Rust.reader_get_entries(site, dir.to_s, subfolder.to_s))
+      end
+
       base = site.in_source_dir(dir, subfolder)
       return [] unless File.exist?(base)
 

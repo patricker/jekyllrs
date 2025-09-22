@@ -1,25 +1,26 @@
+mod cleaner;
+mod cli_build;
+mod cli_clean;
 mod dates;
 mod document;
 mod document_reader;
+mod engine;
 mod entry_filter;
 mod file_opts;
+mod frontmatter;
 mod liquid;
 mod merge;
 mod path_manager;
+mod reader;
+mod regenerator_io;
 mod ruby_utils;
 mod slugify;
 mod static_file;
-mod frontmatter;
-mod cleaner;
 mod theme_reader;
-mod regenerator_io;
 mod time_utils;
 mod url;
 mod utils;
 mod yaml_header;
-mod engine;
-mod cli_build;
-mod cli_clean;
 
 use magnus::{prelude::*, Error, RModule, Ruby};
 
@@ -61,6 +62,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     engine::define_into(&bridge)?;
     cli_build::define_into(&bridge)?;
     cli_clean::define_into(&bridge)?;
+    reader::define_into(&bridge)?;
 
     Ok(())
 }

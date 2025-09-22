@@ -33,11 +33,13 @@ fn cleaner_existing_files(site_dest: String, keep_files_val: Value) -> Result<Va
 
     // Fetch File::FNM_DOTMATCH
     let file_class: Value = ruby.class_object().const_get("File")?;
-    let fnm_dotmatch_value: Value = file_class.funcall("const_get", (ruby.str_new("FNM_DOTMATCH"),))?;
+    let fnm_dotmatch_value: Value =
+        file_class.funcall("const_get", (ruby.str_new("FNM_DOTMATCH"),))?;
 
     // Dir.glob(pattern, File::FNM_DOTMATCH)
     let dir_module: Value = ruby.class_object().const_get("Dir")?;
-    let glob_value: Value = dir_module.funcall("glob", (ruby.str_new(&pattern), fnm_dotmatch_value))?;
+    let glob_value: Value =
+        dir_module.funcall("glob", (ruby.str_new(&pattern), fnm_dotmatch_value))?;
     let entries = Vec::<String>::try_convert(glob_value).unwrap_or_default();
 
     let mut results: Vec<String> = Vec::new();
@@ -63,7 +65,8 @@ fn cleaner_existing_files(site_dest: String, keep_files_val: Value) -> Result<Va
 }
 
 fn is_hidden_meta(path: &str) -> bool {
-    path.ends_with(&format!("{}.", MAIN_SEPARATOR)) || path.ends_with(&format!("{}..", MAIN_SEPARATOR))
+    path.ends_with(&format!("{}.", MAIN_SEPARATOR))
+        || path.ends_with(&format!("{}..", MAIN_SEPARATOR))
 }
 
 fn is_kept_file(site_dest: &str, entry: &str, keep_files: &[String]) -> bool {

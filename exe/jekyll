@@ -38,6 +38,52 @@ Mercenary.program(:jekyll) do |p|
     end
   end
 
+    p.command(:build) do |c|
+    c.syntax      "build [options]"
+    c.description "Build your site"
+    c.alias :b
+
+    Jekyll::Command.add_build_options(c)
+
+    c.action do |_, options|
+      options["serving"] = false
+      begin
+        Jekyll::Rust.engine_build_process(options)
+      rescue Exception => e
+        raise e if c.trace
+        msg = " Please append `--trace` to the `build` command "
+        dashes = "-" * msg.length
+        Jekyll.logger.error "", dashes
+        Jekyll.logger.error "Jekyll #{Jekyll::VERSION} ", msg
+        Jekyll.logger.error "", " for any additional information or backtrace. "
+        Jekyll.logger.abort_with "", dashes
+      end
+    end
+  end
+
+
+
+  p.command(:clean) do |c|
+    c.syntax      "clean [options]"
+    c.description "Clean the site (removes site output and metadata file) without building."
+
+    Jekyll::Command.add_build_options(c)
+
+    c.action do |_, options|
+      begin
+        Jekyll::Rust.engine_clean_process(options)
+      rescue Exception => e
+        raise e if c.trace
+        msg = " Please append `--trace` to the `clean` command "
+        dashes = "-" * msg.length
+        Jekyll.logger.error "", dashes
+        Jekyll.logger.error "Jekyll #{Jekyll::VERSION} ", msg
+        Jekyll.logger.error "", " for any additional information or backtrace. "
+        Jekyll.logger.abort_with "", dashes
+      end
+    end
+  end
+
   Jekyll::Command.subclasses.each { |c| c.init_with_program(p) }
 
   p.action do |args, _|

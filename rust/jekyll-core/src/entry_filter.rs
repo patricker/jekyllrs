@@ -29,10 +29,13 @@ fn entry_filter(
     let include_patterns = extract_patterns(&ruby, include_value)?;
     let exclude_patterns = extract_patterns(&ruby, exclude_diff)?;
 
-    let base_dir = match base_directory {
+    let mut base_dir = match base_directory {
         Some(dir) => dir.to_string()?,
         None => String::new(),
     };
+    if !base_dir.is_empty() && base_dir.starts_with(&source) {
+        base_dir = base_dir[source.len()..].to_string();
+    }
 
     let entries_array = RArray::try_convert(entries)?;
     let mut filtered = Vec::new();

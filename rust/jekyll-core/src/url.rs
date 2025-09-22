@@ -326,7 +326,6 @@ fn apply_replacement(matched: &str, key: &str, escaped: &str) -> Result<String, 
     }
 }
 
-
 fn url_filters_strip_index(input: Value) -> Result<Value, Error> {
     let ruby = ruby_handle()?;
     if input.is_nil() {

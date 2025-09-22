@@ -17,7 +17,12 @@ fn theme_assets_list(root: RString) -> Result<Value, Error> {
 
     let fnm_dotmatch: Value = file_class.funcall("const_get", (ruby.str_new("FNM_DOTMATCH"),))?;
     let glob_value: Value = dir_module.funcall("glob", (ruby.str_new(&pattern), fnm_dotmatch))?;
-    let entries = RArray::from_value(glob_value).ok_or_else(|| Error::new(ruby.exception_type_error(), "Dir.glob did not return an array"))?;
+    let entries = RArray::from_value(glob_value).ok_or_else(|| {
+        Error::new(
+            ruby.exception_type_error(),
+            "Dir.glob did not return an array",
+        )
+    })?;
 
     let array = ruby.ary_new();
     for entry in entries.each() {

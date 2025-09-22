@@ -234,6 +234,16 @@ module Jekyll
         Bridge.entry_filter(site, entries, base_directory)
       end
 
+      def reader_classify(site, base_directory)
+        ensure_loaded!
+        Bridge.reader_classify(site, base_directory)
+      end
+
+      def reader_walk(site, dir = "")
+        ensure_loaded!
+        Bridge.reader_walk(site, dir)
+      end
+
       def merged_file_read_opts(site, opts)
         ensure_loaded!
         Bridge.merged_file_read_opts(site, opts)

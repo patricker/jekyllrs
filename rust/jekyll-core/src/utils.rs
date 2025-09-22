@@ -378,7 +378,6 @@ fn add_permalink_suffix_internal(template: &str, style: PermalinkStyle) -> Strin
     updated
 }
 
-
 fn normalize_whitespace(input: Value) -> Result<Value, Error> {
     let ruby = ruby_handle()?;
     let s = input.funcall::<_, _, RString>("to_s", ())?.to_string()?;
@@ -404,14 +403,19 @@ fn number_of_words(input: Value, mode: Option<Value>) -> Result<Value, Error> {
     let s = input.funcall::<_, _, RString>("to_s", ())?.to_string()?;
     let use_cjk = match mode {
         Some(v) => {
-            if v.is_nil() { false } else { true }
+            if v.is_nil() {
+                false
+            } else {
+                true
+            }
         }
         None => false,
     };
 
     if use_cjk {
         let cjk_re = regex::Regex::new(r"[\p{Han}\p{Katakana}\p{Hiragana}\p{Hangul}]").unwrap();
-        let word_re = regex::Regex::new(r"[^\p{Han}\p{Katakana}\p{Hiragana}\p{Hangul}\s]+").unwrap();
+        let word_re =
+            regex::Regex::new(r"[^\p{Han}\p{Katakana}\p{Hiragana}\p{Hangul}\s]+").unwrap();
         let cjk_count = cjk_re.find_iter(&s).count();
         let count = if cjk_count == 0 {
             s.split_whitespace().count()
@@ -482,7 +486,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn add_permalink_suffix_handles_nil_and_unknown_symbol() {
         // Internal helper expects parsed style; simulate by calling internal with Other("")
@@ -494,10 +497,7 @@ mod tests {
         // Unknown symbol becomes a string via to_s and should not modify template
         assert_eq!(
             "/:basename",
-            add_permalink_suffix_internal(
-                "/:basename",
-                PermalinkStyle::Other("foo".to_string())
-            )
+            add_permalink_suffix_internal("/:basename", PermalinkStyle::Other("foo".to_string()))
         );
     }
 
@@ -513,7 +513,6 @@ mod tests {
     }
 }
 
-
 // appended new where_filter_fast
 fn where_filter_fast2(input: Value, property: Value, target: Value) -> Result<Value, Error> {
     let ruby = ruby_handle()?;
@@ -528,16 +527,30 @@ fn where_filter_fast2(input: Value, property: Value, target: Value) -> Result<Va
     let out = ruby.ary_new();
     let key_sym = ruby.to_symbol(&prop_str);
     let key_str = ruby.str_new(&prop_str);
+    let target_is_nil = target.is_nil();
+    let target_s: RString = if target_is_nil { ruby.str_new("") } else { target.funcall("to_s", ())? };
+    let target_str = target_s.to_string()?;
     let len_val: Value = arr.funcall("length", ())?;
     let len: i64 = i64::try_convert(len_val)?;
     for i in 0..len {
         let obj: Value = arr.funcall("[]", (i,))?;
         if let Some(h) = RHash::from_value(obj) {
             let mut val: Value = h.funcall("[]", (key_sym,))?;
-            if val.is_nil() { val = h.funcall("[]", (key_str,))?; }
-            if !val.is_nil() {
-                let eq: bool = val.funcall("==", (target,))?;
-                if eq { out.push(obj)?; }
+            if val.is_nil() {
+                val = h.funcall("[]", (key_str,))?;
+            }
+            if val.is_kind_of(ruby.class_array()) || val.is_kind_of(ruby.class_hash()) {
+                return Ok(ruby.qnil().into_value_with(&ruby));
+            }
+            if target_is_nil {
+                if val.is_nil() {
+                    out.push(obj)?;
+                }
+            } else if !val.is_nil() {
+                let val_s: RString = val.funcall("to_s", ())?;
+                if val_s.to_string()? == target_str {
+                    out.push(obj)?;
+                }
             }
         } else {
             return Ok(ruby.qnil().into_value_with(&ruby));
@@ -545,7 +558,6 @@ fn where_filter_fast2(input: Value, property: Value, target: Value) -> Result<Va
     }
     Ok(out.into_value_with(&ruby))
 }
-
 
 #[derive(Debug, Clone)]
 enum SortKey {
@@ -560,17 +572,21 @@ fn parse_sort_key(val: Value) -> Option<SortKey> {
     if let Some(rs) = RString::from_value(val) {
         if let Ok(s0) = rs.to_string() {
             let st = s0.trim();
-            static INT_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
-                regex::Regex::new(r"^\s*-?\d+\s*$").unwrap()
-            });
-            static FLOAT_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
-                regex::Regex::new(r"^\s*-?(?:\d+\.?\d*|\.\d+)\s*$").unwrap()
-            });
+            static INT_RE: once_cell::sync::Lazy<regex::Regex> =
+                once_cell::sync::Lazy::new(|| regex::Regex::new(r"^\s*-?\d+\s*$").unwrap());
+            static FLOAT_RE: once_cell::sync::Lazy<regex::Regex> =
+                once_cell::sync::Lazy::new(|| {
+                    regex::Regex::new(r"^\s*-?(?:\d+\.?\d*|\.\d+)\s*$").unwrap()
+                });
             if INT_RE.is_match(&s0) {
-                if let Ok(i) = st.parse::<f64>() { return Some(SortKey::Num(i)); }
+                if let Ok(i) = st.parse::<f64>() {
+                    return Some(SortKey::Num(i));
+                }
             }
             if FLOAT_RE.is_match(&s0) {
-                if let Ok(f) = st.parse::<f64>() { return Some(SortKey::Num(f)); }
+                if let Ok(f) = st.parse::<f64>() {
+                    return Some(SortKey::Num(f));
+                }
             }
             return Some(SortKey::Str(s0));
         }
@@ -604,7 +620,9 @@ fn sort_filter_fast(input: Value, property: Value, nils: Value) -> Result<Value,
         let obj: Value = arr.funcall("[]", (i,))?;
         if let Some(h) = RHash::from_value(obj) {
             let mut v: Value = h.funcall("[]", (key_sym,))?;
-            if v.is_nil() { v = h.funcall("[]", (key_str,))?; }
+            if v.is_nil() {
+                v = h.funcall("[]", (key_str,))?;
+            }
             let key = if v.is_nil() { None } else { parse_sort_key(v) };
             if !v.is_nil() && key.is_none() {
                 return Ok(ruby.qnil().into_value_with(&ruby));
@@ -614,18 +632,30 @@ fn sort_filter_fast(input: Value, property: Value, nils: Value) -> Result<Value,
             return Ok(ruby.qnil().into_value_with(&ruby));
         }
     }
-    items.sort_unstable_by(|a, b| {
-        match (&a.0, &b.0) {
-            (Some(_), None) => if order < 0 { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater },
-            (None, Some(_)) => if order < 0 { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less },
-            (None, None) => std::cmp::Ordering::Equal,
-            (Some(ka), Some(kb)) => match (ka, kb) {
-                (SortKey::Num(x), SortKey::Num(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
-                (SortKey::Str(sa), SortKey::Str(sb)) => sa.cmp(sb),
-                (SortKey::Num(x), SortKey::Str(sb)) => x.to_string().cmp(sb),
-                (SortKey::Str(sa), SortKey::Num(y)) => sa.cmp(&y.to_string()),
-            },
+    items.sort_unstable_by(|a, b| match (&a.0, &b.0) {
+        (Some(_), None) => {
+            if order < 0 {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            }
         }
+        (None, Some(_)) => {
+            if order < 0 {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        }
+        (None, None) => std::cmp::Ordering::Equal,
+        (Some(ka), Some(kb)) => match (ka, kb) {
+            (SortKey::Num(x), SortKey::Num(y)) => {
+                x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+            }
+            (SortKey::Str(sa), SortKey::Str(sb)) => sa.cmp(sb),
+            (SortKey::Num(x), SortKey::Str(sb)) => x.to_string().cmp(sb),
+            (SortKey::Str(sa), SortKey::Num(y)) => sa.cmp(&y.to_string()),
+        },
     });
     let out = ruby.ary_new();
     for (_, obj) in items.into_iter() {

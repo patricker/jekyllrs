@@ -1,4 +1,4 @@
-use magnus::{function, prelude::*, Error, RModule, Value, IntoValue};
+use magnus::{function, prelude::*, Error, IntoValue, RModule, Value};
 
 use crate::ruby_utils::ruby_handle;
 
@@ -26,8 +26,11 @@ fn engine_clean_process(options: Value) -> Result<(), Error> {
     let source: Value = config.funcall("[]", (ruby.str_new("source"),))?;
     let cache_dir_name: Value = config.funcall("[]", (ruby.str_new("cache_dir"),))?;
 
-    let metadata_file = rb_join(source, ruby.str_new(".jekyll-metadata").into_value_with(&ruby))?;
-    let cache_dir = rb_join(source, cache_dir_name.funcall::<_,_,Value>("to_s", ())?)?;
+    let metadata_file = rb_join(
+        source,
+        ruby.str_new(".jekyll-metadata").into_value_with(&ruby),
+    )?;
+    let cache_dir = rb_join(source, cache_dir_name.funcall::<_, _, Value>("to_s", ())?)?;
 
     // Remove helper mirrors Ruby Clean.remove
     fn remove(path: Value, checker: &str) -> Result<(), Error> {

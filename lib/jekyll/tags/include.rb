@@ -130,10 +130,12 @@ module Jekyll
       end
       def add_include_to_dependency(site, path, context)
         if context.registers[:page]&.key?("path")
-          site.regenerator.add_dependency(
-            site.in_source_dir(context.registers[:page]["path"]),
-            path
-          )
+          absolute_path = if context.registers[:page]["collection"]
+                           site.in_source_dir(site.config["collections_dir"], context.registers[:page]["path"])
+                         else
+                           site.in_source_dir(context.registers[:page]["path"])
+                         end
+        site.regenerator.add_dependency(absolute_path, path)
         end
       end
 
@@ -335,5 +337,5 @@ module Jekyll
   end
 end
 
-Liquid::Template.register_tag("include", Jekyll::Tags::OptimizedIncludeTag)
+Liquid::Template.register_tag("include", Jekyll::Tags::IncludeTag)
 Liquid::Template.register_tag("include_relative", Jekyll::Tags::IncludeRelativeTag)

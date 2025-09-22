@@ -185,6 +185,9 @@ module Jekyll
       return input if !property || value.is_a?(Array) || value.is_a?(Hash)
       return input unless input.respond_to?(:select)
 
+      # Normalize Hash input to its values for selection semantics
+      input = input.values if input.is_a?(Hash) # FIXME: maintain parity with existing behavior
+
       if Jekyll::Rust.respond_to?(:where_filter_fast) &&
          input.is_a?(Array) && input.all? { |e| e.is_a?(Hash) } && !property.to_s.include?(".")
         begin

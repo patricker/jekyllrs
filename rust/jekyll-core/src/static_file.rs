@@ -216,7 +216,6 @@ fn io_error(ruby: &Ruby, path: &str, err: &io::Error) -> Error {
     Error::new(error_class, format!("Error handling '{}': {}", path, err))
 }
 
-
 fn simple_copy(src: &str, dest: &str, production: bool) -> io::Result<()> {
     let dest_path = Path::new(dest);
     if let Some(parent) = dest_path.parent() {

@@ -1,4 +1,4 @@
-use magnus::{function, prelude::*, Error, RModule, Value, IntoValue, TryConvert};
+use magnus::{function, prelude::*, Error, IntoValue, RModule, TryConvert, Value};
 
 use crate::ruby_utils::ruby_handle;
 
@@ -27,12 +27,45 @@ fn engine_build_site_with_profile(site: Value, profile_enabled: bool) -> Result<
         let _: Value = profiler.funcall("profile_process", ())?;
         return Ok(());
     }
+    // Non-profiled build with phase timings and a summary table
+    let mut phases: Vec<(&str, f64)> = Vec::with_capacity(6);
+
+    let t = std::time::Instant::now();
     let _: Value = site.funcall("reset", ())?;
+    phases.push(("RESET", t.elapsed().as_secs_f64()));
+
+    let t = std::time::Instant::now();
     let _: Value = site.funcall("read", ())?;
+    phases.push(("READ", t.elapsed().as_secs_f64()));
+
+    let t = std::time::Instant::now();
     let _: Value = site.funcall("generate", ())?;
+    phases.push(("GENERATE", t.elapsed().as_secs_f64()));
+
+    let t = std::time::Instant::now();
     let _: Value = site.funcall("render", ())?;
+    phases.push(("RENDER", t.elapsed().as_secs_f64()));
+
+    let t = std::time::Instant::now();
     let _: Value = site.funcall("cleanup", ())?;
+    phases.push(("CLEANUP", t.elapsed().as_secs_f64()));
+
+    let t = std::time::Instant::now();
     let _: Value = site.funcall("write", ())?;
+    phases.push(("WRITE", t.elapsed().as_secs_f64()));
+
+    // Print Build Process Summary to match Jekyll profile output style
+    let ruby = ruby_handle()?;
+    let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
+    let logger: Value = jekyll.funcall("logger", ())?;
+    let _: Value = logger.funcall("info", ("", "Build Process Summary:"))?;
+    let _: Value = logger.funcall("info", ("", ""))?;
+    let _: Value = logger.funcall("info", ("", "| PHASE    |    TIME |"))?;
+    let _: Value = logger.funcall("info", ("", "+----------+---------+"))?;
+    for (name, secs) in phases {
+        let row = format!("| {:<8} | {:>7.4} |", name, secs);
+        let _: Value = logger.funcall("info", ("", row))?;
+    }
     Ok(())
 }
 
@@ -57,7 +90,10 @@ fn engine_build_process(options: Value) -> Result<(), Error> {
     if skip_initial {
         let _: Value = logger.funcall(
             "warn",
-            ("Build Warning:", "Skipping the initial build. This may result in an out-of-date site."),
+            (
+                "Build Warning:",
+                "Skipping the initial build. This may result in an out-of-date site.",
+            ),
         )?;
     } else {
         // Build with logging identical to Ruby
@@ -71,7 +107,11 @@ fn engine_build_process(options: Value) -> Result<(), Error> {
 
         let incremental_val: Value = config.funcall("[]", (ruby.str_new("incremental"),))?;
         let incremental = !incremental_val.is_nil() && incremental_val.to_bool();
-        let inc_msg = if incremental { "enabled" } else { "disabled. Enable with --incremental" };
+        let inc_msg = if incremental {
+            "enabled"
+        } else {
+            "disabled. Enable with --incremental"
+        };
 
         let _: Value = logger.funcall("info", ("Source:", source))?;
         let _: Value = logger.funcall("info", ("Destination:", destination))?;
@@ -110,7 +150,10 @@ fn engine_build_process(options: Value) -> Result<(), Error> {
     } else if detach {
         let _: Value = logger.funcall(
             "info",
-            ("Auto-regeneration:", "disabled when running server detached."),
+            (
+                "Auto-regeneration:",
+                "disabled when running server detached.",
+            ),
         )?;
     } else if watch {
         let external: RModule = jekyll.const_get("External")?;

@@ -63,7 +63,8 @@ fn regenerator_read_metadata(metadata_file: String, disabled: bool) -> Result<Va
                 let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
                 let logger: Value = jekyll.funcall("logger", ())?;
                 let message = format!("Failed to load {}: {}", metadata_file, err);
-                let _ = logger.funcall::<_, _, Value>("warn", (ruby.str_new(""), ruby.str_new(&message)));
+                let _ = logger
+                    .funcall::<_, _, Value>("warn", (ruby.str_new(""), ruby.str_new(&message)));
                 return Ok(ruby.hash_new().into_value_with(&ruby));
             }
             // Re-raise other errors
@@ -85,21 +86,21 @@ fn regenerator_write_metadata(
     let logger: Value = jekyll.funcall("logger", ())?;
     let _ = logger.funcall::<_, _, Value>(
         "debug",
-        (ruby.str_new("Writing Metadata:"), ruby.str_new(".jekyll-metadata")),
+        (
+            ruby.str_new("Writing Metadata:"),
+            ruby.str_new(".jekyll-metadata"),
+        ),
     );
 
     let marshal: Value = ruby.class_object().const_get("Marshal")?;
     let dumped: Value = marshal.funcall("dump", (metadata,))?;
 
     let file_class: Value = ruby.class_object().const_get("File")?;
-    let _ = file_class.funcall::<_, _, Value>(
-        "binwrite",
-        (ruby.str_new(&metadata_file), dumped),
-    )?;
+    let _ =
+        file_class.funcall::<_, _, Value>("binwrite", (ruby.str_new(&metadata_file), dumped))?;
 
     Ok(())
 }
-
 
 fn regenerator_existing_file_modified(this_obj: Value, path: String) -> Result<bool, Error> {
     let ruby = ruby_handle()?;
@@ -144,7 +145,6 @@ fn regenerator_existing_file_modified(this_obj: Value, path: String) -> Result<b
     let _ = this_obj.funcall::<_, _, Value>("add", (ruby.str_new(&path),))?;
     Ok(true)
 }
-
 
 fn regenerator_source_modified_or_dest_missing(
     this_obj: Value,

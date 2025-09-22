@@ -1565,3 +1565,42 @@ class TestFilters < JekyllUnitTest
     end
   end
 end
+
+
+class TestFilters < JekyllUnitTest
+  context "where and sort fast paths" do
+    should "where matches array of hashes on simple property" do
+      f = make_filter_mock
+      data = [
+        { "color" => "red",  "n" => 2 },
+        { "color" => "blue", "n" => 3 },
+        { "color" => "red",  "n" => 1 },
+      ]
+      out = f.where(data, "color", "red")
+      assert_equal 2, out.length
+      assert out.all? { |e| e["color"] == "red" }
+    end
+
+    should "where falls back on dotted properties" do
+      f = make_filter_mock
+      data = [{ "a" => { "b" => 1 } }, { "a" => { "b" => 2 } }]
+      out = f.where(data, "a.b", 2)
+      assert_equal 1, out.length
+      assert_equal 2, out[0]["a"]["b"]
+    end
+
+    should "sort by simple property and honor nils order" do
+      f = make_filter_mock
+      data = [
+        { "k" => "10" },
+        { "k" => nil },
+        { "k" => "2" },
+      ]
+      asc = f.sort(data, "k", "first")
+      assert_equal [nil, 2.0, 10.0], asc.map { |e| e["k"].nil? ? nil : e["k"].to_f }
+
+      desc = f.sort(data, "k", "last")
+      assert_equal [2.0, 10.0, nil], desc.map { |e| e["k"].nil? ? nil : e["k"].to_f }
+    end
+  end
+end

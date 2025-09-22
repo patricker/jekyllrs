@@ -438,7 +438,6 @@ mod tests {
     }
 }
 
-
 fn document_metadata(
     path: String,
     relative_path: String,

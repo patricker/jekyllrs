@@ -1,6 +1,6 @@
+use magnus::IntoValue;
 use magnus::{function, prelude::*, Error, RModule, RString, Value};
 use once_cell::sync::Lazy;
-use magnus::IntoValue;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
@@ -20,7 +20,8 @@ pub fn define_into(bridge: &RModule) -> Result<(), Error> {
 }
 
 // Cache for globbed absolute scope paths -> Vec<String>
-static GLOB_CACHE: Lazy<Mutex<HashMap<String, Vec<String>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static GLOB_CACHE: Lazy<Mutex<HashMap<String, Vec<String>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 fn frontmatter_applies_path(
     path: RString,
@@ -74,7 +75,10 @@ fn frontmatter_applies_path(
                 Err(_) => entry.clone(),
             };
             if rel.starts_with(std::path::MAIN_SEPARATOR) || rel.starts_with('/') {
-                rel = rel.trim_start_matches(std::path::MAIN_SEPARATOR).trim_start_matches('/').to_string();
+                rel = rel
+                    .trim_start_matches(std::path::MAIN_SEPARATOR)
+                    .trim_start_matches('/')
+                    .to_string();
             }
             // Remove collections_dir prefix if present
             let rel_stripped = strip_collections_dir(&rel, &collections_dir);
@@ -85,7 +89,10 @@ fn frontmatter_applies_path(
                 let logger: Value = jekyll.funcall("logger", ())?;
                 let _ = logger.funcall::<_, _, Value>(
                     "debug",
-                    (ruby.str_new("Globbed Scope Path:"), ruby.str_new(&rel_stripped)),
+                    (
+                        ruby.str_new("Globbed Scope Path:"),
+                        ruby.str_new(&rel_stripped),
+                    ),
                 );
             }
 
@@ -108,8 +115,12 @@ fn frontmatter_has_precedence(old_scope: Value, new_scope: Value) -> Result<bool
 
     let ruby = ruby_handle()?;
 
-    let new_path = sanitize_path(&string_or_empty(new_scope.funcall::<_, _, Value>("[]", (ruby.str_new("path"),))?));
-    let old_path = sanitize_path(&string_or_empty(old_scope.funcall::<_, _, Value>("[]", (ruby.str_new("path"),))?));
+    let new_path = sanitize_path(&string_or_empty(
+        new_scope.funcall::<_, _, Value>("[]", (ruby.str_new("path"),))?,
+    ));
+    let old_path = sanitize_path(&string_or_empty(
+        old_scope.funcall::<_, _, Value>("[]", (ruby.str_new("path"),))?,
+    ));
 
     if new_path.len() != old_path.len() {
         return Ok(new_path.len() >= old_path.len());
