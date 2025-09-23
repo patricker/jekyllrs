@@ -21,6 +21,7 @@ mod time_utils;
 mod url;
 mod utils;
 mod yaml_header;
+mod fs_walk;
 
 use magnus::{prelude::*, Error, RModule, Ruby};
 

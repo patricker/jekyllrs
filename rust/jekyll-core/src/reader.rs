@@ -7,11 +7,11 @@ use crate::ruby_utils::ruby_handle;
 pub fn define_into(bridge: &RModule) -> Result<(), Error> {
     bridge.define_singleton_method("reader_classify", function!(reader_classify, 2))?;
     bridge.define_singleton_method("reader_walk", function!(reader_walk, 2))?;
-    bridge.define_singleton_method("reader_get_entries", function!(reader_get_entries, 3))?;
-    bridge.define_singleton_method("reader_get_entries_posts", function!(reader_get_entries_posts, 3))?;
-    bridge.define_singleton_method("reader_get_entries_drafts", function!(reader_get_entries_drafts, 3))?;
+    bridge.define_singleton_method("reader_get_entries", function!(reader_get_entries_walk, 3))?;
+    bridge.define_singleton_method("reader_get_entries_posts", function!(reader_get_entries_posts_walk, 3))?;
+    bridge.define_singleton_method("reader_get_entries_drafts", function!(reader_get_entries_drafts_walk, 3))?;
     bridge.define_singleton_method("data_reader_entries", function!(data_reader_entries, 2))?;
-    bridge.define_singleton_method("layout_entries", function!(layout_entries, 2))?;
+    bridge.define_singleton_method("layout_entries", function!(layout_entries_walk, 2))?;
     Ok(())
 }
 
@@ -383,4 +383,151 @@ fn layout_entries(site: Value, dir: RString) -> Result<Value, Error> {
         return Ok(out.into_value_with(&ruby));
     }
     Ok(filtered)
+}
+
+// Native-walker-backed implementation for get_entries
+fn reader_get_entries_walk(site: Value, dir: RString, subfolder: RString) -> Result<Value, Error> {
+    let ruby = ruby_handle()?;
+    let file: Value = ruby.class_object().const_get("File")?;
+    let base: RString = site.funcall("in_source_dir", (dir, subfolder))?;
+    let base_str = base.to_string()?;
+    let exists: bool = file.funcall("exist?", (ruby.str_new(&base_str),))?;
+    if !exists {
+        return Ok(ruby.ary_new().into_value_with(&ruby));
+    }
+
+    let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
+    let rust: RModule = jekyll.const_get("Rust")?;
+    let bridge: RModule = rust.const_get("Bridge")?;
+
+    let list = crate::fs_walk::recursive_list_site(site, &base_str).unwrap_or_else(|_| Vec::new());
+    let arr = ruby.ary_new();
+    for s in list.iter() { let _ = arr.push(ruby.str_new(s)); }
+    let filtered: Value = bridge.funcall("entry_filter", (site, arr, base))?;
+    let entries = RArray::try_convert(filtered)?;
+
+    let out = ruby.ary_new();
+    for item in entries.each() {
+        let e: RString = item?.funcall("to_s", ())?;
+        let joined: RString = site.funcall("in_source_dir", (ruby.str_new(&base_str), e))?;
+        let is_dir: bool = file.funcall("directory?", (joined,))?;
+        if !is_dir {
+            out.push(e)?;
+        }
+    }
+    Ok(out.into_value_with(&ruby))
+}
+
+// Native-walker-backed implementation for layout entries
+fn layout_entries_walk(site: Value, dir: RString) -> Result<Value, Error> {
+    let ruby = ruby_handle()?;
+    let file: Value = ruby.class_object().const_get("File")?;
+    let dir_str = dir.to_string()?;
+    let exists: bool = file.funcall("exist?", (ruby.str_new(&dir_str),))?;
+    let out = ruby.ary_new();
+    if !exists {
+        return Ok(out.into_value_with(&ruby));
+    }
+
+    // Traverse and collect files with an extension (like **/*.*)
+    let mut entries_vec: Vec<String> = Vec::new();
+    let mut stack: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from(&dir_str)];
+    while let Some(p) = stack.pop() {
+        if let Ok(iter) = std::fs::read_dir(&p) {
+            for ent in iter.flatten() {
+                let path = ent.path();
+                let rel = match path.strip_prefix(&dir_str) { Ok(r) => r, Err(_) => continue };
+                let name = {
+                    let s = rel.to_string_lossy();
+                    if std::path::MAIN_SEPARATOR == '/' { s.into_owned() } else { s.replace(std::path::MAIN_SEPARATOR, "/") }
+                };
+                if name.is_empty() { continue; }
+                if let Ok(ft) = ent.file_type() {
+                    if ft.is_dir() {
+                        stack.push(path);
+                    } else if name.contains('.') {
+                        entries_vec.push(name);
+                    }
+                }
+            }
+        }
+    }
+
+    let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
+    let rust: RModule = jekyll.const_get("Rust")?;
+    let bridge: RModule = rust.const_get("Bridge")?;
+    let arr = ruby.ary_new();
+    for s in entries_vec.iter() { let _ = arr.push(ruby.str_new(s)); }
+    let filtered: Value = bridge.funcall("entry_filter", (site, arr, dir))?;
+
+    // Filter out symlinked files outside the source when in safe mode
+    let ef_class: Value = jekyll.const_get("EntryFilter")?;
+    let ef: Value = ef_class.funcall("new", (site,))?;
+    if let Some(arr) = RArray::from_value(filtered.clone()) {
+        let out = ruby.ary_new();
+        for item in arr.each() {
+            let name: RString = item?.funcall("to_s", ())?;
+            let full: RString = file.funcall("join", (dir, name))?;
+            let skip: bool = ef.funcall("symlink?", (full,))?;
+            if !skip { out.push(name)?; }
+        }
+        return Ok(out.into_value_with(&ruby));
+    }
+    Ok(filtered)
+}
+
+// Helper that mirrors collect_entries but uses native walker
+fn collect_entries_walk(site: Value, dir: RString, subfolder: RString) -> Result<(Ruby, Value, RArray, String), Error> {
+    let ruby = ruby_handle()?;
+    let file: Value = ruby.class_object().const_get("File")?;
+    let base: RString = site.funcall("in_source_dir", (dir, subfolder))?;
+    let base_str = base.to_string()?;
+    let exists: bool = file.funcall("exist?", (ruby.str_new(&base_str),))?;
+    if !exists {
+        let arr = ruby.ary_new();
+        return Ok((ruby, file, arr, base_str));
+    }
+    let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
+    let rust: RModule = jekyll.const_get("Rust")?;
+    let bridge: RModule = rust.const_get("Bridge")?;
+    let list = crate::fs_walk::recursive_list_site(site, &base_str).unwrap_or_else(|_| Vec::new());
+    let arr = ruby.ary_new();
+    for s in list.iter() { let _ = arr.push(ruby.str_new(s)); }
+    let filtered: Value = bridge.funcall("entry_filter", (site, arr, base))?;
+    let entries = RArray::try_convert(filtered)?;
+    Ok((ruby, file, entries, base_str))
+}
+
+fn reader_get_entries_posts_walk(site: Value, dir: RString, subfolder: RString) -> Result<Value, Error> {
+    let (ruby, file, entries, base_str) = collect_entries_walk(site, dir, subfolder)?;
+    static POST_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"^(?:.+/)*?(\d{2,4}-\d{1,2}-\d{1,2})-([^/]*)(\.[^.]+)$").unwrap()
+    });
+    let out = ruby.ary_new();
+    for item in entries.each() {
+        let e: RString = item?.funcall("to_s", ())?;
+        let joined: RString = magnus::Value::from(site).funcall("in_source_dir", (ruby.str_new(&base_str), e))?;
+        let is_dir: bool = file.funcall("directory?", (joined,))?;
+        if is_dir { continue; }
+        let s = e.to_string()?;
+        if POST_RE.is_match(&s) { out.push(e)?; }
+    }
+    Ok(out.into_value_with(&ruby))
+}
+
+fn reader_get_entries_drafts_walk(site: Value, dir: RString, subfolder: RString) -> Result<Value, Error> {
+    let (ruby, file, entries, base_str) = collect_entries_walk(site, dir, subfolder)?;
+    static DRAFT_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"^(?:.+/)*(.*)(\.[^.]+)$").unwrap()
+    });
+    let out = ruby.ary_new();
+    for item in entries.each() {
+        let e: RString = item?.funcall("to_s", ())?;
+        let joined: RString = magnus::Value::from(site).funcall("in_source_dir", (ruby.str_new(&base_str), e))?;
+        let is_dir: bool = file.funcall("directory?", (joined,))?;
+        if is_dir { continue; }
+        let s = e.to_string()?;
+        if DRAFT_RE.is_match(&s) { out.push(e)?; }
+    }
+    Ok(out.into_value_with(&ruby))
 }
