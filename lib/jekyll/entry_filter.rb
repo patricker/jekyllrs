@@ -30,9 +30,6 @@ module Jekyll
 
     def filter(entries)
       Array(Jekyll::Rust.entry_filter(site, entries, base_directory))
-    rescue StandardError => e
-      Jekyll.logger.debug "EntryFilter:", "Rust filter failed (#{e.message}); falling back" if Jekyll.logger
-      filter_with_ruby(entries)
     end
 
     def included?(entry)

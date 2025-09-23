@@ -10,6 +10,7 @@ pub fn define_into(bridge: &RModule) -> Result<(), Error> {
     bridge.define_singleton_method("reader_get_entries", function!(reader_get_entries, 3))?;
     bridge.define_singleton_method("reader_get_entries_posts", function!(reader_get_entries_posts, 3))?;
     bridge.define_singleton_method("reader_get_entries_drafts", function!(reader_get_entries_drafts, 3))?;
+    bridge.define_singleton_method("data_reader_entries", function!(data_reader_entries, 2))?;
     Ok(())
 }
 
@@ -24,7 +25,6 @@ fn reader_classify(site: Value, base: RString) -> Result<Value, Error> {
     let dirs = ruby.ary_new();
     let pages = ruby.ary_new();
     let statics = ruby.ary_new();
-
     if !is_dir {
         result.aset(Symbol::new("dirs"), dirs)?;
         result.aset(Symbol::new("pages"), pages)?;
@@ -76,6 +76,7 @@ fn reader_walk(site: Value, rel_dir: RString) -> Result<Value, Error> {
 
     let pages = ruby.ary_new();
     let statics = ruby.ary_new();
+    let dirs = ruby.ary_new();
 
     fn walk(
         ruby: &Ruby,
@@ -87,6 +88,7 @@ fn reader_walk(site: Value, rel_dir: RString) -> Result<Value, Error> {
         rel_prefix: &str,
         pages: &RArray,
         statics: &RArray,
+        dirs: &RArray,
     ) -> Result<(), Error> {
         let dir_mod: Value = ruby.class_object().const_get("Dir")?;
         let base_rs = ruby.str_new(base_path);
@@ -102,15 +104,18 @@ fn reader_walk(site: Value, rel_dir: RString) -> Result<Value, Error> {
             let full_str = full.to_string()?;
             let is_dir: bool = file.funcall("directory?", (ruby.str_new(&full_str),))?;
             if is_dir {
+                // Exclude symlinked directories (outside source in safe mode)
+                let is_bad: bool = ef.funcall("symlink?", (ruby.str_new(&full_str),))?;
+                if is_bad {
+                    continue;
+                }
                 let child_rel = if rel_prefix.is_empty() {
                     entry_str.clone()
                 } else {
-                    let is_bad: bool = ef.funcall("symlink?", (ruby.str_new(&full_str),))?;
-                    if is_bad {
-                        continue;
-                    }
                     format!("{}/{}", rel_prefix, entry_str)
                 };
+                // Record directory relative path for post/draft scanning on Ruby side
+                dirs.push(ruby.str_new(&child_rel))?;
                 let child_base: RString =
                     file.funcall("join", (ruby.str_new(base_path), ruby.str_new(&entry_str)))?;
                 walk(
@@ -123,6 +128,7 @@ fn reader_walk(site: Value, rel_dir: RString) -> Result<Value, Error> {
                     &child_rel,
                     pages,
                     statics,
+                    dirs,
                 )?;
             } else {
                 let is_bad: bool = ef.funcall("symlink?", (ruby.str_new(&full_str),))?;
@@ -155,12 +161,13 @@ fn reader_walk(site: Value, rel_dir: RString) -> Result<Value, Error> {
     let ef_class: Value = jekyll.const_get("EntryFilter")?;
     let ef: Value = ef_class.funcall("new", (site,))?;
     walk(
-        &ruby, site, file, bridge, ef, &base_path, "", &pages, &statics,
+        &ruby, site, file, bridge, ef, &base_path, "", &pages, &statics, &dirs,
     )?;
 
     let result = RHash::new();
     result.aset(Symbol::new("pages"), pages)?;
     result.aset(Symbol::new("static"), statics)?;
+    result.aset(Symbol::new("dirs"), dirs)?;
     Ok(result.into_value_with(&ruby))
 }
 
@@ -266,3 +273,72 @@ fn reader_get_entries_drafts(site: Value, dir: RString, subfolder: RString) -> R
     Ok(out.into_value_with(&ruby))
 }
 
+fn data_reader_entries(site: Value, dir: RString) -> Result<Value, Error> {
+    let ruby = ruby_handle()?;
+    let file: Value = ruby.class_object().const_get("File")?;
+    let dir_mod: Value = ruby.class_object().const_get("Dir")?;
+    let dir_str = dir.to_string()?;
+
+    let is_dir: bool = file.funcall("directory?", (ruby.str_new(&dir_str),))?;
+    let result = RHash::new();
+    let files = ruby.ary_new();
+    let dirs = ruby.ary_new();
+    result.aset(Symbol::new("files"), files)?;
+    result.aset(Symbol::new("dirs"), dirs)?;
+
+    if !is_dir {
+        return Ok(result.into_value_with(&ruby));
+    }
+
+    // EntryFilter for symlink checks
+    let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
+    let ef_class: Value = jekyll.const_get("EntryFilter")?;
+    let ef: Value = ef_class.funcall("new", (site,))?;
+
+    // Within the directory, gather data files and child directories
+    let block = ruby.proc_from_fn(|_args: &[Value], _block| {
+        let ruby = crate::ruby_utils::ruby_handle()?;
+        let dir_mod: Value = ruby.class_object().const_get("Dir")?;
+        let data_files: Value = dir_mod.funcall("glob", ("*.{yaml,yml,json,csv,tsv}",))?;
+        let entries: Value = dir_mod.funcall("entries", (".",))?;
+        let array = ruby.hash_new();
+        array.aset(Symbol::new("data_files"), data_files)?;
+        array.aset(Symbol::new("entries"), entries)?;
+        Ok(array.into_value_with(&ruby))
+    });
+    let listing: Value = dir_mod.funcall_with_block("chdir", (ruby.str_new(&dir_str),), block)?;
+    let data_files_val: Value = listing.funcall("[]", (Symbol::new("data_files"),))?;
+    let entries_val: Value = listing.funcall("[]", (Symbol::new("entries"),))?;
+
+    // Filter data files (skip symlinks)
+    if let Some(arr) = RArray::from_value(data_files_val) {
+        for item in arr.each() {
+            let name: RString = item?.funcall("to_s", ())?;
+            let name_str = name.to_string()?;
+            let full: RString = file.funcall("join", (ruby.str_new(&dir_str), name))?;
+            let skip: bool = ef.funcall("symlink?", (full,))?;
+            if !skip {
+                files.push(ruby.str_new(&name_str))?;
+            }
+        }
+    }
+
+    // Filter directories (skip symlinks)
+    if let Some(arr) = RArray::from_value(entries_val) {
+        for item in arr.each() {
+            let name: RString = item?.funcall("to_s", ())?;
+            let name_str = name.to_string()?;
+            if name_str == "." || name_str == ".." { continue; }
+            let full: RString = file.funcall("join", (ruby.str_new(&dir_str), name))?;
+            let is_dir: bool = file.funcall("directory?", (full,))?;
+            if !is_dir { continue; }
+            let full2: RString = file.funcall("join", (ruby.str_new(&dir_str), ruby.str_new(&name_str)))?;
+            let skip: bool = ef.funcall("symlink?", (full2,))?;
+            if !skip {
+                dirs.push(ruby.str_new(&name_str))?;
+            }
+        }
+    }
+
+    Ok(result.into_value_with(&ruby))
+}

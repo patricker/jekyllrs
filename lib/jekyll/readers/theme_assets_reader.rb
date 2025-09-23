@@ -37,7 +37,16 @@ module Jekyll
     end
 
     def append_unless_exists(haystack, new_item)
-      if haystack.any? { |file| (file.relative_path == new_item.relative_path) || (file.relative_path.delete_prefix("/") == new_item.relative_path.delete_prefix("/")) }
+      new_rel = new_item.relative_path.delete_prefix("/")
+      new_url = new_item.respond_to?(:url) ? new_item.url.to_s : nil
+      # Prefer site content over theme content: if a site file exists on disk
+      # at the same relative path, do not add the theme item regardless of
+      # whether the site item has been materialized yet.
+      site_path = File.join(site.source, new_rel)
+      if File.exist?(site_path) || haystack.any? do |file|
+           (file.relative_path.delete_prefix("/") == new_rel) ||
+           (new_url && file.respond_to?(:url) && file.url.to_s == new_url)
+         end
         Jekyll.logger.debug "Theme:",
                             "Ignoring #{new_item.relative_path} in theme due to existing file " \
                             "with that path in site."

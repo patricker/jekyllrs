@@ -54,44 +54,46 @@ module Jekyll
     # Returns nothing.
     def read_directories(dir = "")
       base = site.in_source_dir(dir)
-
+      
       return unless File.directory?(base)
-
-      dot_dirs = []
-      dot_pages = []
-      dot_static_files = []
-
-      classified = Jekyll::Rust.reader_classify(site, base)
-      dot_dirs = classified[:dirs]
-      dot_pages = []
-      dot_static_files = []
-
-      retrieve_posts(dir)
-      retrieve_dirs(base, dir, dot_dirs)
-      retrieve_pages(dir, dot_pages)
-      retrieve_static_files(dir, dot_static_files)
-
-      # Use Rust walker once at root to read pages and static files
-      if dir == ""
-        begin
-          walked = Jekyll::Rust.reader_walk(site, dir)
-          group_by_dir = lambda do |paths|
-            groups = Hash.new { |h, k| h[k] = [] }
-            Array(paths).each do |rel|
-              rel = rel.to_s
-              d  = File.dirname(rel)
-              d  = "" if d == "."
-              groups[d] << File.basename(rel)
-            end
-            groups
-          end
-          group_by_dir.call(walked[:pages]).each { |d, files| site.pages.concat(PageReader.new(site, d).read(files)) }
-          group_by_dir.call(walked[:static]).each { |d, files| static_dir = d == "" ? d : "/#{d}"; site.static_files.concat(StaticFileReader.new(site, static_dir).read(files)) }
-        rescue StandardError
-          # Fallback to the per-directory classified lists if walker fails
-          retrieve_pages(dir, classified[:pages])
-          retrieve_static_files(dir, classified[:static])
+      
+      walked = Jekyll::Rust.reader_walk(site, dir)
+      group_by_dir = lambda do |paths|
+        groups = Hash.new { |h, k| h[k] = [] }
+        Array(paths).each do |rel|
+          rel = rel.to_s
+          d  = File.dirname(rel)
+          d  = "" if d == "."
+          groups[d] << File.basename(rel)
         end
+        groups
+      end
+
+      join_dir = lambda do |prefix, d|
+        if prefix.to_s.empty?
+          d.to_s
+        elsif d.to_s.empty?
+          prefix.to_s
+        else
+          File.join(prefix.to_s, d.to_s)
+        end
+      end
+
+      group_by_dir.call(walked[:pages]).each do |d, files|
+        effective_dir = join_dir.call(dir, d)
+        site.pages.concat(PageReader.new(site, effective_dir).read(files))
+      end
+
+      group_by_dir.call(walked[:static]).each do |d, files|
+        effective_dir = join_dir.call(dir, d)
+        static_dir = effective_dir.empty? ? effective_dir : "/#{effective_dir}"
+        site.static_files.concat(StaticFileReader.new(site, static_dir).read(files))
+      end
+
+      # Read posts/drafts under this subtree
+      retrieve_posts(dir)
+      Array(walked[:dirs]).each do |d|
+        retrieve_posts(join_dir.call(dir, d.to_s))
       end
     end
 
@@ -165,15 +167,7 @@ module Jekyll
     #
     # Returns the list of entries to process
     def get_entries(dir, subfolder)
-      if defined?(Jekyll::Rust) && Jekyll::Rust.respond_to?(:reader_get_entries)
-        return Array(Jekyll::Rust.reader_get_entries(site, dir.to_s, subfolder.to_s))
-      end
-
-      base = site.in_source_dir(dir, subfolder)
-      return [] unless File.exist?(base)
-
-      entries = Dir.chdir(base) { filter_entries(Dir["**/*"], base) }
-      entries.delete_if { |e| File.directory?(site.in_source_dir(base, e)) }
+      Array(Jekyll::Rust.reader_get_entries(site, dir.to_s, subfolder.to_s))
     end
 
     private
@@ -188,7 +182,9 @@ module Jekyll
     # outside that directory.
     def outside_configured_directory?(dir)
       collections_dir = site.config["collections_dir"]
-      !collections_dir.empty? && !dir.start_with?("/#{collections_dir}")
+      return false if collections_dir.to_s.empty?
+      normalized = dir.to_s.start_with?("/") ? dir.to_s : "/%s" % dir
+      !normalized.start_with?("/%s" % collections_dir)
     end
 
     # Create a single PostReader instance to retrieve drafts and posts from all valid

@@ -34,20 +34,23 @@ module Jekyll
     def read_data_to(dir, data)
       return unless File.directory?(dir) && !@entry_filter.symlink?(dir)
 
-      entries = Dir.chdir(dir) do
-        Dir["*.{yaml,yml,json,csv,tsv}"] + Dir["*"].select { |fn| File.directory?(fn) }
-      end
+      listing = Jekyll::Rust.data_reader_entries(site, dir)
+      files = Array(listing[:files])
+      dirs  = Array(listing[:dirs])
 
-      entries.each do |entry|
+      # Files first, then directories, so that folder data takes precedence
+      # over files with the same basename.
+      files.each do |entry|
         path = @in_source_dir.call(dir, entry)
         next if @entry_filter.symlink?(path)
+        key = sanitize_filename(File.basename(entry, ".*"))
+        data[key] = read_data_file(path)
+      end
 
-        if File.directory?(path)
-          read_data_to(path, data[sanitize_filename(entry)] = {})
-        else
-          key = sanitize_filename(File.basename(entry, ".*"))
-          data[key] = read_data_file(path)
-        end
+      dirs.each do |entry|
+        path = @in_source_dir.call(dir, entry)
+        next if @entry_filter.symlink?(path)
+        read_data_to(path, data[sanitize_filename(entry)] = {})
       end
     end
 

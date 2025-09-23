@@ -92,33 +92,19 @@ module Jekyll
     def filtered_entries
       return [] unless exists?
 
-      # Try Rust fast path: uses EntryFilter + glob and excludes directories upfront
-      begin
-        if defined?(Jekyll::Rust) && Jekyll::Rust.respond_to?(:reader_get_entries)
-          files = Array(Jekyll::Rust.reader_get_entries(site, container.to_s, relative_directory.to_s))
-          # Align with Ruby: reject symlinks (with full path) if any slipped through
-          if site.include.is_a?(Array)
-          Dir.chdir(directory) do
-            site.include.each do |inc|
-              next unless inc.is_a?(String) && inc.start_with?(".") && !inc.include?("/")
-              Dir.glob(File.join("**", inc), File::FNM_DOTMATCH) do |match|
-                files << match unless files.include?(match)
-              end
+      files = Array(Jekyll::Rust.reader_get_entries(site, container.to_s, relative_directory.to_s))
+      # Also include dotfiles explicitly listed in  within the collection dir.
+      if site.include.is_a?(Array)
+        Dir.chdir(directory) do
+          site.include.each do |inc|
+            next unless inc.is_a?(String) && inc.start_with?(".") && !inc.include?("/")
+            Dir.glob(File.join("**", inc), File::FNM_DOTMATCH) do |match|
+              files << match unless files.include?(match)
             end
           end
         end
-        return files.reject { |f| entry_filter.symlink?(collection_dir(f)) }
-        end
-      rescue StandardError
-        # fall through to Ruby path
       end
-
-      @filtered_entries ||= Dir.chdir(directory) do
-        entry_filter.filter(entries).reject do |f|
-          path = collection_dir(f)
-          File.directory?(path) || entry_filter.symlink?(f)
-        end
-      end
+      files.reject { |f| entry_filter.symlink?(collection_dir(f)) }
     end
 
     # The directory for this Collection, relative to the site source or the directory

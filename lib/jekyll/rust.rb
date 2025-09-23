@@ -259,6 +259,11 @@ module Jekyll
         Bridge.reader_get_entries_drafts(site, dir, subfolder)
       end
 
+      def data_reader_entries(site, dir)
+        ensure_loaded!
+        Bridge.data_reader_entries(site, dir)
+      end
+
       def merged_file_read_opts(site, opts)
         ensure_loaded!
         Bridge.merged_file_read_opts(site, opts)

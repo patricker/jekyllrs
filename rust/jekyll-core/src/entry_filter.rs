@@ -64,7 +64,7 @@ fn entry_filter(
             continue;
         }
 
-        if is_symlink_filtered(&ruby, site, file_class, &entry_str)? {
+        if is_symlink_filtered(&ruby, site, file_class, &base_dir, &entry_str)? {
             continue;
         }
 
@@ -172,6 +172,7 @@ fn is_symlink_filtered(
     ruby: &Ruby,
     site: Value,
     file_class: Value,
+    base_directory: &str,
     entry: &str,
 ) -> Result<bool, Error> {
     let safe: bool = site.funcall("safe", ())?;
@@ -179,12 +180,14 @@ fn is_symlink_filtered(
         return Ok(false);
     }
 
-    let is_symlink: bool = file_class.funcall("symlink?", (ruby.str_new(entry),))?;
+    // Evaluate symlink status against the path relative to the filter base directory
+    let full_path = join_paths(ruby, file_class, base_directory, entry)?;
+    let is_symlink: bool = file_class.funcall("symlink?", (ruby.str_new(full_path.as_str()),))?;
     if !is_symlink {
         return Ok(false);
     }
 
-    let realpath: RString = file_class.funcall("realpath", (ruby.str_new(entry),))?;
+    let realpath: RString = file_class.funcall("realpath", (ruby.str_new(full_path.as_str()),))?;
     let root: RString = site.funcall("in_source_dir", ())?;
 
     let real = PathBuf::from(realpath.to_string()?);
