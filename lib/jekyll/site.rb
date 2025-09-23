@@ -188,12 +188,7 @@ module Jekyll
     #
     # Returns nothing.
     def generate
-      generators.each do |generator|
-        start = Time.now
-        generator.generate(self)
-        Jekyll.logger.debug "Generating:",
-                            "#{generator.class} finished in #{Time.now - start} seconds."
-      end
+      Jekyll::Rust.engine_generate(self)
       nil
     end
 

@@ -110,42 +110,7 @@ module Jekyll
       site.posts.docs.concat(post_reader.read_drafts(dir)) if site.show_drafts
     end
 
-    # Recursively traverse directories with the read_directories function.
-    #
-    # base - The String representing the site's base directory.
-    # dir - The String representing the directory to traverse down.
-    # dot_dirs - The Array of subdirectories in the dir.
-    #
-    # Returns nothing.
-    def retrieve_dirs(_base, dir, dot_dirs)
-      dot_dirs.each do |file|
-        dir_path = site.in_source_dir(dir, file)
-        rel_path = PathManager.join(dir, file)
-        @site.reader.read_directories(rel_path) unless @site.dest.chomp("/") == dir_path
-      end
-    end
-
-    # Retrieve all the pages from the current directory,
-    # add them to the site and sort them.
-    #
-    # dir - The String representing the directory retrieve the pages from.
-    # dot_pages - The Array of pages in the dir.
-    #
-    # Returns nothing.
-    def retrieve_pages(dir, dot_pages)
-      site.pages.concat(PageReader.new(site, dir).read(dot_pages))
-    end
-
-    # Retrieve all the static files from the current directory,
-    # add them to the site and sort them.
-    #
-    # dir - The directory retrieve the static files from.
-    # dot_static_files - The static files in the dir.
-    #
-    # Returns nothing.
-    def retrieve_static_files(dir, dot_static_files)
-      site.static_files.concat(StaticFileReader.new(site, dir).read(dot_static_files))
-    end
+    # (unused legacy helpers removed after Rust walker integration)
 
     # Filter out any files/directories that are hidden or backup files (start
     # with "." or "#" or end with "~"), or contain site content (start with "_"),

@@ -4,6 +4,7 @@ use crate::ruby_utils::ruby_handle;
 
 pub fn define_into(bridge: &RModule) -> Result<(), Error> {
     bridge.define_singleton_method("engine_build_site", function!(engine_build_site, 1))?;
+    bridge.define_singleton_method("engine_generate", function!(engine_generate, 1))?;
     Ok(())
 }
 
@@ -30,5 +31,26 @@ fn engine_build_site(site: Value) -> Result<(), Error> {
     let _ = site.funcall::<_, _, Value>("cleanup", ())?;
     let _ = site.funcall::<_, _, Value>("write", ())?;
 
+    Ok(())
+}
+
+fn engine_generate(site: Value) -> Result<(), Error> {
+    let ruby = ruby_handle()?;
+    let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
+    let logger: Value = jekyll.funcall("logger", ())?;
+    let generators: Value = site.funcall("generators", ())?;
+    if let Some(arr) = magnus::RArray::from_value(generators) {
+        for item in arr.each() {
+            let gen = item?;
+            // Time the generator
+            let start = std::time::Instant::now();
+            let _: Value = gen.funcall("generate", (site,))?;
+            let elapsed = start.elapsed().as_secs_f64();
+            let klass: Value = gen.funcall("class", ())?;
+            let klass_s: Value = klass.funcall("to_s", ())?;
+            let msg = format!("{} finished in {} seconds.", String::try_convert(klass_s)?, elapsed);
+            let _: Value = logger.funcall("debug", ("Generating:", msg))?;
+        }
+    }
     Ok(())
 }

@@ -277,6 +277,10 @@ fn static_file_write_batch(jobs: Value, _safe: bool, production: bool) -> Result
     for h in handles {
         let _ = h.join();
     }
+    // apply mtime after copying (on main thread; uses Ruby File.utime)
+    for (src, dest, mtime) in list.iter() {
+        let _ = perform_copy(&ruby, src, dest, *mtime, false, production);
+    }
     Ok(true)
 }
 

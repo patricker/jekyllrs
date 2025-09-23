@@ -97,18 +97,5 @@ module Jekyll
 
     private
 
-    def filter_with_ruby(entries)
-      entries.reject do |e|
-        next true if e.end_with?(".")
-
-        included = included?(e)
-
-        next true if excluded?(e) && !included
-        next true if symlink?(e)
-        next false if included
-
-        special?(e) || backup?(e)
-      end
-    end
   end
 end

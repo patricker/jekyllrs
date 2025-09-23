@@ -34,29 +34,15 @@ module Jekyll
     private
 
     def layout_entries
-      entries_in layout_directory
+      Array(Jekyll::Rust.layout_entries(site, layout_directory))
     end
 
     def theme_layout_entries
-      theme_layout_directory ? entries_in(theme_layout_directory) : []
-    end
-
-    def entries_in(dir)
-      entries = []
-      within(dir) do
-        entries = EntryFilter.new(site).filter(Dir["**/*.*"])
-      end
-      entries
+      theme_layout_directory ? Array(Jekyll::Rust.layout_entries(site, theme_layout_directory)) : []
     end
 
     def layout_name(file)
       file.split(".")[0..-2].join(".")
-    end
-
-    def within(directory)
-      return unless File.exist?(directory)
-
-      Dir.chdir(directory) { yield }
     end
   end
 end

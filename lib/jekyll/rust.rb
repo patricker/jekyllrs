@@ -216,6 +216,11 @@ module Jekyll
         Bridge.engine_clean_process(options)
       end
 
+      def engine_generate(site)
+        ensure_loaded!
+        Bridge.engine_generate(site)
+      end
+
 
       # URL filters helpers
       def url_filters_strip_index(input)
@@ -262,6 +267,11 @@ module Jekyll
       def data_reader_entries(site, dir)
         ensure_loaded!
         Bridge.data_reader_entries(site, dir)
+      end
+
+      def layout_entries(site, dir)
+        ensure_loaded!
+        Bridge.layout_entries(site, dir)
       end
 
       def merged_file_read_opts(site, opts)

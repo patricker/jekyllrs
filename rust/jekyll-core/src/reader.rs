@@ -11,6 +11,7 @@ pub fn define_into(bridge: &RModule) -> Result<(), Error> {
     bridge.define_singleton_method("reader_get_entries_posts", function!(reader_get_entries_posts, 3))?;
     bridge.define_singleton_method("reader_get_entries_drafts", function!(reader_get_entries_drafts, 3))?;
     bridge.define_singleton_method("data_reader_entries", function!(data_reader_entries, 2))?;
+    bridge.define_singleton_method("layout_entries", function!(layout_entries, 2))?;
     Ok(())
 }
 
@@ -341,4 +342,45 @@ fn data_reader_entries(site: Value, dir: RString) -> Result<Value, Error> {
     }
 
     Ok(result.into_value_with(&ruby))
+}
+
+fn layout_entries(site: Value, dir: RString) -> Result<Value, Error> {
+    let ruby = ruby_handle()?;
+    let file: Value = ruby.class_object().const_get("File")?;
+    let dir_mod: Value = ruby.class_object().const_get("Dir")?;
+
+    let dir_str = dir.to_string()?;
+    let exists: bool = file.funcall("exist?", (ruby.str_new(&dir_str),))?;
+    let out = ruby.ary_new();
+    if !exists {
+        return Ok(out.into_value_with(&ruby));
+    }
+
+    // Use EntryFilter to filter files; list all files with an extension
+    let block = ruby.proc_from_fn(|_args: &[Value], _block| {
+        let ruby = crate::ruby_utils::ruby_handle()?;
+        let dir_mod: Value = ruby.class_object().const_get("Dir")?;
+        let glob: Value = dir_mod.funcall("glob", ("**/*.*",))?;
+        Ok(glob)
+    });
+    let entries_val: Value = dir_mod.funcall_with_block("chdir", (ruby.str_new(&dir_str),), block)?;
+
+    let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
+    let rust: RModule = jekyll.const_get("Rust")?;
+    let bridge: RModule = rust.const_get("Bridge")?;
+    let filtered: Value = bridge.funcall("entry_filter", (site, entries_val, dir))?;
+    // Filter out symlinked files outside the source when in safe mode
+    let ef_class: Value = jekyll.const_get("EntryFilter")?;
+    let ef: Value = ef_class.funcall("new", (site,))?;
+    if let Some(arr) = RArray::from_value(filtered) {
+        let out = ruby.ary_new();
+        for item in arr.each() {
+            let name: RString = item?.funcall("to_s", ())?;
+            let full: RString = file.funcall("join", (dir, name))?;
+            let skip: bool = ef.funcall("symlink?", (full,))?;
+            if !skip { out.push(name)?; }
+        }
+        return Ok(out.into_value_with(&ruby));
+    }
+    Ok(filtered)
 }
