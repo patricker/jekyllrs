@@ -250,6 +250,16 @@ module Jekyll
       return input unless input.respond_to?(:find)
 
       input    = input.values if input.is_a?(Hash)
+
+      if defined?(Jekyll::Rust) && Jekyll::Rust.respond_to?(:find_filter_fast) &&
+         input.is_a?(Array) && input.all? { |e| e.is_a?(Hash) } && !property.to_s.include?(".") &&
+         !(value.is_a?(Array) || value.is_a?(Hash))
+        begin
+          return Jekyll::Rust.find_filter_fast(input, property, value)
+        rescue StandardError
+          # ignore and fall back
+        end
+      end
       input_id = input.hash
 
       # implement a hash based on method parameters to cache the end-result for given parameters.

@@ -13,6 +13,15 @@ module Jekyll
       #   "items" => [...] } # all the items where `property` == "larry"
       def group_by(input, property)
         if groupable?(input)
+          if defined?(Jekyll::Rust) && Jekyll::Rust.respond_to?(:group_by_fast) &&
+             input.is_a?(Array) && input.all? { |e| e.is_a?(Hash) } && !property.to_s.include?(".")
+            begin
+              fast = Jekyll::Rust.group_by_fast(input, property)
+              return fast if fast.is_a?(Array)
+            rescue StandardError
+              # ignore and fall back
+            end
+          end
           groups = input.group_by { |item| item_property(item, property).to_s }
           grouped_array(groups)
         else

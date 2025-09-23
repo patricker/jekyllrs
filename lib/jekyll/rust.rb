@@ -244,6 +244,21 @@ module Jekyll
         Bridge.reader_walk(site, dir)
       end
 
+      def reader_get_entries(site, dir, subfolder)
+        ensure_loaded!
+        Bridge.reader_get_entries(site, dir, subfolder)
+      end
+
+      def reader_get_entries_posts(site, dir, subfolder)
+        ensure_loaded!
+        Bridge.reader_get_entries_posts(site, dir, subfolder)
+      end
+
+      def reader_get_entries_drafts(site, dir, subfolder)
+        ensure_loaded!
+        Bridge.reader_get_entries_drafts(site, dir, subfolder)
+      end
+
       def merged_file_read_opts(site, opts)
         ensure_loaded!
         Bridge.merged_file_read_opts(site, opts)
@@ -321,6 +336,16 @@ module Jekyll
       def sort_filter_fast(input, property, nils)
         ensure_loaded!
         Bridge.sort_filter_fast(input, property, nils)
+      end
+
+      def group_by_fast(input, property)
+        ensure_loaded!
+        Bridge.group_by_fast(input, property)
+      end
+
+      def find_filter_fast(input, property, value)
+        ensure_loaded!
+        Bridge.find_filter_fast(input, property, value)
       end
 
       private

@@ -50,7 +50,23 @@ module Jekyll
     #
     # Returns klass type of content files
     def read_content(dir, magic_dir, matcher)
-      @site.reader.get_entries(dir, magic_dir).map do |entry|
+      entries = begin
+        if defined?(Jekyll::Rust)
+          if magic_dir == "_posts" && Jekyll::Rust.respond_to?(:reader_get_entries_posts)
+            Array(Jekyll::Rust.reader_get_entries_posts(@site, dir.to_s, magic_dir.to_s))
+          elsif magic_dir == "_drafts" && Jekyll::Rust.respond_to?(:reader_get_entries_drafts)
+            Array(Jekyll::Rust.reader_get_entries_drafts(@site, dir.to_s, magic_dir.to_s))
+          else
+            Array(@site.reader.get_entries(dir, magic_dir))
+          end
+        else
+          Array(@site.reader.get_entries(dir, magic_dir))
+        end
+      rescue StandardError
+        Array(@site.reader.get_entries(dir, magic_dir))
+      end
+
+      entries.map do |entry|
         next unless matcher.match?(entry)
 
         path = @site.in_source_dir(File.join(dir, magic_dir, entry))

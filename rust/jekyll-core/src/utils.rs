@@ -31,6 +31,8 @@ pub fn define_into(bridge: &RModule) -> Result<(), Error> {
     bridge.define_singleton_method("number_of_words", function!(number_of_words, 2))?;
     bridge.define_singleton_method("where_filter_fast", function!(where_filter_fast2, 3))?;
     bridge.define_singleton_method("sort_filter_fast", function!(sort_filter_fast, 3))?;
+    bridge.define_singleton_method("group_by_fast", function!(group_by_fast, 2))?;
+    bridge.define_singleton_method("find_filter_fast", function!(find_filter_fast, 3))?;
     Ok(())
 }
 
@@ -666,4 +668,114 @@ fn sort_filter_fast(input: Value, property: Value, nils: Value) -> Result<Value,
         out.push(obj).unwrap();
     }
     Ok(out.into_value_with(&ruby))
+}
+
+
+fn group_by_fast(input: Value, property: Value) -> Result<Value, Error> {
+    let ruby = ruby_handle()?;
+    let arr = match RArray::from_value(input) {
+        Some(a) => a,
+        None => return Ok(ruby.qnil().into_value_with(&ruby)),
+    };
+    let prop_rs: RString = property.funcall("to_s", ())?;
+    let prop = prop_rs.to_string()?;
+    if prop.contains('.') {
+        return Ok(ruby.qnil().into_value_with(&ruby));
+    }
+    let key_sym = ruby.to_symbol(&prop);
+    let key_str = ruby.str_new(&prop);
+
+    use std::collections::HashMap;
+    let mut order: Vec<String> = Vec::new();
+    let mut map: HashMap<String, Vec<Value>> = HashMap::new();
+
+    let len: i64 = i64::try_convert(arr.funcall("length", ())?)?;
+    for i in 0..len {
+        let obj: Value = arr.funcall("[]", (i,))?;
+        if let Some(h) = RHash::from_value(obj) {
+            let mut v: Value = h.funcall("[]", (key_sym,))?;
+            if v.is_nil() { v = h.funcall("[]", (key_str,))?; }
+            let name_rs: RString = v.funcall("to_s", ())?;
+            let name = name_rs.to_string()?;
+            if !map.contains_key(&name) {
+                order.push(name.clone());
+                map.insert(name.clone(), Vec::new());
+            }
+            map.get_mut(&name).unwrap().push(obj);
+        } else { return Ok(ruby.qnil().into_value_with(&ruby)); }
+    }
+    let groups = ruby.ary_new();
+    for name in order.into_iter() {
+        let items = ruby.ary_new();
+        if let Some(vec) = map.remove(&name) { for v in vec { items.push(v).unwrap(); } }
+        let h = RHash::new();
+        h.aset("name", ruby.str_new(&name))?;
+        h.aset("items", items)?;
+        let size = i64::try_convert(items.funcall("length", ())?)?;
+        h.aset("size", size)?;
+        groups.push(h)?;
+    }
+    Ok(groups.into_value_with(&ruby))
+}
+
+fn find_filter_fast(input: Value, property: Value, target: Value) -> Result<Value, Error> {
+    let ruby = ruby_handle()?;
+    let arr = match RArray::from_value(input) {
+        Some(a) => a,
+        None => return Ok(ruby.qnil().into_value_with(&ruby)),
+    };
+    let prop_rs: RString = property.funcall("to_s", ())?;
+    let prop = prop_rs.to_string()?;
+    if prop.contains('.') { return Ok(ruby.qnil().into_value_with(&ruby)); }
+    let key_sym = ruby.to_symbol(&prop);
+    let key_str = ruby.str_new(&prop);
+
+    let target_is_nil = target.is_nil();
+    // Detect Liquid::Expression::MethodLiteral (e.g., empty, blank) via class name
+    let method_literal = if target_is_nil { false } else {
+        let cls: Value = target.funcall("class", ()).unwrap();
+        let name_rs: RString = cls.funcall("name", ()).unwrap();
+        let name = name_rs.to_string().unwrap();
+        name == "Liquid::Expression::MethodLiteral"
+    };
+    let target_str = if target_is_nil { String::new() } else { RString::try_convert(target.funcall("to_s", ())?)?.to_string()? };
+
+    let len: i64 = i64::try_convert(arr.funcall("length", ())?)?;
+    for i in 0..len {
+        let obj: Value = arr.funcall("[]", (i,))?;
+        if let Some(h) = RHash::from_value(obj) {
+            let mut val: Value = h.funcall("[]", (key_sym,))?;
+            if val.is_nil() { val = h.funcall("[]", (key_str,))?; }
+            if target_is_nil { if val.is_nil() { return Ok(obj); } else { continue; } }
+            if val.is_nil() { continue; }
+            if method_literal {
+                let is_empty = if let Some(rs) = RString::from_value(val) {
+                    rs.to_string()?.is_empty()
+                } else if let Some(a) = RArray::from_value(val) {
+                    let alen: i64 = i64::try_convert(a.funcall("length", ())?)?;
+                    alen == 0
+                } else if let Some(h) = RHash::from_value(val) {
+                    let hlen: i64 = i64::try_convert(h.funcall("length", ())?)?;
+                    hlen == 0
+                } else {
+                    let vs: RString = val.funcall("to_s", ())?;
+                    vs.to_string()?.is_empty()
+                };
+                if is_empty { return Ok(obj); }
+            } else if let Some(rs) = RString::from_value(val) {
+                if rs.to_string()? == target_str { return Ok(obj); }
+            } else if let Some(a) = RArray::from_value(val) {
+                let alen: i64 = i64::try_convert(a.funcall("length", ())?)?;
+                for j in 0..alen {
+                    let av: Value = a.funcall("[]", (j,))?;
+                    let avs: RString = av.funcall("to_s", ())?;
+                    if avs.to_string()? == target_str { return Ok(obj); }
+                }
+            } else {
+                let vs: RString = val.funcall("to_s", ())?;
+                if vs.to_string()? == target_str { return Ok(obj); }
+            }
+        } else { return Ok(ruby.qnil().into_value_with(&ruby)); }
+    }
+    Ok(ruby.qnil().into_value_with(&ruby))
 }

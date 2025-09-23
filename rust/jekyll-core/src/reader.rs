@@ -8,6 +8,8 @@ pub fn define_into(bridge: &RModule) -> Result<(), Error> {
     bridge.define_singleton_method("reader_classify", function!(reader_classify, 2))?;
     bridge.define_singleton_method("reader_walk", function!(reader_walk, 2))?;
     bridge.define_singleton_method("reader_get_entries", function!(reader_get_entries, 3))?;
+    bridge.define_singleton_method("reader_get_entries_posts", function!(reader_get_entries_posts, 3))?;
+    bridge.define_singleton_method("reader_get_entries_drafts", function!(reader_get_entries_drafts, 3))?;
     Ok(())
 }
 
@@ -180,7 +182,9 @@ fn reader_get_entries(site: Value, dir: RString, subfolder: RString) -> Result<V
     let block = ruby.proc_from_fn(|_args: &[Value], _block| {
         let ruby = crate::ruby_utils::ruby_handle()?;
         let dir_mod: Value = ruby.class_object().const_get("Dir")?;
-        let glob: Value = dir_mod.funcall("glob", ("**/*",))?;
+        let file_class: Value = ruby.class_object().const_get("File")?;
+        let dot: Value = file_class.funcall("const_get", ("FNM_DOTMATCH",))?;
+        let glob: Value = dir_mod.funcall("glob", ("**/*", dot))?;
         Ok(glob)
     });
     let glob_val: Value = dir_mod.funcall_with_block("chdir", (ruby.str_new(&base_str),), block)?;
@@ -198,3 +202,67 @@ fn reader_get_entries(site: Value, dir: RString, subfolder: RString) -> Result<V
     }
     Ok(out.into_value_with(&ruby))
 }
+
+fn collect_entries(site: Value, dir: RString, subfolder: RString) -> Result<(Ruby, Value, RArray, String), Error> {
+    let ruby = ruby_handle()?;
+    let file: Value = ruby.class_object().const_get("File")?;
+    let base: RString = site.funcall("in_source_dir", (dir, subfolder))?;
+    let base_str = base.to_string()?;
+    let exists: bool = file.funcall("exist?", (ruby.str_new(&base_str),))?;
+    if !exists {
+        let arr = ruby.ary_new();
+        return Ok((ruby, file, arr, base_str));
+    }
+    let dir_mod: Value = ruby.class_object().const_get("Dir")?;
+    let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
+    let rust: RModule = jekyll.const_get("Rust")?;
+    let bridge: RModule = rust.const_get("Bridge")?;
+
+    let block = ruby.proc_from_fn(|_args: &[Value], _block| {
+        let ruby = crate::ruby_utils::ruby_handle()?;
+        let dir_mod: Value = ruby.class_object().const_get("Dir")?;
+        let file_class: Value = ruby.class_object().const_get("File")?;
+        let dot: Value = file_class.funcall("const_get", ("FNM_DOTMATCH",))?;
+        let glob: Value = dir_mod.funcall("glob", ("**/*", dot))?;
+        Ok(glob)
+    });
+    let glob_val: Value = dir_mod.funcall_with_block("chdir", (ruby.str_new(&base_str),), block)?;
+    let filtered: Value = bridge.funcall("entry_filter", (site, glob_val, base))?;
+    let entries = RArray::try_convert(filtered)?;
+    Ok((ruby, file, entries, base_str))
+}
+
+fn reader_get_entries_posts(site: Value, dir: RString, subfolder: RString) -> Result<Value, Error> {
+    let (ruby, file, entries, base_str) = collect_entries(site, dir, subfolder)?;
+    static POST_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"^(?:.+/)*?(\d{2,4}-\d{1,2}-\d{1,2})-([^/]*)(\.[^.]+)$").unwrap()
+    });
+    let out = ruby.ary_new();
+    for item in entries.each() {
+        let e: RString = item?.funcall("to_s", ())?;
+        let joined: RString = site.funcall("in_source_dir", (ruby.str_new(&base_str), e))?;
+        let is_dir: bool = file.funcall("directory?", (joined,))?;
+        if is_dir { continue; }
+        let s = e.to_string()?;
+        if POST_RE.is_match(&s) { out.push(e)?; }
+    }
+    Ok(out.into_value_with(&ruby))
+}
+
+fn reader_get_entries_drafts(site: Value, dir: RString, subfolder: RString) -> Result<Value, Error> {
+    let (ruby, file, entries, base_str) = collect_entries(site, dir, subfolder)?;
+    static DRAFT_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"^(?:.+/)*(.*)(\.[^.]+)$").unwrap()
+    });
+    let out = ruby.ary_new();
+    for item in entries.each() {
+        let e: RString = item?.funcall("to_s", ())?;
+        let joined: RString = site.funcall("in_source_dir", (ruby.str_new(&base_str), e))?;
+        let is_dir: bool = file.funcall("directory?", (joined,))?;
+        if is_dir { continue; }
+        let s = e.to_string()?;
+        if DRAFT_RE.is_match(&s) { out.push(e)?; }
+    }
+    Ok(out.into_value_with(&ruby))
+}
+
