@@ -60,40 +60,17 @@ module Jekyll
       private
 
       def compute_absolute_url(input)
-        input = input.url if input.respond_to?(:url)
-        return input if Addressable::URI.parse(input.to_s).absolute?
-
         site = @context.registers[:site]
-        site_url = site.config["url"]
-        return relative_url(input) if site_url.nil? || site_url == ""
-
-        Addressable::URI.parse(
-          site_url.to_s + relative_url(input)
-        ).normalize.to_s
+        Jekyll::Rust.url_filters_absolute_url(site, input)
       end
 
       def compute_relative_url(input)
-        input = input.url if input.respond_to?(:url)
-        return input if Addressable::URI.parse(input.to_s).absolute?
-
-        parts = [sanitized_baseurl, input]
-        Addressable::URI.parse(
-          Jekyll::Rust.url_filters_join_relative(sanitized_baseurl, input)
-        ).normalize.to_s
-      end
-
-      def sanitized_baseurl
         site = @context.registers[:site]
-        baseurl = site.config["baseurl"]
-        return "" if baseurl.nil?
-
-        baseurl.to_s.chomp("/")
+        Jekyll::Rust.url_filters_relative_url(site, input)
       end
 
       def ensure_leading_slash(input)
-        return input if input.nil? || input.empty? || input.start_with?("/")
-
-        "/#{input}"
+        Jekyll::Rust.ensure_leading_slash(input)
       end
     end
   end

@@ -1,4 +1,4 @@
-use magnus::{prelude::*, Error, RModule, RString, Ruby, Value};
+use magnus::{prelude::*, Error, RModule, RString, Value};
 
 // Normalize a Path to a forward-slash string regardless of platform
 fn to_forward_slash(path: &std::path::Path) -> String {
@@ -13,7 +13,7 @@ fn to_forward_slash(path: &std::path::Path) -> String {
 // Recursively list all entries under base_dir, returning relative paths with '/'
 // Uses EntryFilter#symlink? to decide whether to descend into directories (safe-mode semantics)
 pub fn recursive_list_site(site: Value, base_dir: &str) -> Result<Vec<String>, Error> {
-    let ruby = Ruby::get().map_err(|e| magnus::Error::from(e))?;
+    let ruby = crate::ruby_utils::ruby_handle()?;
     let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
     let ef_class: Value = jekyll.const_get("EntryFilter")?;
     let ef: Value = ef_class.funcall("new", (site,))?;
@@ -44,7 +44,10 @@ pub fn recursive_list_site(site: Value, base_dir: &str) -> Result<Vec<String>, E
                     if ft.is_dir() {
                         let full: RString = file.funcall(
                             "join",
-                            (ruby.str_new(base_path.to_string_lossy().as_ref()), ruby.str_new(&rel_str)),
+                            (
+                                ruby.str_new(base_path.to_string_lossy().as_ref()),
+                                ruby.str_new(&rel_str),
+                            ),
                         )?;
                         let is_bad: bool = ef.funcall("symlink?", (full,))?;
                         if !is_bad {

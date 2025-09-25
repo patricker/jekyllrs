@@ -191,6 +191,10 @@ module Jekyll
       Jekyll::Rust.add_permalink_suffix(template, permalink_style)
     end
 
+    def ensure_leading_slash(path)
+      Jekyll::Rust.ensure_leading_slash(path)
+    end
+
     # Work the same way as Dir.glob but separating the input into two parts
     # ('dir' + '/' + 'pattern') to make sure the first part('dir') does not act
     # as a pattern.

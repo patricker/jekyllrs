@@ -37,5 +37,12 @@ class TestReaderWalkSymlink < JekyllUnitTest
       refute_includes pages, "symlink-test/evil.md"
       refute_includes stat,  "symlink-test/evil.md"
     end
+
+    should "include symlinked file when not safe" do
+      @site.safe = false
+      walked = Jekyll::Rust.reader_walk(@site, "")
+      stat = Array(walked[:static]).map(&:to_s)
+      assert_includes stat, "symlink-test/evil.md"
+    end
   end
 end

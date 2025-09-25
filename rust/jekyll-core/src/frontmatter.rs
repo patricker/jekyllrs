@@ -1,4 +1,3 @@
-use magnus::IntoValue;
 use magnus::{function, prelude::*, Error, RModule, RString, Value};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
@@ -58,14 +57,51 @@ fn frontmatter_applies_path(
             cache.get(&abs_scope_str).cloned()
         }
         .unwrap_or_else(|| {
-            let dir_module: Value = ruby.class_object().const_get("Dir").unwrap();
-            let glob_value: Value = dir_module
-                .funcall("glob", (ruby.str_new(&abs_scope_str),))
-                .unwrap_or_else(|_| ruby.ary_new().into_value_with(&ruby));
-            let entries = Vec::<String>::try_convert(glob_value).unwrap_or_default();
+            // Walk from a conservative root and filter using Ruby File.fnmatch?
+            let file_class: Value = ruby.class_object().const_get("File").unwrap();
+            let mut root = abs_scope_str.clone();
+            // Find earliest glob meta
+            let metas = ["*", "?", "[", "{"];
+            let mut idx: Option<usize> = None;
+            for m in metas.iter() {
+                if let Some(pos) = abs_scope_str.find(m) {
+                    idx = Some(match idx {
+                        Some(i) => i.min(pos),
+                        None => pos,
+                    });
+                }
+            }
+            if let Some(i) = idx {
+                if let Some(slash) = abs_scope_str[..i].rfind(std::path::MAIN_SEPARATOR) {
+                    root = abs_scope_str[..slash].to_string();
+                } else if let Some(slash) = abs_scope_str[..i].rfind('/') {
+                    root = abs_scope_str[..slash].to_string();
+                }
+            }
+            let mut acc: Vec<String> = Vec::new();
+            let mut stack: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from(&root)];
+            while let Some(dirp) = stack.pop() {
+                if let Ok(read) = std::fs::read_dir(&dirp) {
+                    for ent in read.flatten() {
+                        let p = ent.path();
+                        let s = p.to_string_lossy().to_string();
+                        let matched: bool = file_class
+                            .funcall("fnmatch?", (ruby.str_new(&abs_scope_str), ruby.str_new(&s)))
+                            .unwrap_or(false);
+                        if matched {
+                            acc.push(s.clone());
+                        }
+                        if let Ok(ft) = ent.file_type() {
+                            if ft.is_dir() {
+                                stack.push(p);
+                            }
+                        }
+                    }
+                }
+            }
             let mut cache = GLOB_CACHE.lock().expect("glob cache poisoned");
-            cache.insert(abs_scope_str.clone(), entries.clone());
-            entries
+            cache.insert(abs_scope_str.clone(), acc.clone());
+            acc
         });
 
         for entry in entries {

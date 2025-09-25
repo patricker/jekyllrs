@@ -29,6 +29,18 @@ pub fn define_into(bridge: &RModule) -> Result<(), Error> {
         "url_filters_join_relative",
         function!(url_filters_join_relative, 2),
     )?;
+    bridge.define_singleton_method(
+        "ensure_leading_slash",
+        function!(ensure_leading_slash_exposed, 1),
+    )?;
+    bridge.define_singleton_method(
+        "url_filters_relative_url",
+        function!(url_filters_relative_url, 2),
+    )?;
+    bridge.define_singleton_method(
+        "url_filters_absolute_url",
+        function!(url_filters_absolute_url, 2),
+    )?;
     Ok(())
 }
 
@@ -375,6 +387,131 @@ fn ensure_leading_slash(s: &str) -> String {
         out.push_str(s);
         out
     }
+}
+
+fn ensure_leading_slash_exposed(input: Value) -> Result<Value, Error> {
+    let ruby = ruby_handle()?;
+    if input.is_nil() {
+        return Ok(ruby.qnil().into_value_with(&ruby));
+    }
+    let s = input.funcall::<_, _, RString>("to_s", ())?.to_string()?;
+    let result = ensure_leading_slash(&s);
+    Ok(ruby.str_new(&result).into_value_with(&ruby))
+}
+
+fn url_filters_relative_url(site: Value, input: Value) -> Result<Value, Error> {
+    let ruby = ruby_handle()?;
+    let addressable_uri = addressable_uri_class(&ruby)?;
+    let config = site.funcall::<_, _, Value>("config", ())?;
+    let base_key = ruby.str_new("baseurl");
+    let baseurl_value = config.funcall::<_, _, Value>("[]", (base_key,))?;
+    let sanitized_base = sanitize_baseurl_value(baseurl_value)?;
+    let input_string = resolve_input_to_string(input)?;
+
+    let result = if is_absolute_uri(&ruby, addressable_uri, &input_string)? {
+        input_string
+    } else {
+        compute_relative_from_components(&ruby, addressable_uri, &input_string, &sanitized_base)?
+    };
+
+    Ok(ruby.str_new(&result).into_value_with(&ruby))
+}
+
+fn url_filters_absolute_url(site: Value, input: Value) -> Result<Value, Error> {
+    let ruby = ruby_handle()?;
+    let addressable_uri = addressable_uri_class(&ruby)?;
+    let config = site.funcall::<_, _, Value>("config", ())?;
+
+    let url_key = ruby.str_new("url");
+    let site_url_value = config.funcall::<_, _, Value>("[]", (url_key,))?;
+
+    let base_key = ruby.str_new("baseurl");
+    let baseurl_value = config.funcall::<_, _, Value>("[]", (base_key,))?;
+    let sanitized_base = sanitize_baseurl_value(baseurl_value)?;
+
+    let input_string = resolve_input_to_string(input)?;
+
+    if is_absolute_uri(&ruby, addressable_uri, &input_string)? {
+        return Ok(ruby.str_new(&input_string).into_value_with(&ruby));
+    }
+
+    let site_url_string = if site_url_value.is_nil() {
+        String::new()
+    } else {
+        value_to_string(site_url_value)?
+    };
+
+    if site_url_string.is_empty() {
+        let relative = compute_relative_from_components(
+            &ruby,
+            addressable_uri,
+            &input_string,
+            &sanitized_base,
+        )?;
+        return Ok(ruby.str_new(&relative).into_value_with(&ruby));
+    }
+
+    let relative =
+        compute_relative_from_components(&ruby, addressable_uri, &input_string, &sanitized_base)?;
+
+    let combined = format!("{}{}", site_url_string, relative);
+    let normalized = normalize_uri_string(&ruby, addressable_uri, &combined)?;
+
+    Ok(ruby.str_new(&normalized).into_value_with(&ruby))
+}
+
+fn addressable_uri_class(ruby: &Ruby) -> Result<Value, Error> {
+    let addressable = ruby.class_object().const_get::<_, RModule>("Addressable")?;
+    addressable.const_get::<_, Value>("URI")
+}
+
+fn resolve_input_to_string(input: Value) -> Result<String, Error> {
+    let mut resolved = input;
+    if resolved.respond_to("url", false)? {
+        resolved = resolved.funcall("url", ())?;
+    }
+    value_to_string(resolved)
+}
+
+fn sanitize_baseurl_value(baseurl_value: Value) -> Result<String, Error> {
+    if baseurl_value.is_nil() {
+        return Ok(String::new());
+    }
+
+    let mut base = value_to_string(baseurl_value)?;
+    if base.ends_with('/') {
+        base.pop();
+    }
+
+    Ok(base)
+}
+
+fn compute_relative_from_components(
+    ruby: &Ruby,
+    addressable_uri: Value,
+    input: &str,
+    sanitized_base: &str,
+) -> Result<String, Error> {
+    let joined = join_relative_paths(sanitized_base, input);
+    normalize_uri_string(ruby, addressable_uri, &joined)
+}
+
+fn join_relative_paths(base: &str, input: &str) -> String {
+    ensure_leading_slash(base) + &ensure_leading_slash(input)
+}
+
+fn is_absolute_uri(ruby: &Ruby, addressable_uri: Value, input: &str) -> Result<bool, Error> {
+    let parsed = addressable_uri.funcall::<_, _, Value>("parse", (ruby.str_new(input),))?;
+    parsed.funcall("absolute?", ())
+}
+
+fn normalize_uri_string(ruby: &Ruby, addressable_uri: Value, input: &str) -> Result<String, Error> {
+    let parsed = addressable_uri.funcall::<_, _, Value>("parse", (ruby.str_new(input),))?;
+    let normalized = parsed.funcall::<_, _, Value>("normalize", ())?;
+    let string = normalized
+        .funcall::<_, _, RString>("to_s", ())?
+        .to_string()?;
+    Ok(string)
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ mod engine;
 mod entry_filter;
 mod file_opts;
 mod frontmatter;
+mod fs_walk;
 mod liquid;
 mod merge;
 mod path_manager;
@@ -21,7 +22,6 @@ mod time_utils;
 mod url;
 mod utils;
 mod yaml_header;
-mod fs_walk;
 
 use magnus::{prelude::*, Error, RModule, Ruby};
 

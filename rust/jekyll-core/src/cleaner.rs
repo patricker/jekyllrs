@@ -28,19 +28,26 @@ fn cleaner_existing_files(site_dest: String, keep_files_val: Value) -> Result<Va
     // Compute keep_dirs as all parent dirs of site_dest/keep_file entries
     let keep_dirs = compute_keep_dirs(&site_dest, &keep_files);
 
-    // Build pattern: "#{site_dest}/**/*"
-    let pattern = format!("{}{}**{}*", site_dest, MAIN_SEPARATOR, MAIN_SEPARATOR);
-
-    // Fetch File::FNM_DOTMATCH
-    let file_class: Value = ruby.class_object().const_get("File")?;
-    let fnm_dotmatch_value: Value =
-        file_class.funcall("const_get", (ruby.str_new("FNM_DOTMATCH"),))?;
-
-    // Dir.glob(pattern, File::FNM_DOTMATCH)
-    let dir_module: Value = ruby.class_object().const_get("Dir")?;
-    let glob_value: Value =
-        dir_module.funcall("glob", (ruby.str_new(&pattern), fnm_dotmatch_value))?;
-    let entries = Vec::<String>::try_convert(glob_value).unwrap_or_default();
+    // Native traversal under site_dest (include files and dirs; include dotfiles)
+    let mut entries: Vec<String> = Vec::new();
+    let mut stack: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from(&site_dest)];
+    while let Some(dirp) = stack.pop() {
+        if let Ok(read) = std::fs::read_dir(&dirp) {
+            for ent in read.flatten() {
+                let path = ent.path();
+                let s = path.to_string_lossy().to_string();
+                if s.is_empty() {
+                    continue;
+                }
+                entries.push(s.clone());
+                if let Ok(ft) = ent.file_type() {
+                    if ft.is_dir() {
+                        stack.push(path);
+                    }
+                }
+            }
+        }
+    }
 
     let mut results: Vec<String> = Vec::new();
 

@@ -1589,6 +1589,22 @@ class TestFilters < JekyllUnitTest
       assert_equal 2, out[0]["a"]["b"]
     end
 
+    should "where matches nil and boolean values" do
+      f = make_filter_mock
+      data = [
+        { "flag" => true,  "color" => nil },
+        { "flag" => false, "color" => "" },
+        { "flag" => true,  "color" => "red" },
+      ]
+
+      nil_results = f.where(data, "color", nil)
+      assert_equal 1, nil_results.length
+      assert_nil nil_results.first["color"]
+
+      bool_results = f.where(data, "flag", true)
+      assert_equal [true, true], bool_results.map { |h| h["flag"] }
+    end
+
     should "sort by simple property and honor nils order" do
       f = make_filter_mock
       data = [
@@ -1601,6 +1617,18 @@ class TestFilters < JekyllUnitTest
 
       desc = f.sort(data, "k", "last")
       assert_equal [2.0, 10.0, nil], desc.map { |e| e["k"].nil? ? nil : e["k"].to_f }
+    end
+
+    should "sort mixes numeric strings and numbers consistently" do
+      f = make_filter_mock
+      data = [
+        { "score" => 3 },
+        { "score" => "12" },
+        { "score" => "2" },
+      ]
+
+      sorted = f.sort(data, "score")
+      assert_equal [2.0, 3.0, 12.0], sorted.map { |h| h["score"].to_f }
     end
   end
 end

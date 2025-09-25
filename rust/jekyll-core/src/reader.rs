@@ -8,9 +8,18 @@ pub fn define_into(bridge: &RModule) -> Result<(), Error> {
     bridge.define_singleton_method("reader_classify", function!(reader_classify, 2))?;
     bridge.define_singleton_method("reader_walk", function!(reader_walk, 2))?;
     bridge.define_singleton_method("reader_get_entries", function!(reader_get_entries_walk, 3))?;
-    bridge.define_singleton_method("reader_get_entries_posts", function!(reader_get_entries_posts_walk, 3))?;
-    bridge.define_singleton_method("reader_get_entries_drafts", function!(reader_get_entries_drafts_walk, 3))?;
-    bridge.define_singleton_method("data_reader_entries", function!(data_reader_entries, 2))?;
+    bridge.define_singleton_method(
+        "reader_get_entries_posts",
+        function!(reader_get_entries_posts_walk, 3),
+    )?;
+    bridge.define_singleton_method(
+        "reader_get_entries_drafts",
+        function!(reader_get_entries_drafts_walk, 3),
+    )?;
+    bridge.define_singleton_method(
+        "data_reader_entries",
+        function!(data_reader_entries_native, 2),
+    )?;
     bridge.define_singleton_method("layout_entries", function!(layout_entries_walk, 2))?;
     Ok(())
 }
@@ -172,219 +181,6 @@ fn reader_walk(site: Value, rel_dir: RString) -> Result<Value, Error> {
     Ok(result.into_value_with(&ruby))
 }
 
-fn reader_get_entries(site: Value, dir: RString, subfolder: RString) -> Result<Value, Error> {
-    let ruby = ruby_handle()?;
-    let file: Value = ruby.class_object().const_get("File")?;
-    let base: RString = site.funcall("in_source_dir", (dir, subfolder))?;
-    let base_str = base.to_string()?;
-    let exists: bool = file.funcall("exist?", (ruby.str_new(&base_str),))?;
-    if !exists {
-        return Ok(ruby.ary_new().into_value_with(&ruby));
-    }
-
-    let dir_mod: Value = ruby.class_object().const_get("Dir")?;
-    let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
-    let rust: RModule = jekyll.const_get("Rust")?;
-    let bridge: RModule = rust.const_get("Bridge")?;
-
-    let block = ruby.proc_from_fn(|_args: &[Value], _block| {
-        let ruby = crate::ruby_utils::ruby_handle()?;
-        let dir_mod: Value = ruby.class_object().const_get("Dir")?;
-        let file_class: Value = ruby.class_object().const_get("File")?;
-        let dot: Value = file_class.funcall("const_get", ("FNM_DOTMATCH",))?;
-        let glob: Value = dir_mod.funcall("glob", ("**/*", dot))?;
-        Ok(glob)
-    });
-    let glob_val: Value = dir_mod.funcall_with_block("chdir", (ruby.str_new(&base_str),), block)?;
-    let filtered: Value = bridge.funcall("entry_filter", (site, glob_val, base))?;
-    let entries = RArray::try_convert(filtered)?;
-
-    let out = ruby.ary_new();
-    for item in entries.each() {
-        let e: RString = item?.funcall("to_s", ())?;
-        let joined: RString = site.funcall("in_source_dir", (ruby.str_new(&base_str), e))?;
-        let is_dir: bool = file.funcall("directory?", (joined,))?;
-        if !is_dir {
-            out.push(e)?;
-        }
-    }
-    Ok(out.into_value_with(&ruby))
-}
-
-fn collect_entries(site: Value, dir: RString, subfolder: RString) -> Result<(Ruby, Value, RArray, String), Error> {
-    let ruby = ruby_handle()?;
-    let file: Value = ruby.class_object().const_get("File")?;
-    let base: RString = site.funcall("in_source_dir", (dir, subfolder))?;
-    let base_str = base.to_string()?;
-    let exists: bool = file.funcall("exist?", (ruby.str_new(&base_str),))?;
-    if !exists {
-        let arr = ruby.ary_new();
-        return Ok((ruby, file, arr, base_str));
-    }
-    let dir_mod: Value = ruby.class_object().const_get("Dir")?;
-    let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
-    let rust: RModule = jekyll.const_get("Rust")?;
-    let bridge: RModule = rust.const_get("Bridge")?;
-
-    let block = ruby.proc_from_fn(|_args: &[Value], _block| {
-        let ruby = crate::ruby_utils::ruby_handle()?;
-        let dir_mod: Value = ruby.class_object().const_get("Dir")?;
-        let file_class: Value = ruby.class_object().const_get("File")?;
-        let dot: Value = file_class.funcall("const_get", ("FNM_DOTMATCH",))?;
-        let glob: Value = dir_mod.funcall("glob", ("**/*", dot))?;
-        Ok(glob)
-    });
-    let glob_val: Value = dir_mod.funcall_with_block("chdir", (ruby.str_new(&base_str),), block)?;
-    let filtered: Value = bridge.funcall("entry_filter", (site, glob_val, base))?;
-    let entries = RArray::try_convert(filtered)?;
-    Ok((ruby, file, entries, base_str))
-}
-
-fn reader_get_entries_posts(site: Value, dir: RString, subfolder: RString) -> Result<Value, Error> {
-    let (ruby, file, entries, base_str) = collect_entries(site, dir, subfolder)?;
-    static POST_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
-        regex::Regex::new(r"^(?:.+/)*?(\d{2,4}-\d{1,2}-\d{1,2})-([^/]*)(\.[^.]+)$").unwrap()
-    });
-    let out = ruby.ary_new();
-    for item in entries.each() {
-        let e: RString = item?.funcall("to_s", ())?;
-        let joined: RString = site.funcall("in_source_dir", (ruby.str_new(&base_str), e))?;
-        let is_dir: bool = file.funcall("directory?", (joined,))?;
-        if is_dir { continue; }
-        let s = e.to_string()?;
-        if POST_RE.is_match(&s) { out.push(e)?; }
-    }
-    Ok(out.into_value_with(&ruby))
-}
-
-fn reader_get_entries_drafts(site: Value, dir: RString, subfolder: RString) -> Result<Value, Error> {
-    let (ruby, file, entries, base_str) = collect_entries(site, dir, subfolder)?;
-    static DRAFT_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
-        regex::Regex::new(r"^(?:.+/)*(.*)(\.[^.]+)$").unwrap()
-    });
-    let out = ruby.ary_new();
-    for item in entries.each() {
-        let e: RString = item?.funcall("to_s", ())?;
-        let joined: RString = site.funcall("in_source_dir", (ruby.str_new(&base_str), e))?;
-        let is_dir: bool = file.funcall("directory?", (joined,))?;
-        if is_dir { continue; }
-        let s = e.to_string()?;
-        if DRAFT_RE.is_match(&s) { out.push(e)?; }
-    }
-    Ok(out.into_value_with(&ruby))
-}
-
-fn data_reader_entries(site: Value, dir: RString) -> Result<Value, Error> {
-    let ruby = ruby_handle()?;
-    let file: Value = ruby.class_object().const_get("File")?;
-    let dir_mod: Value = ruby.class_object().const_get("Dir")?;
-    let dir_str = dir.to_string()?;
-
-    let is_dir: bool = file.funcall("directory?", (ruby.str_new(&dir_str),))?;
-    let result = RHash::new();
-    let files = ruby.ary_new();
-    let dirs = ruby.ary_new();
-    result.aset(Symbol::new("files"), files)?;
-    result.aset(Symbol::new("dirs"), dirs)?;
-
-    if !is_dir {
-        return Ok(result.into_value_with(&ruby));
-    }
-
-    // EntryFilter for symlink checks
-    let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
-    let ef_class: Value = jekyll.const_get("EntryFilter")?;
-    let ef: Value = ef_class.funcall("new", (site,))?;
-
-    // Within the directory, gather data files and child directories
-    let block = ruby.proc_from_fn(|_args: &[Value], _block| {
-        let ruby = crate::ruby_utils::ruby_handle()?;
-        let dir_mod: Value = ruby.class_object().const_get("Dir")?;
-        let data_files: Value = dir_mod.funcall("glob", ("*.{yaml,yml,json,csv,tsv}",))?;
-        let entries: Value = dir_mod.funcall("entries", (".",))?;
-        let array = ruby.hash_new();
-        array.aset(Symbol::new("data_files"), data_files)?;
-        array.aset(Symbol::new("entries"), entries)?;
-        Ok(array.into_value_with(&ruby))
-    });
-    let listing: Value = dir_mod.funcall_with_block("chdir", (ruby.str_new(&dir_str),), block)?;
-    let data_files_val: Value = listing.funcall("[]", (Symbol::new("data_files"),))?;
-    let entries_val: Value = listing.funcall("[]", (Symbol::new("entries"),))?;
-
-    // Filter data files (skip symlinks)
-    if let Some(arr) = RArray::from_value(data_files_val) {
-        for item in arr.each() {
-            let name: RString = item?.funcall("to_s", ())?;
-            let name_str = name.to_string()?;
-            let full: RString = file.funcall("join", (ruby.str_new(&dir_str), name))?;
-            let skip: bool = ef.funcall("symlink?", (full,))?;
-            if !skip {
-                files.push(ruby.str_new(&name_str))?;
-            }
-        }
-    }
-
-    // Filter directories (skip symlinks)
-    if let Some(arr) = RArray::from_value(entries_val) {
-        for item in arr.each() {
-            let name: RString = item?.funcall("to_s", ())?;
-            let name_str = name.to_string()?;
-            if name_str == "." || name_str == ".." { continue; }
-            let full: RString = file.funcall("join", (ruby.str_new(&dir_str), name))?;
-            let is_dir: bool = file.funcall("directory?", (full,))?;
-            if !is_dir { continue; }
-            let full2: RString = file.funcall("join", (ruby.str_new(&dir_str), ruby.str_new(&name_str)))?;
-            let skip: bool = ef.funcall("symlink?", (full2,))?;
-            if !skip {
-                dirs.push(ruby.str_new(&name_str))?;
-            }
-        }
-    }
-
-    Ok(result.into_value_with(&ruby))
-}
-
-fn layout_entries(site: Value, dir: RString) -> Result<Value, Error> {
-    let ruby = ruby_handle()?;
-    let file: Value = ruby.class_object().const_get("File")?;
-    let dir_mod: Value = ruby.class_object().const_get("Dir")?;
-
-    let dir_str = dir.to_string()?;
-    let exists: bool = file.funcall("exist?", (ruby.str_new(&dir_str),))?;
-    let out = ruby.ary_new();
-    if !exists {
-        return Ok(out.into_value_with(&ruby));
-    }
-
-    // Use EntryFilter to filter files; list all files with an extension
-    let block = ruby.proc_from_fn(|_args: &[Value], _block| {
-        let ruby = crate::ruby_utils::ruby_handle()?;
-        let dir_mod: Value = ruby.class_object().const_get("Dir")?;
-        let glob: Value = dir_mod.funcall("glob", ("**/*.*",))?;
-        Ok(glob)
-    });
-    let entries_val: Value = dir_mod.funcall_with_block("chdir", (ruby.str_new(&dir_str),), block)?;
-
-    let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
-    let rust: RModule = jekyll.const_get("Rust")?;
-    let bridge: RModule = rust.const_get("Bridge")?;
-    let filtered: Value = bridge.funcall("entry_filter", (site, entries_val, dir))?;
-    // Filter out symlinked files outside the source when in safe mode
-    let ef_class: Value = jekyll.const_get("EntryFilter")?;
-    let ef: Value = ef_class.funcall("new", (site,))?;
-    if let Some(arr) = RArray::from_value(filtered) {
-        let out = ruby.ary_new();
-        for item in arr.each() {
-            let name: RString = item?.funcall("to_s", ())?;
-            let full: RString = file.funcall("join", (dir, name))?;
-            let skip: bool = ef.funcall("symlink?", (full,))?;
-            if !skip { out.push(name)?; }
-        }
-        return Ok(out.into_value_with(&ruby));
-    }
-    Ok(filtered)
-}
-
 // Native-walker-backed implementation for get_entries
 fn reader_get_entries_walk(site: Value, dir: RString, subfolder: RString) -> Result<Value, Error> {
     let ruby = ruby_handle()?;
@@ -402,7 +198,9 @@ fn reader_get_entries_walk(site: Value, dir: RString, subfolder: RString) -> Res
 
     let list = crate::fs_walk::recursive_list_site(site, &base_str).unwrap_or_else(|_| Vec::new());
     let arr = ruby.ary_new();
-    for s in list.iter() { let _ = arr.push(ruby.str_new(s)); }
+    for s in list.iter() {
+        let _ = arr.push(ruby.str_new(s));
+    }
     let filtered: Value = bridge.funcall("entry_filter", (site, arr, base))?;
     let entries = RArray::try_convert(filtered)?;
 
@@ -436,12 +234,21 @@ fn layout_entries_walk(site: Value, dir: RString) -> Result<Value, Error> {
         if let Ok(iter) = std::fs::read_dir(&p) {
             for ent in iter.flatten() {
                 let path = ent.path();
-                let rel = match path.strip_prefix(&dir_str) { Ok(r) => r, Err(_) => continue };
+                let rel = match path.strip_prefix(&dir_str) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
                 let name = {
                     let s = rel.to_string_lossy();
-                    if std::path::MAIN_SEPARATOR == '/' { s.into_owned() } else { s.replace(std::path::MAIN_SEPARATOR, "/") }
+                    if std::path::MAIN_SEPARATOR == '/' {
+                        s.into_owned()
+                    } else {
+                        s.replace(std::path::MAIN_SEPARATOR, "/")
+                    }
                 };
-                if name.is_empty() { continue; }
+                if name.is_empty() {
+                    continue;
+                }
                 if let Ok(ft) = ent.file_type() {
                     if ft.is_dir() {
                         stack.push(path);
@@ -457,7 +264,9 @@ fn layout_entries_walk(site: Value, dir: RString) -> Result<Value, Error> {
     let rust: RModule = jekyll.const_get("Rust")?;
     let bridge: RModule = rust.const_get("Bridge")?;
     let arr = ruby.ary_new();
-    for s in entries_vec.iter() { let _ = arr.push(ruby.str_new(s)); }
+    for s in entries_vec.iter() {
+        let _ = arr.push(ruby.str_new(s));
+    }
     let filtered: Value = bridge.funcall("entry_filter", (site, arr, dir))?;
 
     // Filter out symlinked files outside the source when in safe mode
@@ -469,7 +278,9 @@ fn layout_entries_walk(site: Value, dir: RString) -> Result<Value, Error> {
             let name: RString = item?.funcall("to_s", ())?;
             let full: RString = file.funcall("join", (dir, name))?;
             let skip: bool = ef.funcall("symlink?", (full,))?;
-            if !skip { out.push(name)?; }
+            if !skip {
+                out.push(name)?;
+            }
         }
         return Ok(out.into_value_with(&ruby));
     }
@@ -477,7 +288,11 @@ fn layout_entries_walk(site: Value, dir: RString) -> Result<Value, Error> {
 }
 
 // Helper that mirrors collect_entries but uses native walker
-fn collect_entries_walk(site: Value, dir: RString, subfolder: RString) -> Result<(Ruby, Value, RArray, String), Error> {
+fn collect_entries_walk(
+    site: Value,
+    dir: RString,
+    subfolder: RString,
+) -> Result<(Ruby, Value, RArray, String), Error> {
     let ruby = ruby_handle()?;
     let file: Value = ruby.class_object().const_get("File")?;
     let base: RString = site.funcall("in_source_dir", (dir, subfolder))?;
@@ -492,13 +307,19 @@ fn collect_entries_walk(site: Value, dir: RString, subfolder: RString) -> Result
     let bridge: RModule = rust.const_get("Bridge")?;
     let list = crate::fs_walk::recursive_list_site(site, &base_str).unwrap_or_else(|_| Vec::new());
     let arr = ruby.ary_new();
-    for s in list.iter() { let _ = arr.push(ruby.str_new(s)); }
+    for s in list.iter() {
+        let _ = arr.push(ruby.str_new(s));
+    }
     let filtered: Value = bridge.funcall("entry_filter", (site, arr, base))?;
     let entries = RArray::try_convert(filtered)?;
     Ok((ruby, file, entries, base_str))
 }
 
-fn reader_get_entries_posts_walk(site: Value, dir: RString, subfolder: RString) -> Result<Value, Error> {
+fn reader_get_entries_posts_walk(
+    site: Value,
+    dir: RString,
+    subfolder: RString,
+) -> Result<Value, Error> {
     let (ruby, file, entries, base_str) = collect_entries_walk(site, dir, subfolder)?;
     static POST_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
         regex::Regex::new(r"^(?:.+/)*?(\d{2,4}-\d{1,2}-\d{1,2})-([^/]*)(\.[^.]+)$").unwrap()
@@ -506,28 +327,95 @@ fn reader_get_entries_posts_walk(site: Value, dir: RString, subfolder: RString) 
     let out = ruby.ary_new();
     for item in entries.each() {
         let e: RString = item?.funcall("to_s", ())?;
-        let joined: RString = magnus::Value::from(site).funcall("in_source_dir", (ruby.str_new(&base_str), e))?;
+        let joined: RString = site.funcall("in_source_dir", (ruby.str_new(&base_str), e))?;
         let is_dir: bool = file.funcall("directory?", (joined,))?;
-        if is_dir { continue; }
+        if is_dir {
+            continue;
+        }
         let s = e.to_string()?;
-        if POST_RE.is_match(&s) { out.push(e)?; }
+        if POST_RE.is_match(&s) {
+            out.push(e)?;
+        }
     }
     Ok(out.into_value_with(&ruby))
 }
 
-fn reader_get_entries_drafts_walk(site: Value, dir: RString, subfolder: RString) -> Result<Value, Error> {
+fn reader_get_entries_drafts_walk(
+    site: Value,
+    dir: RString,
+    subfolder: RString,
+) -> Result<Value, Error> {
     let (ruby, file, entries, base_str) = collect_entries_walk(site, dir, subfolder)?;
-    static DRAFT_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
-        regex::Regex::new(r"^(?:.+/)*(.*)(\.[^.]+)$").unwrap()
-    });
+    static DRAFT_RE: once_cell::sync::Lazy<regex::Regex> =
+        once_cell::sync::Lazy::new(|| regex::Regex::new(r"^(?:.+/)*(.*)(\.[^.]+)$").unwrap());
     let out = ruby.ary_new();
     for item in entries.each() {
         let e: RString = item?.funcall("to_s", ())?;
-        let joined: RString = magnus::Value::from(site).funcall("in_source_dir", (ruby.str_new(&base_str), e))?;
+        let joined: RString = site.funcall("in_source_dir", (ruby.str_new(&base_str), e))?;
         let is_dir: bool = file.funcall("directory?", (joined,))?;
-        if is_dir { continue; }
+        if is_dir {
+            continue;
+        }
         let s = e.to_string()?;
-        if DRAFT_RE.is_match(&s) { out.push(e)?; }
+        if DRAFT_RE.is_match(&s) {
+            out.push(e)?;
+        }
     }
     Ok(out.into_value_with(&ruby))
+}
+
+fn data_reader_entries_native(site: Value, dir: RString) -> Result<Value, Error> {
+    let ruby = ruby_handle()?;
+    let file: Value = ruby.class_object().const_get("File")?;
+    let dir_str = dir.to_string()?;
+
+    let is_dir: bool = file.funcall("directory?", (ruby.str_new(&dir_str),))?;
+    let result = RHash::new();
+    let files = ruby.ary_new();
+    let dirs = ruby.ary_new();
+    result.aset(Symbol::new("files"), files)?;
+    result.aset(Symbol::new("dirs"), dirs)?;
+
+    if !is_dir {
+        return Ok(result.into_value_with(&ruby));
+    }
+
+    // EntryFilter for symlink checks
+    let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
+    let ef_class: Value = jekyll.const_get("EntryFilter")?;
+    let ef: Value = ef_class.funcall("new", (site,))?;
+
+    if let Ok(iter) = std::fs::read_dir(&dir_str) {
+        for ent in iter.flatten() {
+            let name_os = match ent.file_name().into_string() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let full: RString =
+                file.funcall("join", (ruby.str_new(&dir_str), ruby.str_new(&name_os)))?;
+            let skip: bool = ef.funcall("symlink?", (full,))?;
+            if skip {
+                continue;
+            }
+            if let Ok(ft) = ent.file_type() {
+                if ft.is_dir() {
+                    if name_os != "." && name_os != ".." {
+                        let _ = dirs.push(ruby.str_new(&name_os));
+                    }
+                } else {
+                    let lower = name_os.to_lowercase();
+                    if lower.ends_with(".yaml")
+                        || lower.ends_with(".yml")
+                        || lower.ends_with(".json")
+                        || lower.ends_with(".csv")
+                        || lower.ends_with(".tsv")
+                    {
+                        let _ = files.push(ruby.str_new(&name_os));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(result.into_value_with(&ruby))
 }

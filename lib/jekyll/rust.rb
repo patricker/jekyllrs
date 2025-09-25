@@ -175,6 +175,11 @@ module Jekyll
         Bridge.add_permalink_suffix(template, permalink_style)
       end
 
+      def ensure_leading_slash(path)
+        ensure_loaded!
+        Bridge.ensure_leading_slash(path)
+      end
+
       def escape_path(path)
         ensure_loaded!
         Bridge.url_escape_path(path.to_s)
@@ -223,6 +228,16 @@ module Jekyll
 
 
       # URL filters helpers
+      def url_filters_absolute_url(site, input)
+        ensure_loaded!
+        Bridge.url_filters_absolute_url(site, input)
+      end
+
+      def url_filters_relative_url(site, input)
+        ensure_loaded!
+        Bridge.url_filters_relative_url(site, input)
+      end
+
       def url_filters_strip_index(input)
         ensure_loaded!
         Bridge.url_filters_strip_index(input)
@@ -333,6 +348,12 @@ module Jekyll
         Bridge.regenerator_source_modified_or_dest_missing(this_obj, source_path, dest_path)
       end
 
+      def regenerator_modified(this_obj, path)
+        ensure_loaded!
+        Bridge.regenerator_modified(this_obj, path)
+      end
+
+
 
       def normalize_whitespace(input)
         ensure_loaded!
@@ -346,6 +367,11 @@ module Jekyll
       def where_filter_fast(input, property, target)
         ensure_loaded!
         Bridge.where_filter_fast(input, property, target)
+      end
+
+      def where_exp_fast(input, variable, expression)
+        ensure_loaded!
+        Bridge.where_exp_fast(input, variable, expression)
       end
 
       def sort_filter_fast(input, property, nils)

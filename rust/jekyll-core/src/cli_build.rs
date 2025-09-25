@@ -21,21 +21,6 @@ fn rb_expand_path(path: Value) -> Result<String, Error> {
     String::try_convert(exp)
 }
 
-fn engine_build_site_with_profile(site: Value, profile_enabled: bool) -> Result<(), Error> {
-    if profile_enabled {
-        let profiler: Value = site.funcall("profiler", ())?;
-        let _: Value = profiler.funcall("profile_process", ())?;
-        return Ok(());
-    }
-    let _: Value = site.funcall("reset", ())?;
-    let _: Value = site.funcall("read", ())?;
-    let _: Value = site.funcall("generate", ())?;
-    let _: Value = site.funcall("render", ())?;
-    let _: Value = site.funcall("cleanup", ())?;
-    let _: Value = site.funcall("write", ())?;
-    Ok(())
-}
-
 fn engine_build_process(options: Value) -> Result<(), Error> {
     let ruby = ruby_handle()?;
 
@@ -85,13 +70,15 @@ fn engine_build_process(options: Value) -> Result<(), Error> {
         let _: Value = logger.funcall("info", ("Incremental build:", inc_msg))?;
         let _: Value = logger.funcall("info", ("Generating...",))?;
 
-        // Profile-aware engine run
         let profile_enabled = fetch_bool(config, "profile", false)?;
-        engine_build_site_with_profile(site, profile_enabled)?;
-
+        let timings = crate::engine::run_site_phases(site, profile_enabled)?;
 
         let secs = t0.elapsed().as_secs_f64();
         let _: Value = logger.funcall("info", ("", format!("done in {:.3} seconds.", secs)))?;
+
+        if let Some(ref timings) = timings {
+            crate::engine::emit_build_summary(site, timings)?;
+        }
     }
 
     // Watch handling

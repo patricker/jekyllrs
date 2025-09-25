@@ -1,4 +1,4 @@
-use magnus::{function, prelude::*, Error, IntoValue, RArray, RHash, RModule, Value};
+use magnus::{function, prelude::*, Error, IntoValue, RArray, RHash, RModule, RString, Value};
 
 use crate::ruby_utils::ruby_handle;
 
@@ -19,6 +19,7 @@ pub fn define_into(bridge: &RModule) -> Result<(), Error> {
         "regenerator_source_modified_or_dest_missing",
         function!(regenerator_source_modified_or_dest_missing, 3),
     )?;
+    bridge.define_singleton_method("regenerator_modified", function!(regenerator_modified, 2))?;
     Ok(())
 }
 
@@ -120,7 +121,7 @@ fn regenerator_existing_file_modified(this_obj: Value, path: String) -> Result<b
     if let Some(deps) = RArray::from_value(deps_val) {
         for item in deps.each() {
             let dep = item?;
-            let changed: bool = this_obj.funcall("modified?", (dep,))?;
+            let changed = regenerator_modified(this_obj, dep)?;
             if changed {
                 cache_hash.aset(dep, true.into_value_with(&ruby))?;
                 cache_hash.aset(ruby.str_new(&path), true.into_value_with(&ruby))?;
@@ -156,7 +157,7 @@ fn regenerator_source_modified_or_dest_missing(
     if source_path.is_nil() {
         source_changed = true;
     } else {
-        let changed: bool = this_obj.funcall("modified?", (source_path,))?;
+        let changed = regenerator_modified(this_obj, source_path)?;
         source_changed = changed;
     }
 
@@ -168,4 +169,47 @@ fn regenerator_source_modified_or_dest_missing(
     }
 
     Ok(source_changed || dest_missing)
+}
+
+fn regenerator_modified(this_obj: Value, path: Value) -> Result<bool, Error> {
+    let ruby = ruby_handle()?;
+    // disabled? => true
+    let disabled: bool = this_obj.funcall("disabled?", ())?;
+    if disabled {
+        return Ok(true);
+    }
+
+    // nil path => true
+    if path.is_nil() {
+        return Ok(true);
+    }
+
+    // Normalize path key to string
+    let path_str: RString = path.funcall("to_s", ())?;
+    let key = path_str.into_value_with(&ruby);
+
+    // Cache hit
+    let cache: Value = this_obj.funcall("cache", ())?;
+    let cache_h = RHash::from_value(cache)
+        .ok_or_else(|| Error::new(ruby.exception_type_error(), "cache not a Hash"))?;
+    let has_key: bool = cache_h.funcall("key?", (key,))?;
+    if has_key {
+        let v: Value = cache_h.aref(key)?;
+        return Ok(!v.is_nil() && v.to_bool());
+    }
+
+    // Metadata present?
+    let metadata: Value = this_obj.funcall("metadata", ())?;
+    let meta_h = RHash::from_value(metadata)
+        .ok_or_else(|| Error::new(ruby.exception_type_error(), "metadata not a Hash"))?;
+    let present: bool = meta_h.funcall("key?", (key,))?;
+    if present {
+        // Delegate to existing_file_modified implementation
+        let path_s: String = String::try_convert(path.funcall("to_s", ())?)?;
+        return regenerator_existing_file_modified(this_obj, path_s);
+    }
+
+    // Not seen before: add(path) and mark true
+    let _ = this_obj.funcall::<_, _, Value>("add", (key,))?;
+    Ok(true)
 }

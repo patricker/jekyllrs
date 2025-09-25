@@ -82,22 +82,7 @@ module Jekyll
     #
     # Returns a boolean.
     def modified?(path)
-      return true if disabled?
-
-      # objects that don't have a path are always regenerated
-      return true if path.nil?
-
-      # Check for path in cache
-      return cache[path] if cache.key? path
-
-      if metadata[path]
-        # If we have seen this file before,
-        # check if it or one of its dependencies has been modified
-        existing_file_modified?(path)
-      else
-        # If we have not seen this file before, add it to the metadata and regenerate it
-        add(path)
-      end
+      Jekyll::Rust.regenerator_modified(self, path)
     end
 
     # Add a dependency of a path
