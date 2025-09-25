@@ -188,8 +188,7 @@ module Jekyll
       # Normalize Hash input to its values for selection semantics
       input = input.values if input.is_a?(Hash) # FIXME: maintain parity with existing behavior
 
-      if Jekyll::Rust.respond_to?(:where_filter_fast) &&
-         input.is_a?(Array) && input.all? { |e| e.is_a?(Hash) }
+      if Jekyll::Rust.respond_to?(:where_filter_fast) && input.is_a?(Array)
         begin
           fast = Jekyll::Rust.where_filter_fast(input, property, value)
           return fast if fast.is_a?(Array)
@@ -225,8 +224,7 @@ module Jekyll
       input = input.values if input.is_a?(Hash) # FIXME
 
       # Try Rust fast-path for simple Array<Hash> + simple expression
-      if defined?(Jekyll::Rust) && Jekyll::Rust.respond_to?(:where_exp_fast) &&
-         input.is_a?(Array) && input.all? { |e| e.is_a?(Hash) }
+      if defined?(Jekyll::Rust) && Jekyll::Rust.respond_to?(:where_exp_fast) && input.is_a?(Array)
         begin
           fast = Jekyll::Rust.where_exp_fast(input, variable, expression)
           return fast if fast.is_a?(Array)
@@ -263,8 +261,7 @@ module Jekyll
       input    = input.values if input.is_a?(Hash)
 
       if defined?(Jekyll::Rust) && Jekyll::Rust.respond_to?(:find_filter_fast) &&
-         input.is_a?(Array) && input.all? { |e| e.is_a?(Hash) } &&
-         !(value.is_a?(Array) || value.is_a?(Hash))
+         input.is_a?(Array) && !(value.is_a?(Array) || value.is_a?(Hash))
         begin
           return Jekyll::Rust.find_filter_fast(input, property, value)
         rescue StandardError
@@ -349,8 +346,7 @@ module Jekyll
         end
 
         # Try Rust fast-path for simple Array<Hash> + flat property
-        if Jekyll::Rust.respond_to?(:sort_filter_fast) &&
-           input.is_a?(Array) && input.all? { |e| e.is_a?(Hash) }
+        if Jekyll::Rust.respond_to?(:sort_filter_fast) && input.is_a?(Array)
           begin
             fast = Jekyll::Rust.sort_filter_fast(input, property, nils)
             return fast if fast.is_a?(Array)

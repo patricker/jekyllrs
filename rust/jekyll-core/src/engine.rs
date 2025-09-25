@@ -1,4 +1,4 @@
-use magnus::{function, prelude::*, Error, IntoValue, RModule, RString, Ruby, Value};
+use magnus::{function, prelude::*, Error, IntoValue, RModule, Value};
 
 use crate::ruby_utils::ruby_handle;
 
@@ -21,9 +21,9 @@ pub fn run_site_phases(
     }
 
     let mut timings = Vec::with_capacity(PHASES.len());
-    for phase in PHASES.iter() {
+    for &phase in PHASES.iter() {
         let start = std::time::Instant::now();
-        let _: Value = site.funcall(phase, ())?;
+        let _: Value = site.funcall::<_, _, Value>(phase, ())?;
         let elapsed = start.elapsed().as_secs_f64();
         timings.push((phase.to_uppercase(), elapsed));
     }

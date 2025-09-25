@@ -45,6 +45,20 @@ class TestFilters < JekyllUnitTest
     end
   end
 
+  class HashDrop < Liquid::Drop
+    def initialize(data)
+      @data = data
+    end
+
+    def [](key)
+      @data[key]
+    end
+
+    def to_liquid
+      self
+    end
+  end
+
   context "filters" do
     setup do
       @sample_time = Time.utc(2013, 3, 27, 11, 22, 33)
@@ -1629,6 +1643,134 @@ class TestFilters < JekyllUnitTest
 
       sorted = f.sort(data, "score")
       assert_equal [2.0, 3.0, 12.0], sorted.map { |h| h["score"].to_f }
+    end
+
+    should "where fast matches array values" do
+      skip "rust bridge unavailable" unless defined?(Jekyll::Rust)
+
+      data = [
+        { "tags" => %w(foo bar) },
+        { "tags" => %w(baz) },
+        { "tags" => [] },
+      ]
+
+      result = Jekyll::Rust.where_filter_fast(data, "tags", "foo")
+      assert_equal 1, result.length
+      assert_equal %w(foo bar), result.first["tags"]
+    end
+
+    should "where fast respects method literal empty" do
+      skip "rust bridge unavailable" unless defined?(Jekyll::Rust)
+
+      data = [
+        { "tags" => %w(foo) },
+        { "tags" => [] },
+      ]
+
+      literal = Liquid::Expression.parse("empty")
+      result = Jekyll::Rust.where_filter_fast(data, "tags", literal)
+      assert_equal 1, result.length
+      assert_equal [], result.first["tags"]
+    end
+
+    should "where fast handles drops with nested properties" do
+      skip "rust bridge unavailable" unless defined?(Jekyll::Rust)
+
+      drops = [
+        HashDrop.new("meta" => { "slug" => "alpha", "rating" => 2 }),
+        HashDrop.new("meta" => { "slug" => "beta",  "rating" => 4 }),
+      ]
+
+      result = Jekyll::Rust.where_filter_fast(drops, "meta.slug", "beta")
+      assert_equal 1, result.length
+      assert_equal "beta", result.first["meta"]["slug"]
+    end
+
+    should "where_exp fast evaluates blank against drops" do
+      skip "rust bridge unavailable" unless defined?(Jekyll::Rust)
+
+      drops = [
+        HashDrop.new("meta" => { "slug" => "alpha", "note" => "" }),
+        HashDrop.new("meta" => { "slug" => "beta",  "note" => "filled" }),
+      ]
+
+      result = Jekyll::Rust.where_exp_fast(drops, "item", "item.meta.note == blank")
+      assert_equal 1, result.length
+      assert_equal "alpha", result.first["meta"]["slug"]
+    end
+
+    should "sort fast orders drops by nested score" do
+      skip "rust bridge unavailable" unless defined?(Jekyll::Rust)
+
+      drops = [
+        HashDrop.new("meta" => { "slug" => "alpha", "score" => 7 }),
+        HashDrop.new("meta" => { "slug" => "beta",  "score" => 3 }),
+        HashDrop.new("meta" => { "slug" => "gamma", "score" => 10 }),
+      ]
+
+      sorted = Jekyll::Rust.sort_filter_fast(drops, "meta.score", "first")
+      assert_equal %w(beta alpha gamma), sorted.map { |drop| drop["meta"]["slug"] }
+    end
+
+    should "group_by fast collapses drops on nested key" do
+      skip "rust bridge unavailable" unless defined?(Jekyll::Rust)
+
+      drops = [
+        HashDrop.new("meta" => { "category" => "food" }),
+        HashDrop.new("meta" => { "category" => "tech" }),
+        HashDrop.new("meta" => { "category" => "food" }),
+      ]
+
+      grouped = Jekyll::Rust.group_by_fast(drops, "meta.category")
+      assert_equal %w(food tech), grouped.map { |h| h["name"] }
+      sizes = grouped.map { |h| h["size"] }
+      assert_equal [2, 1], sizes
+      first_items = grouped.first["items"].map { |drop| drop["meta"]["category"] }
+      assert_equal %w(food food), first_items
+    end
+
+    should "where filter handles drops via rust" do
+      skip "rust bridge unavailable" unless defined?(Jekyll::Rust)
+
+      f = make_filter_mock
+      drops = [
+        HashDrop.new("meta" => { "slug" => "alpha" }),
+        HashDrop.new("meta" => { "slug" => "beta" }),
+      ]
+
+      result = f.where(drops, "meta.slug", "beta")
+      assert_equal 1, result.length
+      assert_equal "beta", result.first["meta"]["slug"]
+    end
+
+    should "sort filter orders drops via rust" do
+      skip "rust bridge unavailable" unless defined?(Jekyll::Rust)
+
+      f = make_filter_mock
+      drops = [
+        HashDrop.new("meta" => { "slug" => "alpha", "score" => 7 }),
+        HashDrop.new("meta" => { "slug" => "beta",  "score" => 3 }),
+        HashDrop.new("meta" => { "slug" => "gamma", "score" => 10 }),
+      ]
+
+      sorted = f.sort(drops, "meta.score")
+      assert_equal %w(beta alpha gamma), sorted.map { |drop| drop["meta"]["slug"] }
+    end
+
+    should "group_by filter collapses drops via rust" do
+      skip "rust bridge unavailable" unless defined?(Jekyll::Rust)
+
+      f = make_filter_mock
+      drops = [
+        HashDrop.new("meta" => { "category" => "food" }),
+        HashDrop.new("meta" => { "category" => "tech" }),
+        HashDrop.new("meta" => { "category" => "food" }),
+      ]
+
+      grouped = f.group_by(drops, "meta.category")
+      assert_equal %w(food tech), grouped.map { |h| h["name"] }
+      assert_equal [2, 1], grouped.map { |h| h["size"] }
+      assert_equal %w(food food), grouped.first["items"].map { |drop| drop["meta"]["category"] }
     end
   end
 end

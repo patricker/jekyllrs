@@ -14,7 +14,7 @@ module Jekyll
       def group_by(input, property)
         if groupable?(input)
           if defined?(Jekyll::Rust) && Jekyll::Rust.respond_to?(:group_by_fast) &&
-             input.is_a?(Array) && input.all? { |e| e.is_a?(Hash) } && !property.to_s.include?(".")
+             input.is_a?(Array)
             begin
               fast = Jekyll::Rust.group_by_fast(input, property)
               return fast if fast.is_a?(Array)

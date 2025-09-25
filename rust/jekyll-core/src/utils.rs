@@ -15,6 +15,11 @@ use crate::ruby_utils::ruby_handle;
 static SAFE_GLOB_CACHE: Lazy<Mutex<HashMap<(String, String, i64), Vec<String>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+static INT_RE: Lazy<regex::Regex> =
+    Lazy::new(|| regex::Regex::new(r"^\s*-?\d+\s*$").expect("valid integer regex"));
+static FLOAT_RE: Lazy<regex::Regex> =
+    Lazy::new(|| regex::Regex::new(r"^\s*-?(?:\d+\.?\d*|\.\d+)\s*$").expect("valid float regex"));
+
 fn hash_lookup(ruby: &Ruby, h: Value, key: &str) -> Result<Value, Error> {
     let sym = ruby.to_symbol(key);
     let mut v: Value = h.funcall("[]", (sym,))?;
@@ -24,32 +29,114 @@ fn hash_lookup(ruby: &Ruby, h: Value, key: &str) -> Result<Value, Error> {
     Ok(v)
 }
 
+fn coerce_lookup_target(ruby: &Ruby, value: Value) -> Result<Value, Error> {
+    if value.is_nil() || RHash::from_value(value).is_some() {
+        return Ok(value);
+    }
+
+    if value.respond_to("to_liquid", false)? {
+        let liquid: Value = value.funcall("to_liquid", ())?;
+        if liquid.is_nil() {
+            return Ok(liquid);
+        }
+        let same: bool = value.funcall("equal?", (liquid,))?;
+        if !same {
+            return coerce_lookup_target(ruby, liquid);
+        }
+    }
+
+    if value.respond_to("data", false)? {
+        let data: Value = value.funcall("data", ())?;
+        if data.is_nil() {
+            return Ok(data);
+        }
+        return coerce_lookup_target(ruby, data);
+    }
+
+    Ok(value)
+}
+
+fn arrayify_for_filter(ruby: &Ruby, value: Value) -> Result<RArray, Error> {
+    if value.is_nil() {
+        return Ok(ruby.ary_new());
+    }
+
+    if let Some(array) = RArray::from_value(value) {
+        return Ok(array);
+    }
+
+    if value.respond_to("to_ary", false)? {
+        let converted: Value = value.funcall("to_ary", ())?;
+        return arrayify_for_filter(ruby, converted);
+    }
+
+    if value.respond_to("to_a", false)? {
+        let converted: Value = value.funcall("to_a", ())?;
+        return arrayify_for_filter(ruby, converted);
+    }
+
+    let array = ruby.ary_new();
+    array.push(value)?;
+    Ok(array)
+}
+
+fn value_to_string(value: Value) -> Result<String, Error> {
+    let rs: RString = value.funcall("to_s", ())?;
+    rs.to_string()
+}
+
+fn lookup_key(ruby: &Ruby, current: Value, key: &str) -> Result<Value, Error> {
+    if RHash::from_value(current).is_some() {
+        return hash_lookup(ruby, current, key);
+    }
+
+    if current.respond_to("[]", false)? {
+        let key_str = ruby.str_new(key);
+        let mut value: Value = current.funcall("[]", (key_str,))?;
+        if value.is_nil() {
+            let sym = ruby.to_symbol(key);
+            value = current.funcall("[]", (sym,))?;
+        }
+        return Ok(value);
+    }
+
+    if current.respond_to(key, false)? {
+        let value: Value = current.funcall(key, ())?;
+        return Ok(value);
+    }
+
+    Ok(ruby.qnil().into_value_with(ruby))
+}
+
 fn fetch_nested_prop(ruby: &Ruby, obj: Value, prop: &str) -> Result<Value, Error> {
-    let mut current = obj;
+    if prop.is_empty() {
+        return Ok(ruby.qnil().into_value_with(ruby));
+    }
+
     let parts: Vec<&str> = prop.split('.').collect();
     if parts.is_empty() {
         return Ok(ruby.qnil().into_value_with(ruby));
     }
-    let mut i = 0usize;
-    loop {
-        if let Some(_h) = RHash::from_value(current) {
-            let v = hash_lookup(ruby, current, parts[i])?;
-            if i + 1 == parts.len() {
-                return Ok(v);
-            } else {
-                if RHash::from_value(v).is_some() {
-                    current = v;
-                    i += 1;
-                    continue;
-                } else {
-                    // Intermediary is not a hash; treat as missing
-                    return Ok(ruby.qnil().into_value_with(ruby));
-                }
-            }
-        } else {
+
+    let mut current = coerce_lookup_target(ruby, obj)?;
+
+    for (idx, part) in parts.iter().enumerate() {
+        if part.is_empty() {
             return Ok(ruby.qnil().into_value_with(ruby));
         }
+
+        let value = lookup_key(ruby, current, part)?;
+        if idx + 1 == parts.len() {
+            return Ok(value);
+        }
+
+        current = coerce_lookup_target(ruby, value)?;
+        if current.is_nil() {
+            return Ok(current);
+        }
     }
+
+    Ok(current)
 }
 
 pub fn define_into(bridge: &RModule) -> Result<(), Error> {
@@ -652,9 +739,6 @@ fn where_exp_fast(input: Value, variable: Value, expression: Value) -> Result<Va
     let out = ruby.ary_new();
     for i in 0..len {
         let obj: Value = arr.funcall("[]", (i,))?;
-        if RHash::from_value(obj).is_none() {
-            return Ok(ruby.qnil().into_value_with(&ruby));
-        }
         let v = fetch_nested_prop(&ruby, obj, prop)?;
         let matched = match &rhs_kind {
             RHS::Nil => {
@@ -702,6 +786,12 @@ fn where_exp_fast(input: Value, variable: Value, expression: Value) -> Result<Va
     Ok(out.into_value_with(&ruby))
 }
 
+enum TargetKind {
+    Nil,
+    MethodLiteral(String),
+    String(String),
+}
+
 fn where_filter_fast2(input: Value, property: Value, target: Value) -> Result<Value, Error> {
     let ruby = ruby_handle()?;
     let arr = match RArray::from_value(input) {
@@ -710,32 +800,53 @@ fn where_filter_fast2(input: Value, property: Value, target: Value) -> Result<Va
     };
     let prop_str = property.funcall::<_, _, RString>("to_s", ())?.to_string()?;
     let out = ruby.ary_new();
-    let target_is_nil = target.is_nil();
-    let target_s: RString = if target_is_nil {
-        ruby.str_new("")
+    let target_kind = if target.is_nil() {
+        TargetKind::Nil
     } else {
-        target.funcall("to_s", ())?
+        let cls: Value = target.funcall("class", ())?;
+        let name_rs: RString = cls.funcall("name", ())?;
+        let name = name_rs.to_string()?;
+        let value_str = value_to_string(target)?;
+        if name == "Liquid::Expression::MethodLiteral" {
+            TargetKind::MethodLiteral(value_str)
+        } else {
+            TargetKind::String(value_str)
+        }
     };
-    let target_str = target_s.to_string()?;
     let len: i64 = i64::try_convert(arr.funcall("length", ())?)?;
     for i in 0..len {
         let obj: Value = arr.funcall("[]", (i,))?;
-        if RHash::from_value(obj).is_none() {
-            return Ok(ruby.qnil().into_value_with(&ruby));
-        }
         let val = fetch_nested_prop(&ruby, obj, &prop_str)?;
-        if val.is_kind_of(ruby.class_array()) || val.is_kind_of(ruby.class_hash()) {
-            return Ok(ruby.qnil().into_value_with(&ruby));
-        }
-        if target_is_nil {
-            if val.is_nil() {
-                out.push(obj)?;
+        let matched = match &target_kind {
+            TargetKind::Nil => val.is_nil(),
+            TargetKind::MethodLiteral(expected) => {
+                if let Some(rs) = RString::from_value(val) {
+                    rs.to_string()? == *expected
+                } else {
+                    let array = arrayify_for_filter(&ruby, val)?;
+                    let joined: RString = array.funcall("join", ())?;
+                    joined.to_string()? == *expected
+                }
             }
-        } else if !val.is_nil() {
-            let val_s: RString = val.funcall("to_s", ())?;
-            if val_s.to_string()? == target_str {
-                out.push(obj)?;
+            TargetKind::String(expected) => {
+                if let Some(rs) = RString::from_value(val) {
+                    rs.to_string()? == *expected
+                } else {
+                    let array = arrayify_for_filter(&ruby, val)?;
+                    let mut any_match = false;
+                    for element in array.each() {
+                        let element = element?;
+                        if value_to_string(element)? == *expected {
+                            any_match = true;
+                            break;
+                        }
+                    }
+                    any_match
+                }
             }
+        };
+        if matched {
+            out.push(obj)?;
         }
     }
     Ok(out.into_value_with(&ruby))
@@ -747,33 +858,51 @@ enum SortKey {
     Str(String),
 }
 
-fn parse_sort_key(val: Value) -> Option<SortKey> {
-    if let Ok(n) = f64::try_convert(val) {
-        return Some(SortKey::Num(n));
+fn parse_sort_key(ruby: &Ruby, val: Value) -> Result<Option<SortKey>, Error> {
+    if val.is_nil() {
+        return Ok(None);
     }
-    if let Some(rs) = RString::from_value(val) {
+
+    let resolved = coerce_lookup_target(ruby, val)?;
+    if resolved.is_nil() {
+        return Ok(None);
+    }
+
+    if let Ok(n) = f64::try_convert(resolved) {
+        return Ok(Some(SortKey::Num(n)));
+    }
+
+    if let Some(rs) = RString::from_value(resolved) {
         if let Ok(s0) = rs.to_string() {
-            let st = s0.trim();
-            static INT_RE: once_cell::sync::Lazy<regex::Regex> =
-                once_cell::sync::Lazy::new(|| regex::Regex::new(r"^\s*-?\d+\s*$").unwrap());
-            static FLOAT_RE: once_cell::sync::Lazy<regex::Regex> =
-                once_cell::sync::Lazy::new(|| {
-                    regex::Regex::new(r"^\s*-?(?:\d+\.?\d*|\.\d+)\s*$").unwrap()
-                });
-            if INT_RE.is_match(&s0) {
-                if let Ok(i) = st.parse::<f64>() {
-                    return Some(SortKey::Num(i));
+            let trimmed = s0.trim();
+            if INT_RE.is_match(trimmed) {
+                if let Ok(i) = trimmed.parse::<f64>() {
+                    return Ok(Some(SortKey::Num(i)));
                 }
             }
-            if FLOAT_RE.is_match(&s0) {
-                if let Ok(f) = st.parse::<f64>() {
-                    return Some(SortKey::Num(f));
+            if FLOAT_RE.is_match(trimmed) {
+                if let Ok(f) = trimmed.parse::<f64>() {
+                    return Ok(Some(SortKey::Num(f)));
                 }
             }
-            return Some(SortKey::Str(s0));
+            return Ok(Some(SortKey::Str(s0)));
         }
     }
-    None
+
+    let stringified = value_to_string(resolved)?;
+    let trimmed = stringified.trim();
+    if INT_RE.is_match(trimmed) {
+        if let Ok(i) = trimmed.parse::<f64>() {
+            return Ok(Some(SortKey::Num(i)));
+        }
+    }
+    if FLOAT_RE.is_match(trimmed) {
+        if let Ok(f) = trimmed.parse::<f64>() {
+            return Ok(Some(SortKey::Num(f)));
+        }
+    }
+
+    Ok(Some(SortKey::Str(stringified)))
 }
 
 fn sort_filter_fast(input: Value, property: Value, nils: Value) -> Result<Value, Error> {
@@ -793,14 +922,8 @@ fn sort_filter_fast(input: Value, property: Value, nils: Value) -> Result<Value,
     let mut items: Vec<(Option<SortKey>, Value)> = Vec::with_capacity(len as usize);
     for i in 0..len {
         let obj: Value = arr.funcall("[]", (i,))?;
-        if RHash::from_value(obj).is_none() {
-            return Ok(ruby.qnil().into_value_with(&ruby));
-        }
         let v = fetch_nested_prop(&ruby, obj, &prop)?;
-        let key = if v.is_nil() { None } else { parse_sort_key(v) };
-        if !v.is_nil() && key.is_none() {
-            return Ok(ruby.qnil().into_value_with(&ruby));
-        }
+        let key = parse_sort_key(&ruby, v)?;
         items.push((key, obj));
     }
     items.sort_unstable_by(|a, b| match (&a.0, &b.0) {
@@ -848,12 +971,9 @@ fn group_by_fast(input: Value, property: Value) -> Result<Value, Error> {
     let len: i64 = i64::try_convert(arr.funcall("length", ())?)?;
     for i in 0..len {
         let obj: Value = arr.funcall("[]", (i,))?;
-        if RHash::from_value(obj).is_none() {
-            return Ok(ruby.qnil().into_value_with(&ruby));
-        }
         let v = fetch_nested_prop(&ruby, obj, &prop)?;
-        let name_rs: RString = v.funcall("to_s", ())?;
-        let name = name_rs.to_string()?;
+        let resolved = coerce_lookup_target(&ruby, v)?;
+        let name = value_to_string(resolved)?;
         if !map.contains_key(&name) {
             order.push(name.clone());
             map.insert(name.clone(), Vec::new());
@@ -902,9 +1022,6 @@ fn find_filter_fast(input: Value, property: Value, target: Value) -> Result<Valu
     let len: i64 = i64::try_convert(arr.funcall("length", ())?)?;
     for i in 0..len {
         let obj: Value = arr.funcall("[]", (i,))?;
-        if RHash::from_value(obj).is_none() {
-            return Ok(ruby.qnil().into_value_with(&ruby));
-        }
         let val = fetch_nested_prop(&ruby, obj, &prop)?;
         if target_is_nil {
             if val.is_nil() {

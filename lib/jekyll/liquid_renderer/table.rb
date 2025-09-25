@@ -16,7 +16,10 @@ module Jekyll
       private
 
       def data_for_table(num_of_rows)
-        sorted = @stats.sort_by { |_, file_stats| -file_stats[:time] }
+        sorted = @stats.reject do |filename, _|
+          filename.include?("/lib/") || filename.include?("\\lib\\")
+        end
+        sorted = sorted.sort_by { |_, file_stats| -file_stats[:time] }
         sorted = sorted.slice(0, num_of_rows)
 
         table  = [header_labels]
