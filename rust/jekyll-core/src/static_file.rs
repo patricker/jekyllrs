@@ -1,6 +1,12 @@
 use magnus::{function, prelude::*, Error, ExceptionClass, IntoValue, RHash, RModule, Ruby, Value};
 use once_cell::sync::Lazy;
-use std::{collections::HashMap, fs, io, path::Path, sync::Mutex};
+use std::{
+    collections::HashMap,
+    fs::{self, OpenOptions},
+    io::{self, Write},
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 use crate::ruby_utils::ruby_handle;
 
@@ -115,28 +121,7 @@ fn perform_copy(
 ) -> Result<(), Error> {
     let dest_path = Path::new(dest);
 
-    if let Some(parent) = dest_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| io_error(ruby, parent.to_string_lossy().as_ref(), &err))?;
-    }
-
-    match fs::remove_file(dest_path) {
-        Ok(_) => {}
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) if err.kind() == io::ErrorKind::IsADirectory => {
-            fs::remove_dir_all(dest_path).map_err(|err| io_error(ruby, dest, &err))?;
-        }
-        Err(err) => return Err(io_error(ruby, dest, &err)),
-    }
-
-    fs::copy(src, dest_path).map_err(|err| io_error(ruby, dest, &err))?;
-
-    if production {
-        if let Ok(src_meta) = std::fs::metadata(src) {
-            let perms = src_meta.permissions();
-            let _ = std::fs::set_permissions(dest_path, perms);
-        }
-    }
+    copy_file_atomic(src, dest_path, production).map_err(|err| io_error(ruby, dest, &err))?;
 
     apply_times(ruby, dest, mtime)?;
     Ok(())
@@ -216,26 +201,73 @@ fn io_error(ruby: &Ruby, path: &str, err: &io::Error) -> Error {
     Error::new(error_class, format!("Error handling '{}': {}", path, err))
 }
 
-fn simple_copy(src: &str, dest: &str, production: bool) -> io::Result<()> {
-    let dest_path = Path::new(dest);
+fn copy_file_atomic(src: &str, dest_path: &Path, production: bool) -> io::Result<()> {
     if let Some(parent) = dest_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    match fs::remove_file(dest_path) {
-        Ok(_) => {}
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) if err.kind() == io::ErrorKind::IsADirectory => {
-            fs::remove_dir_all(dest_path)?;
+
+    let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
+    let base_name = dest_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("dest");
+
+    let mut attempt = 0usize;
+    loop {
+        let tmp_path = parent.join(format!(".jekyll-tmp-{}-{}", base_name, attempt));
+        let mut temp_file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                attempt += 1;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+
+        {
+            let mut input = fs::File::open(src)?;
+            io::copy(&mut input, &mut temp_file)?;
         }
-        Err(err) => return Err(err),
-    }
-    fs::copy(src, dest_path)?;
-    if production {
-        if let Ok(meta) = fs::metadata(src) {
-            let _ = fs::set_permissions(dest_path, meta.permissions());
+        temp_file.flush().ok();
+        let _ = temp_file.sync_all();
+
+        if production {
+            if let Ok(meta) = fs::metadata(src) {
+                let _ = fs::set_permissions(&tmp_path, meta.permissions());
+            }
+        }
+
+        if let Err(err) = remove_existing(dest_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+
+        match fs::rename(&tmp_path, dest_path) {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(err);
+            }
         }
     }
-    Ok(())
+}
+
+fn remove_existing(dest_path: &Path) -> io::Result<()> {
+    match fs::metadata(dest_path) {
+        Ok(meta) => {
+            if meta.is_dir() {
+                fs::remove_dir_all(dest_path)
+            } else {
+                fs::remove_file(dest_path)
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 fn static_file_write_batch(jobs: Value, _safe: bool, production: bool) -> Result<bool, Error> {
@@ -269,7 +301,8 @@ fn static_file_write_batch(jobs: Value, _safe: bool, production: bool) -> Result
         let prod = production;
         let handle = std::thread::spawn(move || {
             for (src, dest, _mtime) in jobs {
-                let _ = simple_copy(&src, &dest, prod);
+                let dest_path = PathBuf::from(&dest);
+                let _ = copy_file_atomic(&src, &dest_path, prod);
             }
         });
         handles.push(handle);
@@ -278,8 +311,8 @@ fn static_file_write_batch(jobs: Value, _safe: bool, production: bool) -> Result
         let _ = h.join();
     }
     // apply mtime after copying (on main thread; uses Ruby File.utime)
-    for (src, dest, mtime) in list.iter() {
-        let _ = perform_copy(&ruby, src, dest, *mtime, false, production);
+    for (_src, dest, mtime) in list.iter() {
+        let _ = apply_times(&ruby, dest, *mtime);
     }
     Ok(true)
 }

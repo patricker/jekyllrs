@@ -11,7 +11,9 @@ fn locate_rust_lib() -> Option<PathBuf> {
         }
     }
 
-    let exe_dir = env::current_exe().ok().and_then(|exe| exe.parent().map(PathBuf::from))?;
+    let exe_dir = env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(PathBuf::from))?;
 
     let mut suffixes = vec![env::consts::DLL_SUFFIX.to_string()];
     for extra in [".so", ".dylib", ".dll"] {

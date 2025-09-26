@@ -1,5 +1,7 @@
-use magnus::{function, prelude::*, Error, IntoValue, RArray, RClass, RModule, RString, Ruby, Value};
 use globset::GlobBuilder;
+use magnus::{
+    function, prelude::*, Error, IntoValue, RArray, RClass, RModule, RString, Ruby, Value,
+};
 use once_cell::sync::Lazy;
 use regex::{Regex, RegexBuilder};
 use std::borrow::Cow;
