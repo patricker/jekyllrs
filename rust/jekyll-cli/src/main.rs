@@ -5,13 +5,26 @@ use std::process::ExitCode;
 
 fn locate_rust_lib() -> Option<PathBuf> {
     if let Some(v) = env::var_os("JEKYLL_RUST_LIB") {
-        return Some(PathBuf::from(v));
+        let candidate = PathBuf::from(v);
+        if candidate.exists() {
+            return Some(candidate);
+        }
     }
-    if let Ok(exe) = env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let cand = dir.join("libjekyll_core.so");
-            if cand.exists() {
-                return Some(cand);
+
+    let exe_dir = env::current_exe().ok().and_then(|exe| exe.parent().map(PathBuf::from))?;
+
+    let mut suffixes = vec![env::consts::DLL_SUFFIX.to_string()];
+    for extra in [".so", ".dylib", ".dll"] {
+        if !suffixes.iter().any(|s| s == extra) {
+            suffixes.push(extra.to_string());
+        }
+    }
+
+    for base in ["libjekyll_core", "jekyll_core"] {
+        for suffix in &suffixes {
+            let path = exe_dir.join(format!("{}{}", base, suffix));
+            if path.exists() {
+                return Some(path);
             }
         }
     }
@@ -133,6 +146,9 @@ fn run_core(argv: Vec<String>) -> Result<(), Error> {
     ensure_ruby_load_path_for_gemfile()?;
 
     let (argv, trace) = strip_trace_flag(&argv);
+    if trace && env::var_os("RUST_BACKTRACE").is_none() {
+        env::set_var("RUST_BACKTRACE", "1");
+    }
     let mut args = argv;
     let sub = if args.is_empty() {
         String::from("build")
@@ -236,8 +252,27 @@ fn main() -> ExitCode {
     };
     ExitCode::from(code)
 }
+fn append_csv(hash: &RHash, key: &str, values: &str) -> Result<(), Error> {
+    use magnus::{RArray, Value as RubyValue};
+    let existing: RubyValue = hash.aref::<_, RubyValue>(key)?;
+    let array = if let Some(arr) = RArray::from_value(existing) {
+        arr
+    } else {
+        let arr = RArray::new();
+        hash.aset(key, arr)?;
+        arr
+    };
+    for raw in values.split(',') {
+        let item = raw.trim();
+        if item.is_empty() {
+            continue;
+        }
+        array.push(item)?;
+    }
+    Ok(())
+}
+
 fn parse_build_args(args: &[String]) -> Result<RHash, Error> {
-    use magnus::RArray;
     let hash = RHash::new();
 
     // Defaults mirroring Ruby CLI behavior
@@ -254,18 +289,10 @@ fn parse_build_args(args: &[String]) -> Result<RHash, Error> {
             let k = key.replace('-', "_");
             match k.as_str() {
                 "config" => {
-                    let arr = RArray::new();
-                    for p in val.split(',') {
-                        arr.push(p.trim())?;
-                    }
-                    hash.aset("config", arr)?;
+                    append_csv(&hash, "config", val)?;
                 }
                 "plugins" | "plugins_dir" => {
-                    let arr = RArray::new();
-                    for p in val.split(',') {
-                        arr.push(p.trim())?;
-                    }
-                    hash.aset("plugins_dir", arr)?;
+                    append_csv(&hash, "plugins_dir", val)?;
                 }
                 "limit_posts" => {
                     if let Ok(n) = val.parse::<i64>() {
@@ -341,11 +368,7 @@ fn parse_build_args(args: &[String]) -> Result<RHash, Error> {
             }
             "-p" | "--plugins" => {
                 if i + 1 < args.len() {
-                    let arr = RArray::new();
-                    for p in args[i + 1].split(',') {
-                        arr.push(p.trim())?;
-                    }
-                    hash.aset("plugins_dir", arr)?;
+                    append_csv(&hash, "plugins_dir", &args[i + 1])?;
                     i += 1;
                 }
             }
@@ -363,11 +386,7 @@ fn parse_build_args(args: &[String]) -> Result<RHash, Error> {
             }
             "--config" => {
                 if i + 1 < args.len() {
-                    let arr = RArray::new();
-                    for p in args[i + 1].split(',') {
-                        arr.push(p.trim())?;
-                    }
-                    hash.aset("config", arr)?;
+                    append_csv(&hash, "config", &args[i + 1])?;
                     i += 1;
                 }
             }
@@ -474,7 +493,6 @@ fn run_serve(args: &[String], trace: bool) -> Result<(), Error> {
 }
 
 fn parse_serve_args(args: &[String]) -> Result<RHash, Error> {
-    use magnus::RArray;
     let hash = parse_build_args(args)?;
     let mut i = 0usize;
     while i < args.len() {
@@ -510,11 +528,7 @@ fn parse_serve_args(args: &[String]) -> Result<RHash, Error> {
             }
             "--livereload-ignore" => {
                 if i + 1 < args.len() {
-                    let arr = RArray::new();
-                    for p in args[i + 1].split(',') {
-                        arr.push(p.trim())?;
-                    }
-                    hash.aset("livereload_ignore", arr)?;
+                    append_csv(&hash, "livereload_ignore", &args[i + 1])?;
                     i += 1;
                 }
             }
@@ -628,11 +642,7 @@ fn parse_doctor_args(args: &[String]) -> Result<RHash, Error> {
         match a {
             "--config" => {
                 if i + 1 < args.len() {
-                    let arr = magnus::RArray::new();
-                    for p in args[i + 1].split(',') {
-                        arr.push(p.trim())?;
-                    }
-                    hash.aset("config", arr)?;
+                    append_csv(&hash, "config", &args[i + 1])?;
                     i += 1;
                 }
             }

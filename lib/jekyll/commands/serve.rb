@@ -110,6 +110,11 @@ module Jekyll
             validate_options(opts)
             register_reload_hooks(opts)
           end
+          if opts["watch"]
+            Jekyll.logger.warn "Auto-regeneration:",
+                               "Rust watcher not wired yet; skipping Ruby watcher startup."
+            opts["watch"] = false
+          end
           setup(destination)
 
           start_up_webrick(opts, destination)

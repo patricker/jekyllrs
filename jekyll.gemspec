@@ -14,7 +14,7 @@ Gem::Specification.new do |s|
   s.description   = "Jekyll is a simple, blog aware, static site generator."
 
   all_files       = `git ls-files`.split($INPUT_RECORD_SEPARATOR)
-  s.files         = all_files.grep(%r!^(exe|lib|rubocop)/|^.rubocop.yml$!)
+  s.files         = all_files.grep(%r!^(exe|lib|rubocop|ext)/|^.rubocop.yml$!)
   s.executables   = all_files.grep(%r!^exe/!) { |f| File.basename(f) }
   s.bindir        = "exe"
   s.require_paths = ["lib"]
@@ -50,4 +50,7 @@ Gem::Specification.new do |s|
   s.add_runtime_dependency("safe_yaml",             "~> 1.0")
   s.add_runtime_dependency("terminal-table",        ">= 1.8", "< 4.0")
   s.add_runtime_dependency("webrick",               "~> 1.7")
+  s.add_runtime_dependency("rb_sys",                ">= 0.9", "< 0.11")
+
+  s.extensions << "ext/jekyll_core/extconf.rb"
 end

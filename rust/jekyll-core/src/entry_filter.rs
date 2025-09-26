@@ -1,7 +1,8 @@
-use magnus::r_regexp::RRegexp;
-use magnus::{function, prelude::*, Error, IntoValue, RArray, RModule, RString, Ruby, Value};
+use magnus::{function, prelude::*, Error, IntoValue, RArray, RClass, RModule, RString, Ruby, Value};
+use globset::GlobBuilder;
 use once_cell::sync::Lazy;
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 use crate::ruby_utils::ruby_handle;
@@ -91,6 +92,8 @@ fn entry_filter(
 fn extract_patterns(ruby: &Ruby, list: Value) -> Result<Vec<Pattern>, Error> {
     let mut patterns = Vec::new();
     if let Some(array) = RArray::from_value(list) {
+        let regexp_class: RClass = ruby.class_object().const_get("Regexp")?;
+
         for item in array.each() {
             let item = item?;
             if item.is_nil() {
@@ -98,12 +101,13 @@ fn extract_patterns(ruby: &Ruby, list: Value) -> Result<Vec<Pattern>, Error> {
             }
 
             if let Ok(string) = String::try_convert(item) {
-                patterns.push(Pattern::String(string));
+                patterns.push(Pattern::Glob(string));
             } else if item.respond_to("to_str", false)? {
                 let string: String = item.funcall("to_str", ())?;
-                patterns.push(Pattern::String(string));
-            } else if let Ok(regexp) = RRegexp::try_convert(item) {
-                patterns.push(Pattern::Regex(regexp.into_value_with(ruby)));
+                patterns.push(Pattern::Glob(string));
+            } else if item.is_kind_of(regexp_class) {
+                let regex = compile_ruby_regex(ruby, item)?;
+                patterns.push(Pattern::Regex(regex));
             }
         }
     }
@@ -125,31 +129,26 @@ fn matches_patterns(
     let entry_value = ruby.str_new(entry_with_source.as_str());
     let entry_is_directory: bool = file_class.funcall("directory?", (entry_value,))?;
 
+    let entry_normalized = normalize_path(&entry_with_source);
+    let entry_ref = entry_normalized.as_ref();
+
     for pattern in patterns {
         match pattern {
-            Pattern::String(pattern_str) => {
+            Pattern::Glob(pattern_str) => {
                 let pattern_with_source = join_paths(ruby, file_class, source, pattern_str)?;
 
-                let fnmatch_result: bool = file_class.funcall(
-                    "fnmatch?",
-                    (
-                        ruby.str_new(pattern_with_source.as_str()),
-                        ruby.str_new(entry_with_source.as_str()),
-                    ),
-                )?;
+                let pattern_normalized = normalize_path(&pattern_with_source);
+                let pattern_ref = pattern_normalized.as_ref();
 
-                if fnmatch_result
-                    || entry_with_source.starts_with(&pattern_with_source)
-                    || (entry_is_directory
-                        && format!("{}/", entry_with_source) == pattern_with_source)
+                if glob_matches(pattern_ref, entry_ref)
+                    || entry_ref.starts_with(pattern_ref)
+                    || (entry_is_directory && format!("{}/", entry_ref) == pattern_ref)
                 {
                     return Ok(true);
                 }
             }
-            Pattern::Regex(regexp) => {
-                let matched: bool =
-                    regexp.funcall("match?", (ruby.str_new(entry_with_source.as_str()),))?;
-                if matched {
+            Pattern::Regex(regex) => {
+                if regex.is_match(entry_with_source.as_str()) {
                     return Ok(true);
                 }
             }
@@ -220,6 +219,47 @@ fn join_paths(ruby: &Ruby, file_class: Value, base: &str, item: &str) -> Result<
 }
 
 enum Pattern {
-    String(String),
-    Regex(Value),
+    Glob(String),
+    Regex(Regex),
+}
+
+fn normalize_path<'a>(path: &'a str) -> Cow<'a, str> {
+    if path.contains('\\') {
+        Cow::Owned(path.replace('\\', "/"))
+    } else {
+        Cow::Borrowed(path)
+    }
+}
+
+fn glob_matches(pattern: &str, entry: &str) -> bool {
+    match GlobBuilder::new(pattern)
+        .literal_separator(false)
+        .backslash_escape(true)
+        .build()
+    {
+        Ok(glob) => glob.compile_matcher().is_match(entry),
+        Err(_) => pattern == entry,
+    }
+}
+
+fn compile_ruby_regex(ruby: &Ruby, regexp_value: Value) -> Result<Regex, Error> {
+    let source: RString = regexp_value.funcall("source", ())?;
+    let pattern = source.to_string()?;
+    let options: i64 = regexp_value.funcall("options", ())?;
+
+    let mut builder = RegexBuilder::new(&pattern);
+    let ignore_case = options & 0x01 != 0;
+    let extended = options & 0x02 != 0;
+    let multiline = options & 0x04 != 0;
+    builder.case_insensitive(ignore_case);
+    builder.ignore_whitespace(extended);
+    builder.multi_line(multiline);
+    builder.dot_matches_new_line(multiline);
+
+    builder.build().map_err(|err| {
+        Error::new(
+            ruby.exception_arg_error(),
+            format!("Invalid regular expression /{pattern}/: {err}"),
+        )
+    })
 }

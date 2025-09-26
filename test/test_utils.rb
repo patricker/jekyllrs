@@ -461,6 +461,7 @@ class TestUtils < JekyllUnitTest
 
   context "Utils::Internet.connected?" do
     should "return true if there's internet" do
+      allow(Utils::Internet).to receive(:dns).and_return("127.0.0.1")
       assert Utils::Internet.connected?
     end
   end

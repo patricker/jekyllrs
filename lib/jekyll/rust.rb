@@ -394,17 +394,32 @@ module Jekyll
       def ensure_loaded!
         return if @loaded
 
-        path = ENV["JEKYLL_RUST_LIB"]
-        if path.nil? || path.empty?
-          raise Errors::FatalException,
-                "JEKYLL_RUST_LIB is not set; build jekyll-core and export the cdylib path"
+        last_error = nil
+        begin
+          require "jekyll_core"
+          @loaded = true
+          return
+        rescue LoadError => gem_error
+          last_error = gem_error
         end
 
-        require File.expand_path(path)
-        @loaded = true
-      rescue LoadError => e
-        raise Errors::FatalException,
-              "Failed to load Rust extension from #{path}: #{e.message}"
+        path = ENV["JEKYLL_RUST_LIB"]
+        if path && !path.empty?
+          begin
+            require File.expand_path(path)
+            @loaded = true
+            return
+          rescue LoadError => e
+            raise Errors::FatalException,
+                  "Failed to load Rust extension from #{path}: #{e.message}"
+          end
+        end
+
+        message = "Failed to load the Rust bridge via `require 'jekyll_core'`"
+        message = "#{message}: #{last_error.message}" if last_error
+        message = "#{message}.\nRun `script/rust-build` or set `JEKYLL_RUST_LIB` to the built cdylib path." \
+          unless path && !path.empty?
+        raise Errors::FatalException, message
       end
     end
   end

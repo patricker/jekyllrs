@@ -61,7 +61,7 @@ class TestConvertible < JekyllUnitTest
     end
 
     should "parse the front matter but show an error if permalink is empty" do
-      name = "empty_permalink.erb"
+      name = "_empty_permalink.erb"
       assert_raises(Errors::InvalidPermalinkError) do
         @convertible.read_yaml(@base, name)
       end

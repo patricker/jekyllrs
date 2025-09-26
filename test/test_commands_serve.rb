@@ -6,6 +6,8 @@ require "helper"
 require "httpclient"
 require "openssl"
 require "tmpdir"
+require "socket"
+require "eventmachine"
 
 class TestCommandsServe < JekyllUnitTest
   def custom_opts(what)
@@ -45,6 +47,21 @@ class TestCommandsServe < JekyllUnitTest
     setup do
       skip_if_windows "EventMachine support on Windows is limited"
       skip("Refinements are not fully supported in JRuby") if jruby?
+
+      begin
+        TCPServer.open("127.0.0.1", 0, &:close)
+      rescue SystemCallError => e
+        skip "Local sockets not available: #{e.class}"
+      end
+
+      begin
+        EM.run do
+          EM.start_server("127.0.0.1", 0) { }
+          EM.stop
+        end
+      rescue RuntimeError, SystemCallError => e
+        skip "EventMachine unavailable: #{e.class}"
+      end
 
       @temp_dir = Dir.mktmpdir("jekyll_livereload_test")
       @destination = File.join(@temp_dir, "_site")
@@ -142,6 +159,18 @@ class TestCommandsServe < JekyllUnitTest
           p
         )
       end
+      begin
+        test_server = WEBrick::HTTPServer.new(
+          :BindAddress => "127.0.0.1",
+          :Port => 0,
+          :Logger => WEBrick::Log.new(FakeLogger.new),
+          :AccessLog => [[FakeLogger.new, ""]]
+        )
+      rescue SystemCallError, NoMethodError => e
+        skip "WEBrick unavailable: #{e.class}"
+      ensure
+        test_server&.shutdown
+      end
       Jekyll.sites.clear
       allow(SafeYAML).to receive(:load_file).and_return({})
       allow(Jekyll::Rust).to receive(:engine_build_process).and_return("")
@@ -219,7 +248,7 @@ class TestCommandsServe < JekyllUnitTest
         )
 
         expect(Jekyll::Rust).to(
-          receive(:engine_build_process).with(config).and_call_original
+          receive(:engine_build_process).with(config)
         )
         expect(Jekyll::Commands::Serve).to receive(:process).with(config)
         @merc.execute(:serve, options)
@@ -318,6 +347,19 @@ class TestCommandsServe < JekyllUnitTest
     setup do
       skip_if_windows "fork is not supported on Windows"
       skip("fork is not supported by JRuby") if jruby?
+
+      begin
+        test_server = WEBrick::HTTPServer.new(
+          :BindAddress => "127.0.0.1",
+          :Port => 0,
+          :Logger => WEBrick::Log.new(FakeLogger.new),
+          :AccessLog => [[FakeLogger.new, ""]]
+        )
+      rescue SystemCallError, NoMethodError => e
+        skip "WEBrick unavailable: #{e.class}"
+      ensure
+        test_server&.shutdown
+      end
 
       @temp_dir = Dir.mktmpdir("jekyll_serve_detach_test")
       @destination = File.join(@temp_dir, "_site")

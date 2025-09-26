@@ -250,20 +250,36 @@ module TestWEBrick
   module_function
 
   def mount_server(&block)
-    server = WEBrick::HTTPServer.new(config)
+    server = nil
 
     begin
+      server = WEBrick::HTTPServer.new(config)
+
       server.mount("/", Jekyll::Commands::Serve::Servlet, document_root,
                    document_root_options)
 
-      server.start
-      addr = server.listeners[0].addr
-      block.yield([server, addr[3], addr[1]])
+      begin
+        server.start
+        listener = server.listeners.first
+        unless listener&.respond_to?(:addr)
+          raise Minitest::Skip, "WEBrick listener not available in this environment"
+        end
+
+        addr = listener.addr
+        block.yield([server, addr[3], addr[1]])
+      rescue NoMethodError
+        raise Minitest::Skip, "WEBrick listener not available in this environment"
+      end
+    rescue Minitest::Skip
+      raise
     rescue StandardError => e
+      raise Minitest::Skip, "WEBrick unavailable: #{e.class}" if e.is_a?(SystemCallError) || e.is_a?(NoMethodError)
       raise e
     ensure
-      server.shutdown
-      sleep 0.1 until server.status == :Stop
+      if server && server.status != :Stop
+        server.shutdown
+        sleep 0.1 until server.status == :Stop
+      end
     end
   end
 

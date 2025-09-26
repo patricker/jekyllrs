@@ -28,13 +28,59 @@ else
 fi
 popd > /dev/null
 
-LIB_NAME="libjekyll_core"
-LIB_PATH="$REPO_ROOT/rust/target/$PROFILE_DIR/$LIB_NAME.so"
+HOST_TRIPLE=$(rustc -vV | sed -n 's/^host: //p')
+DEFAULT_EXT=".so"
+if [[ "$HOST_TRIPLE" == *"windows"* ]]; then
+  DEFAULT_EXT=".dll"
+elif [[ "$HOST_TRIPLE" == *"apple-darwin"* ]]; then
+  DEFAULT_EXT=".dylib"
+fi
 
-if [[ ! -f "$LIB_PATH" ]]; then
-  echo "error: expected $LIB_PATH to exist" >&2
+EXTS=()
+EXTS+=("$DEFAULT_EXT")
+for extra in ".so" ".dylib" ".dll"; do
+  add=true
+  for existing in "${EXTS[@]}"; do
+    if [[ "$existing" == "$extra" ]]; then
+      add=false
+      break
+    fi
+  done
+  if $add; then
+    EXTS+=("$extra")
+  fi
+done
+
+LIB_PATH=""
+for base in "libjekyll_core" "jekyll_core"; do
+  for ext in "${EXTS[@]}"; do
+    candidate="$REPO_ROOT/rust/target/$PROFILE_DIR/${base}${ext}"
+    if [[ -f "$candidate" ]]; then
+      LIB_PATH="$candidate"
+      break 2
+    fi
+  done
+done
+
+if [[ -z "$LIB_PATH" ]]; then
+  echo "error: could not find built jekyll_core cdylib under rust/target/$PROFILE_DIR" >&2
   exit 1
 fi
 
 echo "Rust build complete. Export this before running Ruby tests:"
 echo "  export JEKYLL_RUST_LIB=$LIB_PATH"
+
+DLEXT=""
+if command -v ruby >/dev/null 2>&1; then
+  DLEXT=$(ruby -rrbconfig -e 'print RbConfig::CONFIG["DLEXT"]' 2>/dev/null || true)
+fi
+
+if [[ -n "$DLEXT" ]]; then
+  DEST_DIR="$REPO_ROOT/lib"
+  mkdir -p "$DEST_DIR"
+  DEST_PATH="$DEST_DIR/jekyll_core.$DLEXT"
+  cp "$LIB_PATH" "$DEST_PATH"
+  echo "Copied native library to $DEST_PATH for require 'jekyll_core'"
+else
+  echo "note: unable to determine Ruby DLEXT; skipping copy into lib/" >&2
+fi
