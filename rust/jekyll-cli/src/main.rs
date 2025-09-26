@@ -489,8 +489,22 @@ fn run_serve(args: &[String], trace: bool) -> Result<(), Error> {
         }
     }
 
-    let serve_klass: Value = eval("Jekyll::Commands::Serve")?;
-    serve_klass.funcall::<_, _, Value>("process", (options,))?;
+    if let Err(e) = rust_mod.funcall::<_, _, Value>("engine_serve_process", (options,)) {
+        if trace {
+            return Err(e);
+        }
+        let _ = eval::<Value>(
+            r#"
+          msg = " Please append `--trace` to the `serve` command "
+          dashes = "-" * msg.length
+          Jekyll.logger.error "", dashes
+          Jekyll.logger.error "Jekyll #{Jekyll::VERSION} ", msg
+          Jekyll.logger.error "", " for any additional information or backtrace. "
+          Jekyll.logger.abort_with "", dashes
+        "#,
+        );
+        return Err(e);
+    }
     Ok(())
 }
 

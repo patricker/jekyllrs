@@ -104,20 +104,12 @@ module Jekyll
 
         def process(opts)
           opts = configuration_from_options(opts)
-          destination = opts["destination"]
           if opts["livereload"]
             opts["livereload_port"] ||= LIVERELOAD_PORT
             validate_options(opts)
-            register_reload_hooks(opts)
+            register_rust_livereload_hooks(opts)
           end
-          if opts["watch"]
-            Jekyll.logger.warn "Auto-regeneration:",
-                               "Rust watcher not wired yet; skipping Ruby watcher startup."
-            opts["watch"] = false
-          end
-          setup(destination)
-
-          start_up_webrick(opts, destination)
+          Jekyll::Rust.engine_serve_process(opts)
         end
 
         def shutdown
@@ -184,6 +176,46 @@ module Jekyll
               @reload_reactor.reload(@changed_pages)
             end
             @changed_pages = nil
+          end
+        end
+
+        def register_rust_livereload_hooks(opts)
+          ignore_patterns = Array(opts["livereload_ignore"]).map(&:to_s)
+          @livereload_changed_pages = []
+
+          Jekyll::Hooks.register(:site, :post_render) do |site|
+            next unless site.respond_to?(:regenerator)
+
+            @livereload_changed_pages = []
+            site.each_site_file do |item|
+              @livereload_changed_pages << item if site.regenerator.regenerate?(item)
+            end
+          end
+
+          Jekyll::Hooks.register(:site, :post_write) do |_site|
+            pages = Array(@livereload_changed_pages)
+            next if pages.empty?
+
+            ignored = []
+            unless ignore_patterns.empty?
+              ignored, pages = pages.partition do |page|
+                ignore_patterns.any? do |pattern|
+                  File.fnmatch(pattern, page.relative_path, File::FNM_PATHNAME | File::FNM_EXTGLOB)
+                end
+              end
+            end
+
+            unless ignored.empty?
+              Jekyll.logger.debug "LiveReload:", "Ignoring #{ignored.map(&:relative_path)}"
+            end
+
+            paths = pages.map(&:url).compact
+            begin
+              Jekyll::Rust.livereload_reload(paths)
+            rescue StandardError => e
+              Jekyll.logger.debug "LiveReload:", "failed to broadcast reload: #{e.message}"
+            end
+            @livereload_changed_pages = []
           end
         end
 

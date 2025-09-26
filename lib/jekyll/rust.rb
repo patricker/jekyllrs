@@ -125,6 +125,11 @@ module Jekyll
         Bridge.static_file_mtimes_snapshot
       end
 
+      def livereload_reload(paths)
+        ensure_loaded!
+        Bridge.livereload_reload(Array(paths))
+      end
+
       def deep_merge_hashes(master_hash, other_hash)
         ensure_loaded!
         Bridge.deep_merge_hashes(master_hash, other_hash)

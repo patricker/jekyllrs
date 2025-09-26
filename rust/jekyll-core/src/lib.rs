@@ -1,6 +1,7 @@
 mod cleaner;
 mod cli_build;
 mod cli_clean;
+mod cli_serve;
 mod dates;
 mod document;
 mod document_reader;
@@ -63,6 +64,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     engine::define_into(&bridge)?;
     cli_build::define_into(&bridge)?;
     cli_clean::define_into(&bridge)?;
+    cli_serve::define_into(&bridge)?;
     reader::define_into(&bridge)?;
 
     Ok(())
