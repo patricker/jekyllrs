@@ -7,11 +7,19 @@ use crate::ruby_utils::ruby_handle;
 static DATE_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^\d{4}-\d{2}-\d{2}$").expect("valid date regex"));
 static DATETIME_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^\d{4}-\d{2}-\d{2}(?:[ Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?)?(?:[ \t][A-Za-z/_+:-]+)?$")
-        .expect("valid datetime regex")
+    Regex::new(
+        r"^\d{4}-\d{2}-\d{2}(?:[ Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?)?(?:[ \t][A-Za-z0-9/_+:-]+)?$",
+    )
+    .expect("valid datetime regex")
 });
 
 static TIME_REQUIRED: OnceCell<()> = OnceCell::new();
+
+#[derive(Debug)]
+pub(crate) enum TimeStringKind {
+    DateOnly,
+    DateTime,
+}
 
 pub fn define_into(bridge: &RModule) -> Result<(), Error> {
     bridge.define_singleton_method("parse_time", function!(parse_time, 2))?;
@@ -67,7 +75,9 @@ fn parse_time(input: Value, message: Option<Value>) -> Result<Value, Error> {
     Err(invalid_date_error(&ruby, &input_string, message)?)
 }
 
-fn try_time_parse(ruby: &Ruby, input: &str) -> Result<Option<Value>, Error> {
+pub(crate) fn try_time_parse(ruby: &Ruby, input: &str) -> Result<Option<Value>, Error> {
+    ensure_time_required(ruby)?;
+
     let time_class: Value = ruby.class_object().const_get("Time")?;
 
     match time_class.funcall::<_, _, Value>("parse", (ruby.str_new(input),)) {
@@ -79,7 +89,7 @@ fn try_time_parse(ruby: &Ruby, input: &str) -> Result<Option<Value>, Error> {
     }
 }
 
-fn ensure_time_required(ruby: &Ruby) -> Result<(), Error> {
+pub(crate) fn ensure_time_required(ruby: &Ruby) -> Result<(), Error> {
     TIME_REQUIRED.get_or_try_init(|| {
         ruby.eval::<Value>("require 'time'")?;
         Ok::<(), Error>(())
@@ -104,4 +114,18 @@ fn invalid_date_error(ruby: &Ruby, input: &str, message: Option<Value>) -> Resul
         error_class,
         format!("Invalid date '{}': {}", input, detail),
     ))
+}
+
+pub(crate) fn classify_time_string(input: &str) -> Option<TimeStringKind> {
+    if input.is_empty() {
+        return None;
+    }
+
+    if DATE_RE.is_match(input) {
+        Some(TimeStringKind::DateOnly)
+    } else if DATETIME_RE.is_match(input) {
+        Some(TimeStringKind::DateTime)
+    } else {
+        None
+    }
 }

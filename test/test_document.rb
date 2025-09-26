@@ -20,6 +20,18 @@ class TestDocument < JekyllUnitTest
     assert_nil parts["date"]
   end
 
+  should "convert YAML timestamp front matter into Ruby Time" do
+    with_env("TZ", "UTC") do
+      path = source_dir("_dates", "time_with_timezone.md")
+      result = Jekyll::Rust.document_read(path, {})
+      data = result["data"]
+
+      refute_nil data
+      assert_instance_of Time, data["date"]
+      assert_equal "2015-09-30", data["date"].strftime("%Y-%m-%d")
+    end
+  end
+
   should "fallback to basename when no extension is present" do
     parts = Jekyll::Rust.document_title_parts("README", "README")
     assert_equal "README", parts["slug"]

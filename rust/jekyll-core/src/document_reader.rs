@@ -5,9 +5,13 @@ use once_cell::sync::OnceCell;
 use regex::Regex;
 use serde_yaml::{self, value::TaggedValue, Value as YamlValue};
 
-use crate::ruby_utils::ruby_handle;
+use crate::{
+    ruby_utils::ruby_handle,
+    time_utils::{self, TimeStringKind},
+};
 
 static FRONT_MATTER_RE: OnceCell<Regex> = OnceCell::new();
+static DATE_REQUIRED: OnceCell<()> = OnceCell::new();
 
 pub fn define_into(bridge: &RModule) -> Result<(), Error> {
     bridge.define_singleton_method("document_read", function!(document_read, 2))?;
@@ -90,7 +94,7 @@ fn yaml_value_to_ruby(ruby: &Ruby, value: YamlValue) -> Result<Value, Error> {
                 Ok(ruby.qnil().into_value_with(ruby))
             }
         }
-        YamlValue::String(s) => Ok(ruby.str_new(&s).into_value_with(ruby)),
+        YamlValue::String(s) => string_scalar_to_ruby(ruby, &s),
         YamlValue::Sequence(seq) => {
             let array = ruby.ary_new();
             for item in seq {
@@ -108,9 +112,56 @@ fn yaml_value_to_ruby(ruby: &Ruby, value: YamlValue) -> Result<Value, Error> {
             }
             Ok(hash.into_value_with(ruby))
         }
-        YamlValue::Tagged(boxed) => {
-            let TaggedValue { value, .. } = *boxed;
-            yaml_value_to_ruby(ruby, value)
-        }
+        YamlValue::Tagged(boxed) => yaml_tagged_value_to_ruby(ruby, *boxed),
     }
+}
+
+fn yaml_tagged_value_to_ruby(ruby: &Ruby, tagged: TaggedValue) -> Result<Value, Error> {
+    let tag_string = tagged.tag.to_string();
+    let normalized_tag = tag_string.trim_start_matches('!');
+
+    if normalized_tag == "tag:yaml.org,2002:timestamp" || normalized_tag == "timestamp" {
+        return match tagged.value {
+            YamlValue::String(s) => string_scalar_to_ruby(ruby, &s),
+            other => yaml_value_to_ruby(ruby, other),
+        };
+    }
+
+    yaml_value_to_ruby(ruby, tagged.value)
+}
+
+fn string_scalar_to_ruby(ruby: &Ruby, input: &str) -> Result<Value, Error> {
+    if let Some(parsed) = maybe_parse_time_string(ruby, input)? {
+        return Ok(parsed);
+    }
+
+    Ok(ruby.str_new(input).into_value_with(ruby))
+}
+
+fn maybe_parse_time_string(ruby: &Ruby, input: &str) -> Result<Option<Value>, Error> {
+    let candidate = input.trim();
+    match time_utils::classify_time_string(candidate) {
+        Some(TimeStringKind::DateTime) => time_utils::try_time_parse(ruby, candidate),
+        Some(TimeStringKind::DateOnly) => {
+            ensure_date_required(ruby)?;
+            let date_class: Value = ruby.class_object().const_get("Date")?;
+
+            match date_class.funcall::<_, _, Value>("parse", (ruby.str_new(candidate),)) {
+                Ok(value) => Ok(Some(value)),
+                Err(_) => {
+                    let composed = format!("{} 00:00:00", candidate);
+                    time_utils::try_time_parse(ruby, &composed)
+                }
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+fn ensure_date_required(ruby: &Ruby) -> Result<(), Error> {
+    DATE_REQUIRED.get_or_try_init(|| {
+        ruby.eval::<Value>("require 'date'")?;
+        Ok::<(), Error>(())
+    })?;
+    Ok(())
 }
