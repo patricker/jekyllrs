@@ -21,7 +21,7 @@ fn rb_expand_path(path: Value) -> Result<String, Error> {
     String::try_convert(exp)
 }
 
-fn engine_build_process(options: Value) -> Result<(), Error> {
+pub(crate) fn engine_build_process(options: Value) -> Result<(), Error> {
     let ruby = ruby_handle()?;
 
     // Logger and verbosity
@@ -82,20 +82,11 @@ fn engine_build_process(options: Value) -> Result<(), Error> {
     }
 
     // Watch handling
-    // Surface stub messaging until the native watcher (Phase 2) is wired in.
     let serving = fetch_bool(options, "serving", false)?;
     let detach = fetch_bool(config, "detach", false)?;
     let watch = fetch_bool(config, "watch", false)?;
     if serving {
-        if watch {
-            let _: Value = logger.funcall(
-                "warn",
-                (
-                    "Auto-regeneration:",
-                    "pending native watcher integration; watch flag currently no-op.",
-                ),
-            )?;
-        }
+        // Serve path handles watch messaging separately.
     } else if detach {
         let _: Value = logger.funcall(
             "info",

@@ -1,4 +1,4 @@
-use magnus::{eval, exception, prelude::*, Error, RHash, RModule, Value};
+use magnus::{eval, exception, prelude::*, Error, RHash, RModule, Ruby, Value};
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -456,14 +456,32 @@ fn print_help_serve() {
 
 fn run_serve(args: &[String], trace: bool) -> Result<(), Error> {
     eval::<Value>("require 'jekyll'")?;
+    let _ = eval::<Value>("require 'jekyll/commands/serve'");
     let _ = eval::<Value>("STDOUT.sync = true; STDERR.sync = true");
 
     let options = parse_serve_args(args)?;
-    if options.aref::<_, Value>("serving")?.is_nil() {
-        options.aset("serving", true)?;
-    }
+    options.aset("serving", true)?;
     if options.aref::<_, Value>("watch")?.is_nil() {
         options.aset("watch", true)?;
+    }
+
+    let ruby = Ruby::get().map_err(|_| {
+        Error::new(
+            exception::runtime_error(),
+            "Ruby interpreter is not available while running serve",
+        )
+    })?;
+    let serve_cmd: Value = eval("Jekyll::Commands::Serve")?;
+    let validate_sym = ruby.to_symbol("validate_options");
+    let _: Value = serve_cmd.funcall("__send__", (validate_sym, options))?;
+
+    let livereload_enabled = {
+        let value = options.aref::<_, Value>("livereload")?;
+        !value.is_nil() && value.to_bool()
+    };
+    if livereload_enabled {
+        let register_sym = ruby.to_symbol("register_rust_livereload_hooks");
+        let _: Value = serve_cmd.funcall("__send__", (register_sym, options))?;
     }
 
     let jekyll: RModule = eval("Jekyll")?;

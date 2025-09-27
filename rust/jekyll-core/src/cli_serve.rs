@@ -1,7 +1,10 @@
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::pin::Pin;
+use std::sync::{mpsc as sync_mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use globset::{GlobBuilder, GlobMatcher};
@@ -12,11 +15,13 @@ use magnus::{
     function, prelude::*, Error, IntoValue, RArray, RHash, RModule, Ruby, TryConvert, Value,
 };
 use mime_guess::MimeGuess;
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use once_cell::sync::Lazy;
 use percent_encoding::percent_decode_str;
 use tokio::net::TcpListener;
 use tokio::runtime::Builder as RuntimeBuilder;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
+use tokio::task;
 use tokio_tungstenite::{accept_async, tungstenite::protocol::Message};
 
 use crate::ruby_utils::ruby_handle;
@@ -48,6 +53,7 @@ pub fn define_into(bridge: &RModule) -> Result<(), Error> {
 
 #[derive(Clone, Debug)]
 struct ServeOptions {
+    source: PathBuf,
     destination: PathBuf,
     host: String,
     port: u16,
@@ -59,6 +65,8 @@ struct ServeOptions {
     livereload_min_delay: u64,
     livereload_max_delay: u64,
     livereload_ignore: Vec<String>,
+    exclude: Vec<String>,
+    cache_dir: String,
     open_url: bool,
     detach: bool,
     ssl_cert: Option<String>,
@@ -67,6 +75,7 @@ struct ServeOptions {
 
 impl ServeOptions {
     fn from_rhash(ruby: &Ruby, hash: RHash) -> Result<Self, Error> {
+        let source = expand_path(ruby, &hash, "source", ".")?;
         let destination = expand_path(ruby, &hash, "destination", "_site")?;
         let host = fetch_string(ruby, &hash, "host")?.unwrap_or_else(|| "127.0.0.1".to_string());
         let port_raw = fetch_integer(ruby, &hash, "port")?.unwrap_or(4000);
@@ -85,12 +94,17 @@ impl ServeOptions {
             .and_then(|v| u64::try_from(v).ok())
             .unwrap_or(0);
         let livereload_ignore = fetch_string_list(ruby, &hash, "livereload_ignore")?;
+        let exclude = fetch_string_list(ruby, &hash, "exclude")?;
+        let cache_dir = fetch_string(ruby, &hash, "cache_dir")?
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| ".jekyll-cache".to_string());
         let open_url = fetch_bool(ruby, &hash, "open_url")?.unwrap_or(false);
         let detach = fetch_bool(ruby, &hash, "detach")?.unwrap_or(false);
         let ssl_cert = fetch_string(ruby, &hash, "ssl_cert")?.filter(|s| !s.is_empty());
         let ssl_key = fetch_string(ruby, &hash, "ssl_key")?.filter(|s| !s.is_empty());
 
         Ok(Self {
+            source,
             destination,
             host,
             port,
@@ -102,6 +116,8 @@ impl ServeOptions {
             livereload_min_delay,
             livereload_max_delay,
             livereload_ignore,
+            exclude,
+            cache_dir,
             open_url,
             detach,
             ssl_cert,
@@ -118,10 +134,10 @@ fn engine_serve_process(options: Value) -> Result<(), Error> {
     let opts = ServeOptions::from_rhash(&ruby, hash)?;
     warn_unimplemented_features(&ruby, &opts)?;
 
-    run_server(&ruby, opts)
+    run_server(&ruby, opts, options)
 }
 
-fn run_server(ruby: &Ruby, opts: ServeOptions) -> Result<(), Error> {
+fn run_server(ruby: &Ruby, opts: ServeOptions, options: Value) -> Result<(), Error> {
     ensure_time_required(ruby)?;
 
     std::fs::create_dir_all(&opts.destination).map_err(|err| {
@@ -173,6 +189,7 @@ fn run_server(ruby: &Ruby, opts: ServeOptions) -> Result<(), Error> {
         normalized_base.clone(),
         livereload_meta,
     ));
+    let watch_enabled = opts.watch;
     let addr = socket_addr_from(&opts.host, opts.port).map_err(|err| {
         Error::new(
             ruby.exception_arg_error(),
@@ -192,8 +209,11 @@ fn run_server(ruby: &Ruby, opts: ServeOptions) -> Result<(), Error> {
             )
         })?;
 
+    let watch_filters = WatchFilters::new(&opts);
+
     runtime.block_on(async move {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (rebuild_tx, mut rebuild_rx) = mpsc::channel::<Vec<PathBuf>>(8);
 
         let lr_handle = if let Some(cfg) = livereload_cfg.clone() {
             let rx = shutdown_rx.clone();
@@ -201,6 +221,17 @@ fn run_server(ruby: &Ruby, opts: ServeOptions) -> Result<(), Error> {
         } else {
             None
         };
+
+        let watcher_handle = if watch_enabled {
+            let filters = watch_filters.clone();
+            let rx = shutdown_rx.clone();
+            let tx = rebuild_tx.clone();
+            Some(tokio::spawn(run_file_watcher(filters, rx, tx)))
+        } else {
+            None
+        };
+
+        drop(rebuild_tx);
 
         let make_service = make_service_fn(move |_conn| {
             let state = state.clone();
@@ -214,23 +245,31 @@ fn run_server(ruby: &Ruby, opts: ServeOptions) -> Result<(), Error> {
 
         let server = Server::bind(&addr).serve(make_service);
         let graceful = server.with_graceful_shutdown(shutdown_signal(shutdown_rx.clone()));
-
         tokio::pin!(graceful);
 
-        let ctrl_c = async {
+        let mut ctrl_c = Box::pin(async {
             let _ = tokio::signal::ctrl_c().await;
-            let _ = shutdown_tx.send(true);
-        };
+        });
+        let mut shutting_down = false;
 
-        tokio::select! {
-            res = &mut graceful => {
-                if let Err(err) = res {
-                    eprintln!("serve error: {err}");
+        loop {
+            tokio::select! {
+                res = &mut graceful => {
+                    if let Err(err) = res {
+                        eprintln!("serve error: {err}");
+                    }
+                    break;
                 }
-            }
-            _ = ctrl_c => {
-                if let Err(err) = graceful.await {
-                    eprintln!("serve error: {err}");
+                _ = &mut ctrl_c, if !shutting_down => {
+                    shutting_down = true;
+                    let _ = shutdown_tx.send(true);
+                }
+                maybe_paths = rebuild_rx.recv(), if watch_enabled => {
+                    if let Some(paths) = maybe_paths {
+                        if let Err(err) = process_rebuild_event(options, &paths) {
+                            eprintln!("auto-regeneration failed: {err}");
+                        }
+                    }
                 }
             }
         }
@@ -238,6 +277,9 @@ fn run_server(ruby: &Ruby, opts: ServeOptions) -> Result<(), Error> {
         let _ = shutdown_tx.send(true);
 
         if let Some(handle) = lr_handle {
+            let _ = handle.await;
+        }
+        if let Some(handle) = watcher_handle {
             let _ = handle.await;
         }
     });
@@ -326,12 +368,12 @@ fn handle_request(req: Request<Body>, state: Arc<ServerState>) -> Response<Body>
 fn warn_unimplemented_features(ruby: &Ruby, opts: &ServeOptions) -> Result<(), Error> {
     let logger = jekyll_logger(ruby)?;
     if opts.watch {
+        let message = format!("enabled for {}", opts.source.display());
+        let _: Value = logger.funcall("info", ("Auto-regeneration:", message))?;
+    } else {
         let _: Value = logger.funcall(
-            "warn",
-            (
-                "Auto-regeneration:",
-                "watch flag acknowledged but in-progress; automatic rebuilds are currently disabled.",
-            ),
+            "info",
+            ("Auto-regeneration:", "disabled. Use --watch to enable."),
         )?;
     }
     if opts.open_url {
@@ -467,6 +509,113 @@ fn set_livereload_handle(handle: Option<LiveReloadBroadcaster>) {
     *guard = handle;
 }
 
+#[derive(Clone)]
+struct WatchFilters {
+    source: PathBuf,
+    absolute_ignores: Vec<PathBuf>,
+    glob_ignores: Arc<Vec<GlobMatcher>>,
+}
+
+impl WatchFilters {
+    fn new(opts: &ServeOptions) -> Self {
+        let mut absolute_ignores = Vec::new();
+        absolute_ignores.push(opts.destination.clone());
+
+        let cache_path = if Path::new(&opts.cache_dir).is_absolute() {
+            PathBuf::from(&opts.cache_dir)
+        } else {
+            opts.source.join(&opts.cache_dir)
+        };
+        absolute_ignores.push(cache_path.clone());
+        absolute_ignores.push(opts.source.join(".jekyll-metadata"));
+        absolute_ignores.push(opts.source.join(".sass-cache"));
+        absolute_ignores.push(opts.source.join("node_modules"));
+        absolute_ignores.push(opts.source.join("vendor"));
+
+        let mut glob_patterns: Vec<String> = opts.exclude.clone();
+
+        if let Some(rel) = relative_path_string(&opts.source, &opts.destination) {
+            if !rel.is_empty() {
+                glob_patterns.push(format!("{rel}/**"));
+            }
+        }
+
+        if let Some(rel) = relative_path_string(&opts.source, &cache_path) {
+            if !rel.is_empty() {
+                glob_patterns.push(format!("{rel}/**"));
+            }
+        }
+
+        glob_patterns.push(".jekyll-metadata".to_string());
+        glob_patterns.push(".sass-cache/**".to_string());
+        glob_patterns.push("node_modules/**".to_string());
+        glob_patterns.push("vendor/**".to_string());
+
+        let glob_ignores = glob_patterns
+            .into_iter()
+            .filter_map(|pattern| {
+                GlobBuilder::new(&pattern)
+                    .literal_separator(true)
+                    .backslash_escape(true)
+                    .build()
+                    .ok()
+                    .map(|glob| glob.compile_matcher())
+            })
+            .collect();
+
+        Self {
+            source: opts.source.clone(),
+            absolute_ignores,
+            glob_ignores: Arc::new(glob_ignores),
+        }
+    }
+
+    fn should_ignore(&self, path: &Path) -> bool {
+        if self
+            .absolute_ignores
+            .iter()
+            .any(|ignore| path.starts_with(ignore))
+        {
+            return true;
+        }
+
+        if let Ok(rel) = path.strip_prefix(&self.source) {
+            if let Some(rel_str) = normalize_relative_string(rel) {
+                if self
+                    .glob_ignores
+                    .iter()
+                    .any(|glob| glob.is_match(rel_str.as_str()))
+                {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    fn relative_for(&self, path: &Path) -> Option<PathBuf> {
+        let rel = path.strip_prefix(&self.source).ok()?;
+        let mut out = PathBuf::new();
+        let mut has_component = false;
+        for component in rel.components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(part) => {
+                    out.push(part);
+                    has_component = true;
+                }
+                _ => return None,
+            }
+        }
+        if has_component {
+            Some(out)
+        } else {
+            None
+        }
+    }
+}
+
 struct ServerState {
     destination: PathBuf,
     base_prefix: Option<String>,
@@ -570,6 +719,28 @@ fn sanitize_path(input: &str) -> Option<PathBuf> {
         }
     }
     Some(result)
+}
+
+fn relative_path_string(base: &Path, path: &Path) -> Option<String> {
+    let rel = path.strip_prefix(base).ok()?;
+    normalize_relative_string(rel)
+}
+
+fn normalize_relative_string(path: &Path) -> Option<String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            _ => return None,
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
 }
 
 fn render_directory_listing(dir: &Path, request_path: &str) -> String {
@@ -776,6 +947,105 @@ async fn run_livereload(config: LiveReloadConfig, mut shutdown: watch::Receiver<
     }
 }
 
+async fn run_file_watcher(
+    filters: WatchFilters,
+    mut shutdown: watch::Receiver<bool>,
+    rebuild_tx: mpsc::Sender<Vec<PathBuf>>,
+) {
+    let (event_tx, mut event_rx) = mpsc::channel::<Vec<PathBuf>>(64);
+    let (stop_tx, stop_rx) = sync_mpsc::channel();
+
+    let watcher_thread = {
+        let source = filters.source.clone();
+        let tx = event_tx.clone();
+        std::thread::spawn(move || {
+            let handler = move |res: Result<Event, notify::Error>| match res {
+                Ok(event) => {
+                    if matches!(
+                        event.kind,
+                        EventKind::Modify(_)
+                            | EventKind::Create(_)
+                            | EventKind::Remove(_)
+                            | EventKind::Other
+                            | EventKind::Any
+                    ) {
+                        if !event.paths.is_empty() {
+                            let _ = tx.blocking_send(event.paths);
+                        }
+                    }
+                }
+                Err(err) => eprintln!("file watcher error: {}", err),
+            };
+
+            let mut watcher = match RecommendedWatcher::new(handler, notify::Config::default()) {
+                Ok(watcher) => watcher,
+                Err(err) => {
+                    eprintln!("failed to start file watcher: {}", err);
+                    return;
+                }
+            };
+
+            if let Err(err) = watcher.watch(source.as_path(), RecursiveMode::Recursive) {
+                eprintln!("failed to watch {}: {}", source.display(), err);
+                return;
+            }
+
+            let _ = stop_rx.recv();
+        })
+    };
+    drop(event_tx);
+
+    let mut pending: HashSet<PathBuf> = HashSet::new();
+    let mut debounce: Option<Pin<Box<tokio::time::Sleep>>> = None;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    break;
+                }
+            }
+            maybe_paths = event_rx.recv() => {
+                match maybe_paths {
+                    Some(paths) => {
+                        for path in paths {
+                            if filters.should_ignore(&path) {
+                                continue;
+                            }
+                            if let Some(rel) = filters.relative_for(&path) {
+                                pending.insert(rel);
+                            }
+                        }
+                        if !pending.is_empty() {
+                            debounce = Some(Box::pin(tokio::time::sleep(Duration::from_millis(250))));
+                        }
+                    }
+                    None => break,
+                }
+            }
+            _ = async {
+                if let Some(ref mut sleep) = debounce {
+                    sleep.as_mut().await;
+                }
+            }, if debounce.is_some() => {
+                debounce = None;
+                if !pending.is_empty() {
+                    let mut paths: Vec<PathBuf> = pending.drain().collect();
+                    paths.sort_by(|a, b| a.as_os_str().cmp(b.as_os_str()));
+                    if rebuild_tx.send(paths).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = stop_tx.send(());
+    if let Err(err) = watcher_thread.join() {
+        eprintln!("file watcher thread join error: {:?}", err);
+    }
+}
+
 async fn handle_livereload_connection(
     stream: tokio::net::TcpStream,
     _addr: SocketAddr,
@@ -884,6 +1154,50 @@ async fn shutdown_signal(mut rx: watch::Receiver<bool>) {
             break;
         }
     }
+}
+
+fn process_rebuild_event(options: Value, paths: &[PathBuf]) -> Result<(), Error> {
+    log_watch_summary(paths);
+    task::block_in_place(|| crate::cli_build::engine_build_process(options))
+}
+
+fn log_watch_summary(paths: &[PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
+
+    if let Ok(ruby) = ruby_handle() {
+        if let Ok(logger) = jekyll_logger(&ruby) {
+            if let Some(summary) = summarize_changed_paths(paths) {
+                let _ = logger.funcall::<_, _, Value>("info", ("Watch:", summary));
+            }
+        }
+    }
+}
+
+fn summarize_changed_paths(paths: &[PathBuf]) -> Option<String> {
+    if paths.is_empty() {
+        return None;
+    }
+
+    let mut entries: Vec<String> = paths
+        .iter()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .collect();
+    entries.sort();
+
+    let message = match entries.len() {
+        1 => format!("{} changed", entries[0]),
+        2 => format!("{} and {} changed", entries[0], entries[1]),
+        count => format!(
+            "{}, {} and {} more changed",
+            entries[0],
+            entries[1],
+            count - 2
+        ),
+    };
+
+    Some(message)
 }
 
 fn build_livereload_snippet(cfg: &LiveReloadConfig) -> String {
