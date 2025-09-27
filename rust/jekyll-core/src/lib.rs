@@ -10,11 +10,13 @@ mod entry_filter;
 mod file_opts;
 mod frontmatter;
 mod fs_walk;
+mod include_tag;
 mod liquid;
 mod merge;
 mod path_manager;
 mod reader;
 mod regenerator_io;
+mod render;
 mod ruby_utils;
 mod slugify;
 mod static_file;
@@ -66,6 +68,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     cli_clean::define_into(&bridge)?;
     cli_serve::define_into(&bridge)?;
     reader::define_into(&bridge)?;
+    include_tag::define_into(&bridge)?;
+    render::define_into(&bridge)?;
 
     Ok(())
 }

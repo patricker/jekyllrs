@@ -98,21 +98,21 @@ Got it—no runtime fallbacks to Ruby, no “compat flags,” and `jekyllrs` is 
 
 * **Layout chain & payload**
 
-  * [ ] Build the layout resolution and rendering order in Rust (`engine.rs`) and call Ruby Liquid once per step.
-  * [ ] Create Rust structs for site/page/post payloads and only convert to Ruby once per render call (minimize object churn).
+  * [x] Build the layout resolution and rendering order in Rust (`engine.rs`) and call Ruby Liquid once per step.
+  * [x] Create Rust structs for site/page/post payloads and only convert to Ruby once per render call (minimize object churn).
     *Files:* `rust/jekyll-core/src/engine.rs` (extend), new payload module.
 
 * **Includes**
 
-  * [ ] Resolve `{% include %}` and `{% include_relative %}` paths in Rust; pass final strings/data into Ruby Liquid.
+  * [x] Resolve `{% include %}` and `{% include_relative %}` paths in Rust; pass final strings/data into Ruby Liquid.
 
 * **Filters registry**
 
-  * [ ] Register Ruby filters **once** per render cycle in a hub (see next phase), not per page.
+  * [x] Register Ruby filters **once** per render cycle in a hub (see next phase), not per page.
 
 * **Remove duplicated logic in Ruby**
 
-  * [ ] Delete/mothball Ruby code in `lib/jekyll/renderer.rb` that orchestrates phases already handled in Rust (keep only compatibility shims that call the Rust bridge).
+  * [x] Delete/mothball Ruby code in `lib/jekyll/renderer.rb` that orchestrates phases already handled in Rust (keep only compatibility shims that call the Rust bridge).
 
 **Acceptance**
 

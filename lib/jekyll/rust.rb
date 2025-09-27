@@ -231,6 +231,51 @@ module Jekyll
         Bridge.engine_generate(site)
       end
 
+      def render_site(site)
+        ensure_loaded!
+        Bridge.render_site(site)
+      end
+
+      def renderer_run(site, document, payload = nil, layouts = nil)
+        ensure_loaded!
+        Bridge.renderer_run(site, document, payload, layouts)
+      end
+
+      def renderer_convert(site, document, content)
+        ensure_loaded!
+        Bridge.renderer_convert(site, document, content)
+      end
+
+      def renderer_output_ext(site, document)
+        ensure_loaded!
+        Bridge.renderer_output_ext(site, document)
+      end
+
+      def renderer_render_liquid(site, document, content, payload, info, path)
+        ensure_loaded!
+        Bridge.renderer_render_liquid(site, document, content, payload, info, path)
+      end
+
+      def renderer_place_in_layouts(site, document, content, payload, info, layouts)
+        ensure_loaded!
+        Bridge.renderer_place_in_layouts(site, document, content, payload, info, layouts)
+      end
+
+      def renderer_converters(site, document)
+        ensure_loaded!
+        Bridge.renderer_converters(site, document)
+      end
+
+      def include_tag_resolve(context, file, safe)
+        ensure_loaded!
+        Bridge.include_tag_resolve(context, file, safe)
+      end
+
+      def include_relative_resolve(context, file)
+        ensure_loaded!
+        Bridge.include_relative_resolve(context, file)
+      end
+
 
       # URL filters helpers
       def url_filters_absolute_url(site, input)

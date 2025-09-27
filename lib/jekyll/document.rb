@@ -472,11 +472,15 @@ module Jekyll
     end
 
     def read_content(**opts)
-      result = Jekyll::Rust.document_read(path, Utils.merged_file_read_opts(site, opts))
+      file_opts = Utils.merged_file_read_opts(site, opts)
+      result = Jekyll::Rust.document_read(path, file_opts)
       self.content = result["content"]
 
       data_file = result["data"]
       merge_data!(data_file, :source => "YAML front matter") if data_file
+    rescue Psych::SyntaxError
+      self.content = File.read(path, **file_opts)
+      raise
     end
 
     def read_post_data

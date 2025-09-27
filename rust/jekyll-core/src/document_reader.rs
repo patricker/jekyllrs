@@ -70,7 +70,16 @@ fn parse_front_matter(ruby: &Ruby, source: &str) -> Result<Value, Error> {
         Err(err) => {
             let psych: RModule = ruby.class_object().const_get("Psych")?;
             let syntax_error: ExceptionClass = psych.const_get("SyntaxError")?;
-            Err(Error::new(syntax_error, err.to_string()))
+            let message = err.to_string();
+            let exception = syntax_error.new_instance((
+                ruby.qnil().into_value_with(ruby),
+                0.into_value_with(ruby),
+                0.into_value_with(ruby),
+                0.into_value_with(ruby),
+                ruby.str_new(&message).into_value_with(ruby),
+                ruby.qnil().into_value_with(ruby),
+            ))?;
+            Err(Error::from(exception))
         }
     }
 }

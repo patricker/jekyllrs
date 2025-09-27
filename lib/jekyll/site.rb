@@ -196,17 +196,7 @@ module Jekyll
     #
     # Returns nothing.
     def render
-      relative_permalinks_are_deprecated
-
-      payload = site_payload
-
-      Jekyll::Hooks.trigger :site, :pre_render, self, payload
-
-      render_docs(payload)
-      render_pages(payload)
-
-      Jekyll::Hooks.trigger :site, :post_render, self, payload
-      nil
+      Jekyll::Rust.render_site(self)
     end
 
     # Remove orphaned files and empty directories in destination.
@@ -569,26 +559,20 @@ module Jekyll
       self.file_read_opts = Jekyll::Utils.merged_file_read_opts(self, {})
     end
 
-    def render_docs(payload)
-      collections.each_value do |collection|
-        collection.docs.each do |document|
-          render_regenerated(document, payload)
-        end
-      end
+    def render_docs(_payload)
+      Jekyll::Rust.render_site(self)
+      nil
     end
 
-    def render_pages(payload)
-      pages.each do |page|
-        render_regenerated(page, payload)
-      end
+    def render_pages(_payload)
+      Jekyll::Rust.render_site(self)
+      nil
     end
 
-    def render_regenerated(document, payload)
-      return unless regenerator.regenerate?(document)
-
-      document.renderer.payload = payload
-      document.output = document.renderer.run
-      document.trigger_hooks(:post_render)
+    def render_regenerated(_document, _payload)
+      Jekyll::Rust.render_site(self)
+      nil
     end
+
   end
 end

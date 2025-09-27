@@ -2,6 +2,8 @@ use magnus::{function, prelude::*, Error, IntoValue, RModule, Value};
 
 use crate::ruby_utils::ruby_handle;
 
+const RENDER_PHASE: &str = "render";
+
 const PHASES: [&str; 6] = ["reset", "read", "generate", "render", "cleanup", "write"];
 
 pub fn define_into(bridge: &RModule) -> Result<(), Error> {
@@ -23,7 +25,11 @@ pub fn run_site_phases(
     let mut timings = Vec::with_capacity(PHASES.len());
     for &phase in PHASES.iter() {
         let start = std::time::Instant::now();
-        let _: Value = site.funcall::<_, _, Value>(phase, ())?;
+        if phase == RENDER_PHASE {
+            crate::render::render_site(site)?;
+        } else {
+            let _: Value = site.funcall::<_, _, Value>(phase, ())?;
+        }
         let elapsed = start.elapsed().as_secs_f64();
         timings.push((phase.to_uppercase(), elapsed));
     }

@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative "../rust"
+
 module Jekyll
   module Tags
     class IncludeTag < Liquid::Tag
@@ -95,12 +97,7 @@ module Jekyll
       end
 
       def locate_include_file(context, file, safe)
-        includes_dirs = tag_includes_dirs(context)
-        includes_dirs.each do |dir|
-          path = PathManager.join(dir, file)
-          return path if valid_include_file?(path, dir.to_s, safe)
-        end
-        raise IOError, could_not_locate_message(file, includes_dirs, safe)
+        Jekyll::Rust.include_tag_resolve(context, file, safe)
       end
       def render(context)
         site = context.registers[:site]
@@ -283,6 +280,10 @@ module Jekyll
     end
 
     class IncludeRelativeTag < IncludeTag
+      def locate_include_file(context, file, _safe)
+        Jekyll::Rust.include_relative_resolve(context, file)
+      end
+
       def load_cached_partial(path, context)
         context.registers[:cached_partials] ||= {}
         context.registers[:cached_partials][path] ||= parse_partial(path, context)
