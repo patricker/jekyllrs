@@ -1,4 +1,9 @@
-use magnus::{function, prelude::*, Error, RModule, TryConvert, Value};
+use std::collections::HashSet;
+
+use magnus::{
+    function, prelude::*, r_hash::ForEach, Error, IntoValue, RArray, RHash, RModule, Ruby,
+    TryConvert, Value,
+};
 
 use crate::ruby_utils::ruby_handle;
 
@@ -21,7 +26,7 @@ fn rb_expand_path(path: Value) -> Result<String, Error> {
     String::try_convert(exp)
 }
 
-pub(crate) fn engine_build_process(options: Value) -> Result<(), Error> {
+pub(crate) fn engine_build_process(options: Value) -> Result<Value, Error> {
     let ruby = ruby_handle()?;
 
     // Logger and verbosity
@@ -39,6 +44,11 @@ pub(crate) fn engine_build_process(options: Value) -> Result<(), Error> {
 
     // Initial build
     let skip_initial = fetch_bool(options, "skip_initial_build", false)?;
+    let serving = fetch_bool(options, "serving", false)?;
+    let livereload_enabled = fetch_bool(options, "livereload", false)?;
+    let collect_livereload_changes = serving && livereload_enabled;
+    let mut changed_entries: Vec<ChangedEntry> = Vec::new();
+
     if skip_initial {
         let _: Value = logger.funcall(
             "warn",
@@ -73,6 +83,10 @@ pub(crate) fn engine_build_process(options: Value) -> Result<(), Error> {
         let profile_enabled = fetch_bool(config, "profile", false)?;
         let timings = crate::engine::run_site_phases(site, profile_enabled)?;
 
+        if collect_livereload_changes {
+            changed_entries = collect_changed_entries(site)?;
+        }
+
         let secs = t0.elapsed().as_secs_f64();
         let _: Value = logger.funcall("info", ("", format!("done in {:.3} seconds.", secs)))?;
 
@@ -82,7 +96,6 @@ pub(crate) fn engine_build_process(options: Value) -> Result<(), Error> {
     }
 
     // Watch handling
-    let serving = fetch_bool(options, "serving", false)?;
     let detach = fetch_bool(config, "detach", false)?;
     let watch = fetch_bool(config, "watch", false)?;
     if serving {
@@ -110,5 +123,153 @@ pub(crate) fn engine_build_process(options: Value) -> Result<(), Error> {
         )?;
     }
 
+    entries_to_value(&ruby, changed_entries)
+}
+
+struct ChangedEntry {
+    relative_path: String,
+    url: Option<String>,
+}
+
+fn entries_to_value(ruby: &Ruby, entries: Vec<ChangedEntry>) -> Result<Value, Error> {
+    let array = ruby.ary_new_capa(entries.len());
+    for entry in entries {
+        let tuple = ruby.ary_new_capa(2);
+        tuple.push(ruby.str_new(entry.relative_path.as_str()))?;
+        match entry.url {
+            Some(url) => tuple.push(ruby.str_new(&url))?,
+            None => tuple.push(ruby.qnil())?,
+        }
+        array.push(tuple.into_value_with(ruby))?;
+    }
+    Ok(array.into_value_with(ruby))
+}
+
+fn collect_changed_entries(site: Value) -> Result<Vec<ChangedEntry>, Error> {
+    let regenerator: Value = site.funcall("regenerator", ())?;
+    let mut seen = HashSet::new();
+    let mut entries = Vec::new();
+
+    collect_from_array(
+        site.funcall("pages", ())?,
+        &regenerator,
+        &mut seen,
+        &mut entries,
+    )?;
+    collect_static_files(
+        site.funcall("static_files", ())?,
+        &regenerator,
+        &mut seen,
+        &mut entries,
+    )?;
+    collect_collections(
+        site.funcall("collections", ())?,
+        &regenerator,
+        &mut seen,
+        &mut entries,
+    )?;
+
+    Ok(entries)
+}
+
+fn collect_from_array(
+    array_value: Value,
+    regenerator: &Value,
+    seen: &mut HashSet<String>,
+    entries: &mut Vec<ChangedEntry>,
+) -> Result<(), Error> {
+    if let Some(array) = RArray::from_value(array_value) {
+        for item in array.each() {
+            let value = item?;
+            push_if_changed(value, regenerator, seen, entries, true)?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_static_files(
+    array_value: Value,
+    regenerator: &Value,
+    seen: &mut HashSet<String>,
+    entries: &mut Vec<ChangedEntry>,
+) -> Result<(), Error> {
+    if let Some(array) = RArray::from_value(array_value) {
+        for item in array.each() {
+            let value = item?;
+            push_if_changed(
+                value,
+                regenerator,
+                seen,
+                entries,
+                should_consider_write_flag(value)?,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_collections(
+    collections_value: Value,
+    regenerator: &Value,
+    seen: &mut HashSet<String>,
+    entries: &mut Vec<ChangedEntry>,
+) -> Result<(), Error> {
+    if let Some(collections) = RHash::from_value(collections_value) {
+        collections.foreach(|_key: Value, coll: Value| {
+            let docs = coll.funcall("docs", ())?;
+            if let Some(array) = RArray::from_value(docs) {
+                for doc in array.each() {
+                    let doc_value = doc?;
+                    push_if_changed(
+                        doc_value,
+                        regenerator,
+                        seen,
+                        entries,
+                        should_consider_write_flag(doc_value)?,
+                    )?;
+                }
+            }
+            Ok(ForEach::Continue)
+        })?;
+    }
+    Ok(())
+}
+
+fn should_consider_write_flag(value: Value) -> Result<bool, Error> {
+    let writes: Value = value.funcall("write?", ())?;
+    Ok(!writes.is_nil() && writes.to_bool())
+}
+
+fn push_if_changed(
+    entry: Value,
+    regenerator: &Value,
+    seen: &mut HashSet<String>,
+    entries: &mut Vec<ChangedEntry>,
+    should_include: bool,
+) -> Result<(), Error> {
+    if !should_include {
+        return Ok(());
+    }
+
+    let should_regenerate: Value = regenerator.funcall("regenerate?", (entry,))?;
+    if should_regenerate.is_nil() || !should_regenerate.to_bool() {
+        return Ok(());
+    }
+
+    let relative_path_val: Value = entry.funcall("relative_path", ())?;
+    let relative_path = String::try_convert(relative_path_val)?;
+
+    if !seen.insert(relative_path.clone()) {
+        return Ok(());
+    }
+
+    let url_val: Value = entry.funcall("url", ())?;
+    let url = if url_val.is_nil() {
+        None
+    } else {
+        Some(String::try_convert(url_val)?)
+    };
+
+    entries.push(ChangedEntry { relative_path, url });
     Ok(())
 }

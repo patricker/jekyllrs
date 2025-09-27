@@ -39,8 +39,6 @@ require "shoulda-context"
 
 include Jekyll
 
-require "jekyll/commands/serve/servlet"
-
 # Report with color.
 Minitest::Reporters.use! [
   Minitest::Reporters::DefaultReporter.new(
@@ -239,74 +237,6 @@ class JekyllUnitTest < Minitest::Test
          "on this machine".magenta
   rescue NotImplementedError => e
     skip e.to_s.magenta
-  end
-end
-
-class FakeLogger
-  def <<(str); end
-end
-
-module TestWEBrick
-  module_function
-
-  def mount_server(&block)
-    server = nil
-
-    begin
-      server = WEBrick::HTTPServer.new(config)
-
-      server.mount("/", Jekyll::Commands::Serve::Servlet, document_root,
-                   document_root_options)
-
-      begin
-        server.start
-        listener = server.listeners.first
-        unless listener&.respond_to?(:addr)
-          raise Minitest::Skip, "WEBrick listener not available in this environment"
-        end
-
-        addr = listener.addr
-        block.yield([server, addr[3], addr[1]])
-      rescue NoMethodError
-        raise Minitest::Skip, "WEBrick listener not available in this environment"
-      end
-    rescue Minitest::Skip
-      raise
-    rescue StandardError => e
-      raise Minitest::Skip, "WEBrick unavailable: #{e.class}" if e.is_a?(SystemCallError) || e.is_a?(NoMethodError)
-      raise e
-    ensure
-      if server && server.status != :Stop
-        server.shutdown
-        sleep 0.1 until server.status == :Stop
-      end
-    end
-  end
-
-  def config
-    logger = FakeLogger.new
-    {
-      :BindAddress => "127.0.0.1", :Port => 0,
-      :ShutdownSocketWithoutClose => true,
-      :ServerType => Thread,
-      :Logger => WEBrick::Log.new(logger),
-      :AccessLog => [[logger, ""]],
-      :MimeTypesCharset => Jekyll::Commands::Serve.send(:mime_types_charset),
-      :JekyllOptions => {},
-    }
-  end
-
-  def document_root
-    "#{File.dirname(__FILE__)}/fixtures/webrick"
-  end
-
-  def document_root_options
-    WEBrick::Config::FileHandler.merge(
-      :FancyIndexing     => true,
-      :NondisclosureName => [
-        ".ht*", "~*",
-      ]
-    )
   end
 end
 

@@ -67,11 +67,3 @@ output << mimes.map { |mime,extensions| "#{mime.ljust(strlen)} #{extensions.sort
 config = File.expand_path "../lib/jekyll/mime.types", __dir__
 File.write(config, output)
 log_info "Done! See: #{config.inspect.white}"
-
-# --- Generate JSON file from charset_data ----
-puts
-
-log_info "Dumping mimetype-charset mapping as JSON.."
-json_file = File.expand_path "../lib/jekyll/commands/serve/mime_types_charset.json", __dir__
-File.write(json_file, JSON.pretty_generate(charset_data) + "\n")
-log_success "and done! See: #{json_file.inspect.white}"

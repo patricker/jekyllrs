@@ -1,14 +1,20 @@
 use std::collections::HashSet;
 use std::convert::Infallible;
+use std::io::{self, Cursor, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
+use std::process::Command;
 use std::sync::{mpsc as sync_mpsc, Arc, Mutex};
 use std::time::Duration;
 
+use brotli::{enc::BrotliEncoderParams, BrotliCompress};
 use futures_util::{SinkExt, StreamExt};
 use globset::{GlobBuilder, GlobMatcher};
-use hyper::header::{HeaderName, HeaderValue, CACHE_CONTROL, CONTENT_TYPE};
+use hyper::header::{
+    HeaderName, HeaderValue, ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH,
+    CONTENT_TYPE, VARY,
+};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
 use magnus::{
@@ -23,6 +29,9 @@ use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task;
 use tokio_tungstenite::{accept_async, tungstenite::protocol::Message};
+
+use flate2::write::{GzEncoder, ZlibEncoder};
+use flate2::Compression;
 
 use crate::ruby_utils::ruby_handle;
 use crate::time_utils::ensure_time_required;
@@ -170,6 +179,18 @@ fn run_server(ruby: &Ruby, opts: ServeOptions, options: Value) -> Result<(), Err
     }
     let _: Value = logger.funcall("info", ("Server running:", "press Ctrl+C to stop"))?;
 
+    if opts.open_url {
+        if let Err(err) = launch_browser(&address_string) {
+            let _: Value = logger.funcall(
+                "warn",
+                (
+                    "Serve:",
+                    format!("failed to open browser automatically: {err}"),
+                ),
+            )?;
+        }
+    }
+
     let livereload_cfg = if opts.livereload {
         Some(LiveReloadConfig::from_options(&opts))
     } else {
@@ -266,7 +287,7 @@ fn run_server(ruby: &Ruby, opts: ServeOptions, options: Value) -> Result<(), Err
                 }
                 maybe_paths = rebuild_rx.recv(), if watch_enabled => {
                     if let Some(paths) = maybe_paths {
-                        if let Err(err) = process_rebuild_event(options, &paths) {
+                        if let Err(err) = process_rebuild_event(options, &paths, livereload_cfg.as_ref()) {
                             eprintln!("auto-regeneration failed: {err}");
                         }
                     }
@@ -327,13 +348,9 @@ fn handle_request(req: Request<Body>, state: Arc<ServerState>) -> Response<Body>
                     }
                 }
 
-                if req.method() == Method::HEAD {
-                    builder.body(Body::empty()).unwrap()
-                } else {
-                    builder.body(Body::from(bytes)).unwrap()
-                }
+                return finalize_response(&req, builder, bytes);
             }
-            Err(_) => state.not_found(),
+            Err(_) => state.not_found(&req),
         },
         Some(ResolvedPath::DirectoryListing(mut html)) => {
             let mut builder = Response::builder().status(StatusCode::OK);
@@ -355,13 +372,9 @@ fn handle_request(req: Request<Body>, state: Arc<ServerState>) -> Response<Body>
                 }
             }
 
-            if req.method() == Method::HEAD {
-                builder.body(Body::empty()).unwrap()
-            } else {
-                builder.body(Body::from(html)).unwrap()
-            }
+            return finalize_response(&req, builder, html.into_bytes());
         }
-        None => state.not_found(),
+        None => state.not_found(&req),
     }
 }
 
@@ -374,15 +387,6 @@ fn warn_unimplemented_features(ruby: &Ruby, opts: &ServeOptions) -> Result<(), E
         let _: Value = logger.funcall(
             "info",
             ("Auto-regeneration:", "disabled. Use --watch to enable."),
-        )?;
-    }
-    if opts.open_url {
-        let _: Value = logger.funcall(
-            "warn",
-            (
-                "Serve:",
-                "`--open-url` is not yet implemented in the Rust CLI.",
-            ),
         )?;
     }
     if opts.detach {
@@ -680,21 +684,30 @@ impl ServerState {
         None
     }
 
-    fn not_found(&self) -> Response<Body> {
+    fn not_found(&self, req: &Request<Body>) -> Response<Body> {
         if let Some(path) = &self.not_found_path {
             if let Ok(bytes) = std::fs::read(path) {
-                return Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .header("Content-Type", "text/html; charset=utf-8")
-                    .body(Body::from(bytes))
-                    .unwrap();
+                let mut builder = Response::builder().status(StatusCode::NOT_FOUND);
+                if let Some(headers) = builder.headers_mut() {
+                    headers.insert(
+                        CONTENT_TYPE,
+                        HeaderValue::from_static("text/html; charset=utf-8"),
+                    );
+                    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+                }
+                return finalize_response(req, builder, bytes);
             }
         }
-        Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header("Content-Type", "text/plain; charset=utf-8")
-            .body(Body::from("404 Not Found"))
-            .unwrap()
+
+        let mut builder = Response::builder().status(StatusCode::NOT_FOUND);
+        if let Some(headers) = builder.headers_mut() {
+            headers.insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        }
+        finalize_response(req, builder, b"404 Not Found".to_vec())
     }
 }
 
@@ -781,33 +794,8 @@ fn render_directory_listing(dir: &Path, request_path: &str) -> String {
 }
 
 fn livereload_reload(paths: Value) -> Result<(), Error> {
-    let ruby = ruby_handle()?;
-    let (logger, broadcaster) = {
-        let logger = jekyll_logger(&ruby)?;
-        let guard = LIVE_RELOAD_HANDLE
-            .lock()
-            .expect("live reload broadcaster mutex poisoned");
-        (logger, guard.clone())
-    };
-
-    let Some(broadcaster) = broadcaster else {
-        let _: Value = logger.funcall(
-            "debug",
-            ("LiveReload:", "No active server; ignoring reload request."),
-        )?;
-        return Ok(());
-    };
-
     let paths = collect_string_list(paths)?;
-    if paths.is_empty() {
-        return Ok(());
-    }
-
-    for path in paths {
-        broadcaster.trigger_reload(path);
-    }
-
-    Ok(())
+    fire_livereload_events(&paths)
 }
 
 #[derive(Clone)]
@@ -890,6 +878,12 @@ impl LiveReloadConfig {
 
     fn should_ignore(&self, path: &str) -> bool {
         self.ignore_matchers.iter().any(|glob| glob.is_match(path))
+    }
+
+    fn should_ignore_relative(&self, relative: &str) -> bool {
+        self.ignore_matchers
+            .iter()
+            .any(|glob| glob.is_match(relative))
     }
 }
 
@@ -1156,9 +1150,20 @@ async fn shutdown_signal(mut rx: watch::Receiver<bool>) {
     }
 }
 
-fn process_rebuild_event(options: Value, paths: &[PathBuf]) -> Result<(), Error> {
+fn process_rebuild_event(
+    options: Value,
+    paths: &[PathBuf],
+    livereload_cfg: Option<&LiveReloadConfig>,
+) -> Result<(), Error> {
     log_watch_summary(paths);
-    task::block_in_place(|| crate::cli_build::engine_build_process(options))
+    let build_result = task::block_in_place(|| crate::cli_build::engine_build_process(options))?;
+
+    if let Some(cfg) = livereload_cfg {
+        let entries = parse_livereload_entries(build_result)?;
+        handle_livereload_updates(cfg, &entries)?;
+    }
+
+    Ok(())
 }
 
 fn log_watch_summary(paths: &[PathBuf]) {
@@ -1200,6 +1205,113 @@ fn summarize_changed_paths(paths: &[PathBuf]) -> Option<String> {
     Some(message)
 }
 
+struct LiveReloadEntry {
+    relative_path: String,
+    url: Option<String>,
+}
+
+fn parse_livereload_entries(value: Value) -> Result<Vec<LiveReloadEntry>, Error> {
+    if value.is_nil() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = Vec::new();
+    let Some(array) = RArray::from_value(value) else {
+        return Ok(entries);
+    };
+
+    for item in array.each() {
+        let entry = item?;
+        let Some(tuple) = RArray::from_value(entry) else {
+            continue;
+        };
+        if tuple.len() == 0 {
+            continue;
+        }
+
+        let relative_path: String = tuple.entry(0)?;
+        let url = if tuple.len() > 1 {
+            tuple.entry::<Option<String>>(1)?
+        } else {
+            None
+        };
+
+        entries.push(LiveReloadEntry { relative_path, url });
+    }
+
+    Ok(entries)
+}
+
+fn handle_livereload_updates(
+    cfg: &LiveReloadConfig,
+    entries: &[LiveReloadEntry],
+) -> Result<(), Error> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let mut ignored = Vec::new();
+    let mut to_reload = Vec::new();
+
+    for entry in entries {
+        if cfg.should_ignore_relative(entry.relative_path.as_str()) {
+            ignored.push(entry.relative_path.clone());
+            continue;
+        }
+
+        if let Some(url) = &entry.url {
+            to_reload.push(url.clone());
+        }
+    }
+
+    if !ignored.is_empty() {
+        log_livereload_ignored(&ignored)?;
+    }
+
+    fire_livereload_events(&to_reload)
+}
+
+fn log_livereload_ignored(paths: &[String]) -> Result<(), Error> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    let ruby = ruby_handle()?;
+    let logger = jekyll_logger(&ruby)?;
+    let message = format!("Ignoring {:?}", paths);
+    let _: Value = logger.funcall("debug", ("LiveReload:", message))?;
+    Ok(())
+}
+
+fn fire_livereload_events(paths: &[String]) -> Result<(), Error> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    let ruby = ruby_handle()?;
+    let logger = jekyll_logger(&ruby)?;
+    let broadcaster = {
+        let guard = LIVE_RELOAD_HANDLE
+            .lock()
+            .expect("live reload broadcaster mutex poisoned");
+        guard.clone()
+    };
+
+    let Some(broadcaster) = broadcaster else {
+        let _: Value = logger.funcall(
+            "debug",
+            ("LiveReload:", "No active server; ignoring reload request."),
+        )?;
+        return Ok(());
+    };
+
+    for path in paths {
+        broadcaster.trigger_reload(path.clone());
+    }
+
+    Ok(())
+}
+
 fn build_livereload_snippet(cfg: &LiveReloadConfig) -> String {
     let mut args = String::new();
     if cfg.min_delay != 0 {
@@ -1237,6 +1349,216 @@ fn maybe_inject_livereload(bytes: &[u8], snippet: &str, content_type: &str) -> O
     }
 
     Some(html.into_bytes())
+}
+
+fn finalize_response(
+    req: &Request<Body>,
+    mut builder: hyper::http::response::Builder,
+    bytes: Vec<u8>,
+) -> Response<Body> {
+    let encoding = negotiate_encoding(req.headers());
+    let (encoded, encoding_header) = encode_bytes(bytes, encoding);
+
+    if let Some(headers) = builder.headers_mut() {
+        if let Some(header_value) = encoding_header {
+            headers.insert(CONTENT_ENCODING, HeaderValue::from_static(header_value));
+        }
+        headers.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+    }
+
+    let length = encoded.len();
+    if req.method() == Method::HEAD {
+        if let Some(headers) = builder.headers_mut() {
+            if let Ok(value) = HeaderValue::from_str(&length.to_string()) {
+                headers.insert(CONTENT_LENGTH, value);
+            }
+        }
+        builder.body(Body::empty()).unwrap()
+    } else {
+        builder.body(Body::from(encoded)).unwrap()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectedEncoding {
+    Identity,
+    Brotli,
+    Gzip,
+    Deflate,
+}
+
+fn negotiate_encoding(headers: &hyper::HeaderMap<HeaderValue>) -> SelectedEncoding {
+    let value = headers
+        .get(ACCEPT_ENCODING)
+        .and_then(|val| val.to_str().ok())
+        .unwrap_or("");
+
+    let mut q_br = -1.0f32;
+    let mut q_gzip = -1.0f32;
+    let mut q_deflate = -1.0f32;
+    let mut q_identity = 1.0f32;
+
+    for raw in value.split(',') {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.split(';');
+        let token = parts
+            .next()
+            .map(|t| t.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let mut q = 1.0f32;
+        for param in parts {
+            let param = param.trim();
+            if let Some(rest) = param.strip_prefix("q=") {
+                if let Ok(parsed) = rest.trim().parse::<f32>() {
+                    q = parsed;
+                }
+            }
+        }
+
+        match token.as_str() {
+            "br" => q_br = q,
+            "gzip" | "x-gzip" => q_gzip = q,
+            "deflate" => q_deflate = q,
+            "identity" => q_identity = q,
+            "*" => {
+                if q_br < 0.0 {
+                    q_br = q;
+                }
+                if q_gzip < 0.0 {
+                    q_gzip = q;
+                }
+                if q_deflate < 0.0 {
+                    q_deflate = q;
+                }
+                q_identity = q_identity.min(q);
+            }
+            _ => {}
+        }
+    }
+
+    if q_br < 0.0 {
+        q_br = 1.0;
+    }
+    if q_gzip < 0.0 {
+        q_gzip = 1.0;
+    }
+    if q_deflate < 0.0 {
+        q_deflate = 1.0;
+    }
+
+    let mut best = SelectedEncoding::Identity;
+    let mut best_q = if q_identity.is_sign_negative() {
+        0.0
+    } else {
+        q_identity.max(0.0)
+    };
+
+    for (encoding, q) in [
+        (SelectedEncoding::Brotli, q_br),
+        (SelectedEncoding::Gzip, q_gzip),
+        (SelectedEncoding::Deflate, q_deflate),
+    ] {
+        if q > best_q && q > 0.0 {
+            best = encoding;
+            best_q = q;
+        }
+    }
+
+    if best_q <= 0.0 {
+        SelectedEncoding::Identity
+    } else {
+        best
+    }
+}
+
+fn encode_bytes(bytes: Vec<u8>, encoding: SelectedEncoding) -> (Vec<u8>, Option<&'static str>) {
+    match encoding {
+        SelectedEncoding::Identity => (bytes, None),
+        SelectedEncoding::Brotli => match brotli_compress(&bytes) {
+            Ok(out) => (out, Some("br")),
+            Err(_) => (bytes, None),
+        },
+        SelectedEncoding::Gzip => match gzip_compress(&bytes) {
+            Ok(out) => (out, Some("gzip")),
+            Err(_) => (bytes, None),
+        },
+        SelectedEncoding::Deflate => match deflate_compress(&bytes) {
+            Ok(out) => (out, Some("deflate")),
+            Err(_) => (bytes, None),
+        },
+    }
+}
+
+fn gzip_compress(input: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(input)?;
+    encoder.finish()
+}
+
+fn deflate_compress(input: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(input)?;
+    encoder.finish()
+}
+
+fn brotli_compress(input: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut params = BrotliEncoderParams::default();
+    params.quality = 5;
+    let mut output = Vec::new();
+    let mut reader = Cursor::new(input);
+    BrotliCompress(&mut reader, &mut output, &params).map(|_| output)
+}
+
+fn launch_browser(url: &str) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let status = Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "failed to launch browser",
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("open").arg(url).status()?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "failed to launch browser",
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let status = Command::new("xdg-open").arg(url).status()?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "failed to launch browser",
+        ));
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = url;
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "automatic browser launch is not supported on this platform",
+        ))
+    }
 }
 
 fn is_html_mime(content_type: &str) -> bool {

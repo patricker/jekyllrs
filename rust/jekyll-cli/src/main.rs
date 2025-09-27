@@ -33,6 +33,8 @@ fn locate_rust_lib() -> Option<PathBuf> {
     None
 }
 
+const DEFAULT_LIVERELOAD_PORT: i64 = 35_729;
+
 fn set_env_defaults() {
     env::set_var("JEKYLL_RS", "1");
     if env::var_os("FORCE_COLOR").is_none() {
@@ -456,7 +458,6 @@ fn print_help_serve() {
 
 fn run_serve(args: &[String], trace: bool) -> Result<(), Error> {
     eval::<Value>("require 'jekyll'")?;
-    let _ = eval::<Value>("require 'jekyll/commands/serve'");
     let _ = eval::<Value>("STDOUT.sync = true; STDERR.sync = true");
 
     let options = parse_serve_args(args)?;
@@ -465,26 +466,15 @@ fn run_serve(args: &[String], trace: bool) -> Result<(), Error> {
         options.aset("watch", true)?;
     }
 
-    let ruby = Ruby::get().map_err(|_| {
+    let _ruby = Ruby::get().map_err(|_| {
         Error::new(
             exception::runtime_error(),
             "Ruby interpreter is not available while running serve",
         )
     })?;
-    let serve_cmd: Value = eval("Jekyll::Commands::Serve")?;
-    let validate_sym = ruby.to_symbol("validate_options");
-    let _: Value = serve_cmd.funcall("__send__", (validate_sym, options))?;
-
-    let livereload_enabled = {
-        let value = options.aref::<_, Value>("livereload")?;
-        !value.is_nil() && value.to_bool()
-    };
-    if livereload_enabled {
-        let register_sym = ruby.to_symbol("register_rust_livereload_hooks");
-        let _: Value = serve_cmd.funcall("__send__", (register_sym, options))?;
-    }
-
     let jekyll: RModule = eval("Jekyll")?;
+    validate_serve_options(&jekyll, &options)?;
+
     let rust_mod: RModule = jekyll.const_get("Rust")?;
     let res = rust_mod.funcall::<_, _, Value>("engine_build_process", (options,));
     match res {
@@ -610,6 +600,76 @@ fn parse_serve_args(args: &[String]) -> Result<RHash, Error> {
         i += 1;
     }
     Ok(hash)
+}
+
+fn option_truthy(hash: &RHash, key: &str) -> Result<bool, Error> {
+    let value: Value = hash.aref(key)?;
+    if value.is_nil() {
+        Ok(false)
+    } else {
+        Ok(value.to_bool())
+    }
+}
+
+fn value_present(hash: &RHash, key: &str) -> Result<bool, Error> {
+    Ok(!hash.aref::<_, Value>(key)?.is_nil())
+}
+
+fn validate_serve_options(jekyll: &RModule, options: &RHash) -> Result<(), Error> {
+    let logger: Value = jekyll.funcall("logger", ())?;
+    let livereload = option_truthy(options, "livereload")?;
+
+    if livereload {
+        if option_truthy(options, "detach")? {
+            let _: Value = logger.funcall(
+                "warn",
+                (
+                    "Warning:",
+                    "--detach and --livereload are mutually exclusive. Choosing --livereload",
+                ),
+            )?;
+            options.aset("detach", false)?;
+        }
+
+        if value_present(options, "ssl_cert")? || value_present(options, "ssl_key")? {
+            let message = "LiveReload does not support SSL";
+            match logger.funcall::<_, _, Value>("abort_with", ("Error:", message)) {
+                Ok(_) => return Err(Error::new(exception::runtime_error(), message)),
+                Err(e) => return Err(e),
+            }
+        }
+
+        if !option_truthy(options, "watch")? {
+            options.aset("watch", true)?;
+        }
+
+        if !value_present(options, "livereload_port")? {
+            options.aset("livereload_port", DEFAULT_LIVERELOAD_PORT)?;
+        }
+    } else {
+        let extra_flags = [
+            "livereload_min_delay",
+            "livereload_max_delay",
+            "livereload_ignore",
+            "livereload_port",
+        ];
+        let mut has_extra = false;
+        for key in extra_flags.iter() {
+            if value_present(options, key)? {
+                has_extra = true;
+                break;
+            }
+        }
+        if has_extra {
+            let message = "--livereload-min-delay, --livereload-max-delay, --livereload-ignore, and --livereload-port require the --livereload option.";
+            match logger.funcall::<_, _, Value>("abort_with", ("Error:", message)) {
+                Ok(_) => return Err(Error::new(exception::arg_error(), message)),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_new_args(args: &[String]) -> Result<(Vec<String>, RHash), Error> {

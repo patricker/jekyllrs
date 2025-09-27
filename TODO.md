@@ -51,7 +51,7 @@ Got it—no runtime fallbacks to Ruby, no “compat flags,” and `jekyllrs` is 
   * [x] Implement a minimal static server in Rust (e.g., `hyper` or `axum`) with:
 
     * [x] directory index support (toggle via config),
-    * [ ] gzip/deflate/BR if requested,
+    * [x] gzip/deflate/BR if requested,
     * [x] Cache-Control + 404 fallback responses (500/TLS TODO),
     * [x] baseurl handling.
   * [x] Map Jekyll config → server settings (port/host/ssl options) per `lib/jekyll/commands/serve.rb` options.
@@ -61,23 +61,26 @@ Got it—no runtime fallbacks to Ruby, no “compat flags,” and `jekyllrs` is 
   * [x] Inject LiveReload script (Rust) or surface interim guidance if Injector missing.
   * [x] WebSocket endpoint in Rust mirroring `livereload` semantics.
   * [x] Implement `livereload_ignore` filtering identical to Ruby (`File.fnmatch?` parity). You can call back into Ruby initially (existing RRegexp/`fnmatch` bridge), then replace with a Rust `globset` implementation that matches Ruby’s flags.
+  * [x] Remove Ruby hook registration; broadcast post-build reloads directly from the Rust engine.
 
 
 
 * **Watch**
 
-  * [ ] Use `notify` (debounced) with ignore rules honoring: `exclude`, `_site`, theme/vendor dirs, `.jekyll-metadata`, etc.
-  * [ ] On change: call **Rust build** (`engine_build_process`) and then broadcast LiveReload diffs.
+  * [x] Use `notify` (debounced) with ignore rules honoring: `exclude`, `_site`, theme/vendor dirs, `.jekyll-metadata`, etc.
+  * [x] On change: call **Rust build** (`engine_build_process`) and then broadcast LiveReload diffs via the Rust LiveReload bridge.
 
 * **Command surface**
 
 * [x] Add `serve` subcommand to `jekyllrs` (you already parse `serving`/`watch` inside `cli_build.rs`; use a native watcher path instead of `Jekyll::Watcher`).
     *Files:* `rust/jekyll-cli/src/main.rs`, new `rust/jekyll-core/src/cli_serve.rs` (or fold into `cli_build.rs`).
+  * [x] Register `jekyll serve` via `Jekyll::CLI::ServeCommand` so the Ruby CLI just shells into the Rust bridge.
+    *Files:* `exe/jekyll`, `lib/jekyll/cli/serve_command.rb`
 
 * **Remove Ruby watchers from hot path**
 
 * [x] Stop requiring `jekyll-watch` in `cli_build.rs` (currently invoked when `watch` true). Replace with noop there; watcher lives in Rust serve path.
-    *Files:* `rust/jekyll-core/src/cli_build.rs`, `lib/jekyll/commands/serve.rb`
+    *Files:* `rust/jekyll-core/src/cli_build.rs`
 
 **Acceptance**
 
@@ -268,8 +271,10 @@ Got it—no runtime fallbacks to Ruby, no “compat flags,” and `jekyllrs` is 
 
 * **Delete superseded Ruby**
 
-  * [ ] Remove Ruby renderer orchestration, watcher, and any dead helpers now handled in Rust.
-    *Files:* `lib/jekyll/renderer.rb`, `lib/jekyll/commands/serve.rb` (keep CLI option mapping only until `jekyll` itself calls into Rust CLI).
+  * [x] Drop the Ruby serve command and WEBrick helpers now that CLI delegation lives in Rust.
+    *Files:* `exe/jekyll`, `lib/jekyll/cli/serve_command.rb`, removed `lib/jekyll/commands/serve*`
+  * [ ] Remove Ruby renderer orchestration and any remaining helpers now handled in Rust.
+    *Files:* `lib/jekyll/renderer.rb`
 
 * **`jekyllrs` as the replacement package**
 

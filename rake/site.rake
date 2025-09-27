@@ -13,6 +13,7 @@ namespace :site do
   task :preview => :generated_pages do
     require "launchy"
     require "jekyll"
+    require "jekyll/cli/serve_command"
 
     browser_launched = false
     Jekyll::Hooks.register :site, :post_write do |_site|
@@ -32,8 +33,7 @@ namespace :site do
       "watch"       => true,
       "serving"     => true,
     }
-    Jekyll::Rust.engine_build_process(options)
-    Jekyll::Commands::Serve.process(options)
+    Jekyll::CLI::ServeCommand.start(options)
   end
 
   desc "Generate the site"
