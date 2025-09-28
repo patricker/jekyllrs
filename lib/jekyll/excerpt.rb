@@ -80,7 +80,13 @@ module Jekyll
     end
 
     def output
-      @output ||= Renderer.new(doc.site, self, site.site_payload).run
+      return @output if defined?(@output) && @output
+      return content if @rendering
+
+      @rendering = true
+      @output = Renderer.new(doc.site, self, site.site_payload).run
+    ensure
+      @rendering = false
     end
 
     def place_in_layout?

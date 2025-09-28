@@ -1,5 +1,5 @@
 use magnus::r_hash::ForEach;
-use magnus::{function, prelude::*, Error, RClass, RHash, RModule, Value};
+use magnus::{function, prelude::*, Error, RHash, RModule, Value};
 
 use crate::ruby_utils::ruby_handle;
 
@@ -92,17 +92,7 @@ fn duplicate_frozen_values(target: Value) -> Result<(), Error> {
 
 fn is_mergable(value: Value) -> Result<bool, Error> {
     let ruby = ruby_handle()?;
-    if value.is_kind_of(ruby.class_hash()) {
-        return Ok(true);
-    }
-
-    let drop_class: Value = {
-        let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
-        let drops: RModule = jekyll.const_get("Drops")?;
-        drops.const_get("Drop")?
-    };
-    let drop_class = RClass::try_convert(drop_class)?;
-    Ok(value.is_kind_of(drop_class))
+    Ok(value.is_kind_of(ruby.class_hash()))
 }
 
 fn is_duplicable(value: Value) -> Result<bool, Error> {
