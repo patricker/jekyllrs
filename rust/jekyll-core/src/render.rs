@@ -330,7 +330,8 @@ fn assign_layout_data(
         return Ok(());
     }
 
-    let layout: Value = layouts.funcall::<_, _, Value>("[]", (layout_name,))?;
+    let layout_key: Value = layout_name.funcall::<_, _, Value>("to_s", ())?;
+    let layout: Value = layouts.funcall::<_, _, Value>("[]", (layout_key,))?;
     if layout.is_nil() {
         return Ok(());
     }
@@ -620,7 +621,8 @@ fn place_in_layouts(
         return Ok(output);
     }
 
-    let mut layout: Value = layouts.funcall::<_, _, Value>("[]", (layout_name,))?;
+    let layout_lookup: Value = layout_name.funcall::<_, _, Value>("to_s", ())?;
+    let mut layout: Value = layouts.funcall::<_, _, Value>("[]", (layout_lookup,))?;
     validate_layout(ctx, document, layout_name, layout)?;
     if layout.is_nil() {
         return Ok(output);
@@ -651,7 +653,8 @@ fn place_in_layouts(
             break;
         }
 
-        let next_layout: Value = site_layouts.funcall::<_, _, Value>("[]", (next_name,))?;
+        let next_key: Value = next_name.funcall::<_, _, Value>("to_s", ())?;
+        let next_layout: Value = site_layouts.funcall::<_, _, Value>("[]", (next_key,))?;
         if next_layout.is_nil() {
             break;
         }
