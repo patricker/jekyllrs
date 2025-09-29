@@ -8,6 +8,83 @@ use magnus::{
 
 use crate::ruby_utils::ruby_handle;
 
+trait RustConverter: Sync {
+    #[allow(dead_code)]
+    fn name(&self) -> &'static str;
+    fn priority(&self) -> i32;
+    fn matches(&self, ext: &str) -> bool;
+    fn convert(
+        &self,
+        ctx: &RenderingContext,
+        document: Value,
+        content: Value,
+    ) -> Result<Value, Error>;
+    fn output_ext(
+        &self,
+        ctx: &RenderingContext,
+        original_ext: Value,
+    ) -> Result<Option<Value>, Error>;
+    fn highlighter_options(
+        &self,
+        _ctx: &RenderingContext,
+    ) -> Result<Option<(Value, Value)>, Error> {
+        Ok(None)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ConverterKind {
+    Ruby(Value),
+    Rust(&'static dyn RustConverter),
+}
+
+#[derive(Clone, Copy)]
+struct ConverterEntry {
+    priority: i32,
+    order: usize,
+    kind: ConverterKind,
+}
+
+struct IdentityConverter;
+
+impl RustConverter for IdentityConverter {
+    fn name(&self) -> &'static str {
+        "Identity"
+    }
+
+    fn priority(&self) -> i32 {
+        -100
+    }
+
+    fn matches(&self, _ext: &str) -> bool {
+        true
+    }
+
+    fn convert(
+        &self,
+        _ctx: &RenderingContext,
+        _document: Value,
+        content: Value,
+    ) -> Result<Value, Error> {
+        Ok(content)
+    }
+
+    fn output_ext(
+        &self,
+        _ctx: &RenderingContext,
+        original_ext: Value,
+    ) -> Result<Option<Value>, Error> {
+        if original_ext.is_nil() {
+            Ok(None)
+        } else {
+            Ok(Some(original_ext))
+        }
+    }
+}
+
+static IDENTITY_CONVERTER: IdentityConverter = IdentityConverter;
+static RUST_CONVERTERS: &[&dyn RustConverter] = &[&IDENTITY_CONVERTER];
+
 pub fn define_into(bridge: &RModule) -> Result<(), Error> {
     bridge.define_singleton_method("render_site", function!(render_site, 1))?;
     bridge.define_singleton_method("renderer_run", function!(renderer_run, 4))?;
@@ -74,19 +151,12 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
-#[derive(Clone, Copy)]
-struct ConverterEntry {
-    converter: Value,
-    priority: i32,
-    order: usize,
-}
-
 struct SiteConverterRegistry {
     array_object_id: i64,
     array_hash: i64,
     entries: Vec<ConverterEntry>,
-    per_extension: HashMap<String, Vec<usize>>,
     identity_converter: Option<Value>,
+    per_extension: HashMap<String, Vec<usize>>,
 }
 
 impl SiteConverterRegistry {
@@ -96,13 +166,16 @@ impl SiteConverterRegistry {
         array_object_id: i64,
         array_hash: i64,
     ) -> Result<Self, Error> {
-        let mut entries = Vec::with_capacity(converters.len());
+        let mut entries = Vec::with_capacity(converters.len() + RUST_CONVERTERS.len());
         let mut identity_converter = None;
-        for (index, converter) in converters.iter().enumerate() {
+        let mut order = 0;
+
+        for converter in converters {
             if converter.is_kind_of(ctx.identity_converter_class) {
                 identity_converter = Some(*converter);
                 continue;
             }
+
             let converter_class: Value = converter.funcall::<_, _, Value>("class", ())?;
             let priority_symbol: Value = converter_class.funcall::<_, _, Value>("priority", ())?;
             let priority_value: Value = ctx
@@ -113,19 +186,30 @@ impl SiteConverterRegistry {
             } else {
                 i64::try_convert(priority_value)? as i32
             };
+
             entries.push(ConverterEntry {
-                converter: *converter,
                 priority,
-                order: index,
+                order,
+                kind: ConverterKind::Ruby(*converter),
             });
+            order += 1;
+        }
+
+        for converter in RUST_CONVERTERS {
+            entries.push(ConverterEntry {
+                priority: converter.priority(),
+                order,
+                kind: ConverterKind::Rust(*converter),
+            });
+            order += 1;
         }
 
         Ok(Self {
             array_object_id,
             array_hash,
             entries,
-            per_extension: HashMap::new(),
             identity_converter,
+            per_extension: HashMap::new(),
         })
     }
 
@@ -136,13 +220,16 @@ impl SiteConverterRegistry {
         array_object_id: i64,
         array_hash: i64,
     ) -> Result<(), Error> {
-        let mut entries = Vec::with_capacity(converters.len());
+        let mut entries = Vec::with_capacity(converters.len() + RUST_CONVERTERS.len());
         let mut identity_converter = None;
-        for (index, converter) in converters.iter().enumerate() {
+        let mut order = 0;
+
+        for converter in converters {
             if converter.is_kind_of(ctx.identity_converter_class) {
                 identity_converter = Some(*converter);
                 continue;
             }
+
             let converter_class: Value = converter.funcall::<_, _, Value>("class", ())?;
             let priority_symbol: Value = converter_class.funcall::<_, _, Value>("priority", ())?;
             let priority_value: Value = ctx
@@ -153,37 +240,60 @@ impl SiteConverterRegistry {
             } else {
                 i64::try_convert(priority_value)? as i32
             };
+
             entries.push(ConverterEntry {
-                converter: *converter,
                 priority,
-                order: index,
+                order,
+                kind: ConverterKind::Ruby(*converter),
             });
+            order += 1;
+        }
+
+        for converter in RUST_CONVERTERS {
+            entries.push(ConverterEntry {
+                priority: converter.priority(),
+                order,
+                kind: ConverterKind::Rust(*converter),
+            });
+            order += 1;
         }
 
         self.array_object_id = array_object_id;
         self.array_hash = array_hash;
         self.entries = entries;
-        self.per_extension.clear();
         self.identity_converter = identity_converter;
+        self.per_extension.clear();
         Ok(())
     }
 
-    fn converters_for(&mut self, ext_value: Value, ext_string: &str) -> Result<Vec<Value>, Error> {
+    fn converters_for(
+        &mut self,
+        ext_value: Value,
+        ext_string: &str,
+    ) -> Result<Vec<ConverterKind>, Error> {
         if let Some(indices) = self.per_extension.get(ext_string) {
-            let mut cached = Vec::with_capacity(indices.len());
+            let mut cached =
+                Vec::with_capacity(indices.len() + self.identity_converter.map(|_| 1).unwrap_or(0));
             for &index in indices {
-                cached.push(self.entries[index].converter);
+                cached.push(self.entries[index].kind);
             }
             if let Some(identity) = self.identity_converter {
-                cached.push(identity);
+                cached.push(ConverterKind::Ruby(identity));
             }
             return Ok(cached);
         }
 
         let mut matched_indices = Vec::new();
         for (index, entry) in self.entries.iter().enumerate() {
-            let matched: Value = entry.converter.funcall("matches", (ext_value,))?;
-            if matched.to_bool() {
+            let matches = match entry.kind {
+                ConverterKind::Ruby(converter) => {
+                    let matched: Value = converter.funcall("matches", (ext_value,))?;
+                    matched.to_bool()
+                }
+                ConverterKind::Rust(converter) => converter.matches(ext_string),
+            };
+
+            if matches {
                 matched_indices.push(index);
             }
         }
@@ -197,13 +307,15 @@ impl SiteConverterRegistry {
                 .then_with(|| a_entry.order.cmp(&b_entry.order))
         });
 
-        let mut converters = Vec::with_capacity(matched_indices.len() + self.identity_converter.map(|_| 1).unwrap_or(0));
+        let mut converters = Vec::with_capacity(
+            matched_indices.len() + self.identity_converter.map(|_| 1).unwrap_or(0),
+        );
         for &index in matched_indices.iter() {
-            converters.push(self.entries[index].converter);
+            converters.push(self.entries[index].kind);
         }
 
         if let Some(identity) = self.identity_converter {
-            converters.push(identity);
+            converters.push(ConverterKind::Ruby(identity));
         }
 
         self.per_extension
@@ -221,7 +333,7 @@ fn converter_chain_for_site(
     array_hash: i64,
     ext_value: Value,
     ext_string: &str,
-) -> Result<Vec<Value>, Error> {
+) -> Result<Vec<ConverterKind>, Error> {
     let site_object_id: i64 = i64::try_convert(site.funcall::<_, _, Value>("object_id", ())?)?;
 
     let initial_values = CONVERTER_REGISTRY.with(|cache| {
@@ -247,7 +359,7 @@ fn converter_chain_for_site(
         }
     });
 
-    CONVERTER_REGISTRY.with(|cache| -> Result<Vec<Value>, Error> {
+    CONVERTER_REGISTRY.with(|cache| -> Result<Vec<ConverterKind>, Error> {
         let mut map = cache.borrow_mut();
         let mut converter_values_storage: Option<Vec<Value>> = initial_values.transpose()?;
 
@@ -403,9 +515,18 @@ fn renderer_converters(site: Value, document: Value) -> Result<Value, Error> {
     let ruby = ruby_handle()?;
     let ctx = RenderingContext::new(&ruby)?;
     let converters = collect_converters(&ctx, site, document)?;
-    let array = ctx.ruby.ary_new_capa(converters.len());
+    let mut count = 0;
+    for converter in &converters {
+        if matches!(converter, ConverterKind::Ruby(_)) {
+            count += 1;
+        }
+    }
+
+    let array = ctx.ruby.ary_new_capa(count);
     for converter in converters {
-        array.push(converter)?;
+        if let ConverterKind::Ruby(value) = converter {
+            array.push(value)?;
+        }
     }
     Ok(array.into_value_with(ctx.ruby))
 }
@@ -521,7 +642,7 @@ fn collect_converters(
     ctx: &RenderingContext,
     site: Value,
     document: Value,
-) -> Result<Vec<Value>, Error> {
+) -> Result<Vec<ConverterKind>, Error> {
     let raw_extname: Value = document.funcall::<_, _, Value>("extname", ())?;
     let ext_string = if raw_extname.is_nil() {
         String::new()
@@ -559,21 +680,31 @@ fn collect_converters(
 fn assign_highlighter_options(
     ctx: &RenderingContext,
     payload: Value,
-    converters: &[Value],
+    converters: &[ConverterKind],
 ) -> Result<(), Error> {
-    if converters.is_empty() {
+    let Some(first) = converters.first() else {
         return Ok(());
-    }
+    };
 
-    let first = converters[0];
     let prefix_key = ctx.str("highlighter_prefix");
     let suffix_key = ctx.str("highlighter_suffix");
 
-    let prefix: Value = first.funcall("highlighter_prefix", ())?;
-    let suffix: Value = first.funcall("highlighter_suffix", ())?;
+    match first {
+        ConverterKind::Ruby(converter) => {
+            let prefix: Value = converter.funcall("highlighter_prefix", ())?;
+            let suffix: Value = converter.funcall("highlighter_suffix", ())?;
 
-    payload.funcall::<_, _, Value>("[]=", (prefix_key, prefix))?;
-    payload.funcall::<_, _, Value>("[]=", (suffix_key, suffix))?;
+            payload.funcall::<_, _, Value>("[]=", (prefix_key, prefix))?;
+            payload.funcall::<_, _, Value>("[]=", (suffix_key, suffix))?;
+        }
+        ConverterKind::Rust(converter) => {
+            if let Some((prefix, suffix)) = converter.highlighter_options(ctx)? {
+                payload.funcall::<_, _, Value>("[]=", (prefix_key, prefix))?;
+                payload.funcall::<_, _, Value>("[]=", (suffix_key, suffix))?;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -709,39 +840,52 @@ fn render_liquid_template(
 fn convert_content(
     ctx: &RenderingContext,
     document: Value,
-    converters: &[Value],
+    converters: &[ConverterKind],
     mut content: Value,
 ) -> Result<Value, Error> {
-    for &converter in converters {
-        if converter.is_kind_of(ctx.identity_converter_class) {
-            continue;
-        }
-        match converter.funcall::<_, _, Value>("convert", (content,)) {
-            Ok(result) => {
-                content = result;
-            }
-            Err(err) => {
-                let converter_class: Value = converter.funcall::<_, _, Value>("class", ())?;
-                let converter_name: Value = converter_class.funcall::<_, _, Value>("to_s", ())?;
-                let converter_name = String::try_convert(converter_name)?;
-                let relative_path: Value = document.funcall::<_, _, Value>("relative_path", ())?;
-                let relative_path_str = String::try_convert(relative_path)?;
-                let message = format!(
-                    "{} encountered an error while converting '{}':",
-                    converter_name, relative_path_str
-                );
-                ctx.logger.funcall::<_, _, Value>(
-                    "error",
-                    (ctx.str("Conversion error:"), ctx.str(&message)),
-                )?;
-
-                if let Some(exception) = err.value() {
-                    let exception_message: Value = exception.funcall::<_, _, Value>("to_s", ())?;
-                    ctx.logger
-                        .funcall::<_, _, Value>("error", (ctx.str(""), exception_message))?;
+    for converter in converters {
+        match converter {
+            ConverterKind::Ruby(value) => {
+                if value.is_kind_of(ctx.identity_converter_class) {
+                    continue;
                 }
 
-                return Err(err);
+                match value.funcall::<_, _, Value>("convert", (content,)) {
+                    Ok(result) => {
+                        content = result;
+                    }
+                    Err(err) => {
+                        let converter_class: Value = value.funcall::<_, _, Value>("class", ())?;
+                        let converter_name: Value =
+                            converter_class.funcall::<_, _, Value>("to_s", ())?;
+                        let converter_name = String::try_convert(converter_name)?;
+                        let relative_path: Value =
+                            document.funcall::<_, _, Value>("relative_path", ())?;
+                        let relative_path_str = String::try_convert(relative_path)?;
+                        let message = format!(
+                            "{} encountered an error while converting '{}':",
+                            converter_name, relative_path_str
+                        );
+                        ctx.logger.funcall::<_, _, Value>(
+                            "error",
+                            (ctx.str("Conversion error:"), ctx.str(&message)),
+                        )?;
+
+                        if let Some(exception) = err.value() {
+                            let exception_message: Value =
+                                exception.funcall::<_, _, Value>("to_s", ())?;
+                            ctx.logger.funcall::<_, _, Value>(
+                                "error",
+                                (ctx.str(""), exception_message),
+                            )?;
+                        }
+
+                        return Err(err);
+                    }
+                }
+            }
+            ConverterKind::Rust(converter) => {
+                content = converter.convert(ctx, document, content)?;
             }
         }
     }
@@ -784,15 +928,24 @@ fn converter_output_extension(
     let converters = collect_converters(ctx, site, document)?;
     let mut exts: Vec<Value> = Vec::new();
     for converter in &converters {
-        if converter.is_kind_of(ctx.identity_converter_class) {
-            if !extname.is_nil() {
-                exts.push(extname);
+        match converter {
+            ConverterKind::Ruby(value) => {
+                if value.is_kind_of(ctx.identity_converter_class) {
+                    if !extname.is_nil() {
+                        exts.push(extname);
+                    }
+                    continue;
+                }
+                let out_ext: Value = value.funcall::<_, _, Value>("output_ext", (extname,))?;
+                if !out_ext.is_nil() {
+                    exts.push(out_ext);
+                }
             }
-            continue;
-        }
-        let value: Value = converter.funcall::<_, _, Value>("output_ext", (extname,))?;
-        if !value.is_nil() {
-            exts.push(value);
+            ConverterKind::Rust(converter) => {
+                if let Some(out_ext) = converter.output_ext(ctx, extname)? {
+                    exts.push(out_ext);
+                }
+            }
         }
     }
 
