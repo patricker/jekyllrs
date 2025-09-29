@@ -86,6 +86,7 @@ struct SiteConverterRegistry {
     array_hash: i64,
     entries: Vec<ConverterEntry>,
     per_extension: HashMap<String, Vec<usize>>,
+    identity_converter: Option<Value>,
 }
 
 impl SiteConverterRegistry {
@@ -96,7 +97,12 @@ impl SiteConverterRegistry {
         array_hash: i64,
     ) -> Result<Self, Error> {
         let mut entries = Vec::with_capacity(converters.len());
+        let mut identity_converter = None;
         for (index, converter) in converters.iter().enumerate() {
+            if converter.is_kind_of(ctx.identity_converter_class) {
+                identity_converter = Some(*converter);
+                continue;
+            }
             let converter_class: Value = converter.funcall::<_, _, Value>("class", ())?;
             let priority_symbol: Value = converter_class.funcall::<_, _, Value>("priority", ())?;
             let priority_value: Value = ctx
@@ -119,6 +125,7 @@ impl SiteConverterRegistry {
             array_hash,
             entries,
             per_extension: HashMap::new(),
+            identity_converter,
         })
     }
 
@@ -130,7 +137,12 @@ impl SiteConverterRegistry {
         array_hash: i64,
     ) -> Result<(), Error> {
         let mut entries = Vec::with_capacity(converters.len());
+        let mut identity_converter = None;
         for (index, converter) in converters.iter().enumerate() {
+            if converter.is_kind_of(ctx.identity_converter_class) {
+                identity_converter = Some(*converter);
+                continue;
+            }
             let converter_class: Value = converter.funcall::<_, _, Value>("class", ())?;
             let priority_symbol: Value = converter_class.funcall::<_, _, Value>("priority", ())?;
             let priority_value: Value = ctx
@@ -152,6 +164,7 @@ impl SiteConverterRegistry {
         self.array_hash = array_hash;
         self.entries = entries;
         self.per_extension.clear();
+        self.identity_converter = identity_converter;
         Ok(())
     }
 
@@ -160,6 +173,9 @@ impl SiteConverterRegistry {
             let mut cached = Vec::with_capacity(indices.len());
             for &index in indices {
                 cached.push(self.entries[index].converter);
+            }
+            if let Some(identity) = self.identity_converter {
+                cached.push(identity);
             }
             return Ok(cached);
         }
@@ -181,9 +197,13 @@ impl SiteConverterRegistry {
                 .then_with(|| a_entry.order.cmp(&b_entry.order))
         });
 
-        let mut converters = Vec::with_capacity(matched_indices.len());
+        let mut converters = Vec::with_capacity(matched_indices.len() + self.identity_converter.map(|_| 1).unwrap_or(0));
         for &index in matched_indices.iter() {
             converters.push(self.entries[index].converter);
+        }
+
+        if let Some(identity) = self.identity_converter {
+            converters.push(identity);
         }
 
         self.per_extension
@@ -777,7 +797,10 @@ fn converter_output_extension(
     }
 
     if exts.is_empty() {
-        return Ok(ctx.ruby.qnil().into_value_with(ctx.ruby));
+        if extname.is_nil() {
+            return Ok(ctx.ruby.qnil().into_value_with(ctx.ruby));
+        }
+        return Ok(extname);
     }
 
     let selected = if exts.len() == 1 {
