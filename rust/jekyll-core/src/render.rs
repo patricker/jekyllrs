@@ -1,7 +1,10 @@
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 
 use magnus::r_hash::ForEach;
-use magnus::{function, prelude::*, Error, IntoValue, RArray, RClass, RHash, RModule, Ruby, Value};
+use magnus::{
+    function, prelude::*, Error, IntoValue, RArray, RClass, RHash, RModule, RString, Ruby, Value,
+};
 
 use crate::ruby_utils::ruby_handle;
 
@@ -29,6 +32,8 @@ struct RenderingContext<'ruby> {
     liquid_renderer_class: Value,
     utils: Value,
     excerpt_class: RClass,
+    plugin_priorities: Value,
+    identity_converter_class: RClass,
 }
 
 impl<'ruby> RenderingContext<'ruby> {
@@ -39,6 +44,10 @@ impl<'ruby> RenderingContext<'ruby> {
         let liquid_renderer_class: Value = jekyll.const_get("LiquidRenderer")?;
         let utils: Value = jekyll.const_get("Utils")?;
         let excerpt_class: RClass = jekyll.const_get("Excerpt")?;
+        let plugin_class: RClass = jekyll.const_get("Plugin")?;
+        let plugin_priorities: Value = plugin_class.const_get("PRIORITIES")?;
+        let converters_module: RModule = jekyll.const_get("Converters")?;
+        let identity_converter_class: RClass = converters_module.const_get("Identity")?;
         Ok(Self {
             ruby,
             hooks,
@@ -46,6 +55,8 @@ impl<'ruby> RenderingContext<'ruby> {
             liquid_renderer_class,
             utils,
             excerpt_class,
+            plugin_priorities,
+            identity_converter_class,
         })
     }
 
@@ -56,6 +67,217 @@ impl<'ruby> RenderingContext<'ruby> {
     fn str(&self, value: &str) -> Value {
         self.ruby.str_new(value).into_value_with(self.ruby)
     }
+}
+
+thread_local! {
+    static CONVERTER_REGISTRY: RefCell<HashMap<i64, SiteConverterRegistry>> =
+        RefCell::new(HashMap::new());
+}
+
+#[derive(Clone, Copy)]
+struct ConverterEntry {
+    converter: Value,
+    priority: i32,
+    order: usize,
+}
+
+struct SiteConverterRegistry {
+    array_object_id: i64,
+    array_hash: i64,
+    entries: Vec<ConverterEntry>,
+    per_extension: HashMap<String, Vec<usize>>,
+}
+
+impl SiteConverterRegistry {
+    fn from_values(
+        ctx: &RenderingContext,
+        converters: &[Value],
+        array_object_id: i64,
+        array_hash: i64,
+    ) -> Result<Self, Error> {
+        let mut entries = Vec::with_capacity(converters.len());
+        for (index, converter) in converters.iter().enumerate() {
+            let converter_class: Value = converter.funcall::<_, _, Value>("class", ())?;
+            let priority_symbol: Value = converter_class.funcall::<_, _, Value>("priority", ())?;
+            let priority_value: Value = ctx
+                .plugin_priorities
+                .funcall::<_, _, Value>("[]", (priority_symbol,))?;
+            let priority = if priority_value.is_nil() {
+                0
+            } else {
+                i64::try_convert(priority_value)? as i32
+            };
+            entries.push(ConverterEntry {
+                converter: *converter,
+                priority,
+                order: index,
+            });
+        }
+
+        Ok(Self {
+            array_object_id,
+            array_hash,
+            entries,
+            per_extension: HashMap::new(),
+        })
+    }
+
+    fn update_from_values(
+        &mut self,
+        ctx: &RenderingContext,
+        converters: &[Value],
+        array_object_id: i64,
+        array_hash: i64,
+    ) -> Result<(), Error> {
+        let mut entries = Vec::with_capacity(converters.len());
+        for (index, converter) in converters.iter().enumerate() {
+            let converter_class: Value = converter.funcall::<_, _, Value>("class", ())?;
+            let priority_symbol: Value = converter_class.funcall::<_, _, Value>("priority", ())?;
+            let priority_value: Value = ctx
+                .plugin_priorities
+                .funcall::<_, _, Value>("[]", (priority_symbol,))?;
+            let priority = if priority_value.is_nil() {
+                0
+            } else {
+                i64::try_convert(priority_value)? as i32
+            };
+            entries.push(ConverterEntry {
+                converter: *converter,
+                priority,
+                order: index,
+            });
+        }
+
+        self.array_object_id = array_object_id;
+        self.array_hash = array_hash;
+        self.entries = entries;
+        self.per_extension.clear();
+        Ok(())
+    }
+
+    fn converters_for(&mut self, ext_value: Value, ext_string: &str) -> Result<Vec<Value>, Error> {
+        if let Some(indices) = self.per_extension.get(ext_string) {
+            let mut cached = Vec::with_capacity(indices.len());
+            for &index in indices {
+                cached.push(self.entries[index].converter);
+            }
+            return Ok(cached);
+        }
+
+        let mut matched_indices = Vec::new();
+        for (index, entry) in self.entries.iter().enumerate() {
+            let matched: Value = entry.converter.funcall("matches", (ext_value,))?;
+            if matched.to_bool() {
+                matched_indices.push(index);
+            }
+        }
+
+        matched_indices.sort_by(|a, b| {
+            let a_entry = &self.entries[*a];
+            let b_entry = &self.entries[*b];
+            b_entry
+                .priority
+                .cmp(&a_entry.priority)
+                .then_with(|| a_entry.order.cmp(&b_entry.order))
+        });
+
+        let mut converters = Vec::with_capacity(matched_indices.len());
+        for &index in matched_indices.iter() {
+            converters.push(self.entries[index].converter);
+        }
+
+        self.per_extension
+            .insert(ext_string.to_string(), matched_indices);
+
+        Ok(converters)
+    }
+}
+
+fn converter_chain_for_site(
+    ctx: &RenderingContext,
+    site: Value,
+    converters_array: RArray,
+    array_object_id: i64,
+    array_hash: i64,
+    ext_value: Value,
+    ext_string: &str,
+) -> Result<Vec<Value>, Error> {
+    let site_object_id: i64 = i64::try_convert(site.funcall::<_, _, Value>("object_id", ())?)?;
+
+    let initial_values = CONVERTER_REGISTRY.with(|cache| {
+        let map = cache.borrow();
+        match map.get(&site_object_id) {
+            Some(registry) => {
+                if registry.array_object_id != array_object_id || registry.array_hash != array_hash
+                {
+                    Some(
+                        converters_array
+                            .each()
+                            .collect::<Result<Vec<Value>, Error>>(),
+                    )
+                } else {
+                    None
+                }
+            }
+            None => Some(
+                converters_array
+                    .each()
+                    .collect::<Result<Vec<Value>, Error>>(),
+            ),
+        }
+    });
+
+    CONVERTER_REGISTRY.with(|cache| -> Result<Vec<Value>, Error> {
+        let mut map = cache.borrow_mut();
+        let mut converter_values_storage: Option<Vec<Value>> = initial_values.transpose()?;
+
+        if !map.contains_key(&site_object_id) {
+            if converter_values_storage.is_none() {
+                converter_values_storage = Some(
+                    converters_array
+                        .each()
+                        .collect::<Result<Vec<Value>, Error>>()?,
+                );
+            }
+
+            let values = converter_values_storage.as_ref().ok_or_else(|| {
+                Error::new(
+                    ctx.ruby.exception_runtime_error(),
+                    "converter registry missing entries",
+                )
+            })?;
+            let registry = SiteConverterRegistry::from_values(
+                ctx,
+                values.as_slice(),
+                array_object_id,
+                array_hash,
+            )?;
+            map.insert(site_object_id, registry);
+        }
+
+        let registry = map
+            .get_mut(&site_object_id)
+            .expect("converter registry must exist");
+        if registry.array_object_id != array_object_id || registry.array_hash != array_hash {
+            if converter_values_storage.is_none() {
+                converter_values_storage = Some(
+                    converters_array
+                        .each()
+                        .collect::<Result<Vec<Value>, Error>>()?,
+                );
+            }
+
+            let values = converter_values_storage.as_ref().ok_or_else(|| {
+                Error::new(
+                    ctx.ruby.exception_runtime_error(),
+                    "converter registry missing entries",
+                )
+            })?;
+            registry.update_from_values(ctx, values.as_slice(), array_object_id, array_hash)?;
+        }
+
+        registry.converters_for(ext_value, ext_string)
+    })
 }
 
 pub(crate) fn render_site(site: Value) -> Result<(), Error> {
@@ -161,7 +383,11 @@ fn renderer_converters(site: Value, document: Value) -> Result<Value, Error> {
     let ruby = ruby_handle()?;
     let ctx = RenderingContext::new(&ruby)?;
     let converters = collect_converters(&ctx, site, document)?;
-    Ok(converters.into_value_with(ctx.ruby))
+    let array = ctx.ruby.ary_new_capa(converters.len());
+    for converter in converters {
+        array.push(converter)?;
+    }
+    Ok(array.into_value_with(ctx.ruby))
 }
 
 fn render_collections(
@@ -275,37 +501,51 @@ fn collect_converters(
     ctx: &RenderingContext,
     site: Value,
     document: Value,
-) -> Result<RArray, Error> {
-    let extname: Value = document.funcall::<_, _, Value>("extname", ())?;
-    let converters_value: Value = site.funcall::<_, _, Value>("converters", ())?;
-    let Some(converters) = RArray::from_value(converters_value) else {
-        let empty_array = ctx.ruby.ary_new();
-        return Ok(empty_array);
+) -> Result<Vec<Value>, Error> {
+    let raw_extname: Value = document.funcall::<_, _, Value>("extname", ())?;
+    let ext_string = if raw_extname.is_nil() {
+        String::new()
+    } else if let Some(ext) = RString::from_value(raw_extname) {
+        ext.to_string()?
+    } else {
+        let coerced: RString = raw_extname.funcall("to_s", ())?;
+        coerced.to_string()?
     };
 
-    let filtered = ctx.ruby.ary_new();
-    for entry in converters.each() {
-        let converter = entry?;
-        let matched: Value = converter.funcall::<_, _, Value>("matches", (extname,))?;
-        if matched.to_bool() {
-            filtered.push(converter)?;
-        }
-    }
+    let ext_value = ctx
+        .ruby
+        .str_new(ext_string.as_str())
+        .into_value_with(ctx.ruby);
 
-    filtered.funcall::<_, _, Value>("sort!", ())?;
-    Ok(filtered)
+    let converters_value: Value = site.funcall::<_, _, Value>("converters", ())?;
+    let Some(converters_array) = RArray::from_value(converters_value) else {
+        return Ok(Vec::new());
+    };
+
+    let array_object_id: i64 = i64::try_convert(converters_value.funcall("object_id", ())?)?;
+    let array_hash: i64 = i64::try_convert(converters_value.funcall("hash", ())?)?;
+
+    converter_chain_for_site(
+        ctx,
+        site,
+        converters_array,
+        array_object_id,
+        array_hash,
+        ext_value,
+        &ext_string,
+    )
 }
 
 fn assign_highlighter_options(
     ctx: &RenderingContext,
     payload: Value,
-    converters: &RArray,
+    converters: &[Value],
 ) -> Result<(), Error> {
-    if converters.len() == 0 {
+    if converters.is_empty() {
         return Ok(());
     }
 
-    let first: Value = converters.entry(0)?;
+    let first = converters[0];
     let prefix_key = ctx.str("highlighter_prefix");
     let suffix_key = ctx.str("highlighter_suffix");
 
@@ -387,6 +627,27 @@ fn render_liquid_template(
     content: Value,
     path: Option<Value>,
 ) -> Result<Value, Error> {
+    if let Ok(content_string) = String::try_convert(content) {
+        match crate::liquid_engine::render_template(&content_string, payload, info) {
+            Ok(rendered) => {
+                let rendered_value = ctx
+                    .ruby
+                    .str_new(rendered.as_str())
+                    .into_value_with(ctx.ruby);
+                return Ok(rendered_value);
+            }
+            Err(err) => {
+                ctx.logger.funcall::<_, _, Value>(
+                    "debug",
+                    (
+                        ctx.str("Rust liquid engine fallback"),
+                        ctx.str(&format!("using Ruby renderer: {}", err)),
+                    ),
+                )?;
+            }
+        }
+    }
+
     let liquid_renderer: Value = site.funcall::<_, _, Value>("liquid_renderer", ())?;
     let path_value = match path {
         Some(ref value) => value.clone(),
@@ -428,11 +689,13 @@ fn render_liquid_template(
 fn convert_content(
     ctx: &RenderingContext,
     document: Value,
-    converters: &RArray,
+    converters: &[Value],
     mut content: Value,
 ) -> Result<Value, Error> {
-    for entry in converters.each() {
-        let converter = entry?;
+    for &converter in converters {
+        if converter.is_kind_of(ctx.identity_converter_class) {
+            continue;
+        }
         match converter.funcall::<_, _, Value>("convert", (content,)) {
             Ok(result) => {
                 content = result;
@@ -500,8 +763,13 @@ fn converter_output_extension(
     let extname: Value = document.funcall::<_, _, Value>("extname", ())?;
     let converters = collect_converters(ctx, site, document)?;
     let mut exts: Vec<Value> = Vec::new();
-    for entry in converters.each() {
-        let converter = entry?;
+    for converter in &converters {
+        if converter.is_kind_of(ctx.identity_converter_class) {
+            if !extname.is_nil() {
+                exts.push(extname);
+            }
+            continue;
+        }
         let value: Value = converter.funcall::<_, _, Value>("output_ext", (extname,))?;
         if !value.is_nil() {
             exts.push(value);

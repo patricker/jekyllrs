@@ -12,6 +12,7 @@ mod frontmatter;
 mod fs_walk;
 mod include_tag;
 mod liquid;
+mod liquid_engine;
 mod merge;
 mod path_manager;
 mod reader;

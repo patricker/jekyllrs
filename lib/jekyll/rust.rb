@@ -1,10 +1,64 @@
 # frozen_string_literal: true
 
 require_relative "errors"
+require "liquid"
 
 module Jekyll
   module Rust
     class << self
+      def liquid_filter_names
+        ensure_loaded!
+        strainer = Liquid::Strainer.send(:class_variable_get, :@@global_strainer)
+        strainer.filter_methods.to_a
+      end
+
+      def prepare_liquid_filter_context(payload, info)
+        ensure_loaded!
+        info ||= {}
+        registers = if info.key?("registers")
+                      info["registers"]
+                    elsif info.key?(:registers)
+                      info[:registers]
+                    end
+        registers = registers ? registers.dup : {}
+
+        resource_limits = if info.key?("resource_limits")
+                            info["resource_limits"]
+                          elsif info.key?(:resource_limits)
+                            info[:resource_limits]
+                          end
+
+        context = Liquid::Context.new([payload], {}, registers, false, resource_limits)
+
+        if info.key?("strict_filters") || info.key?(:strict_filters)
+          context.strict_filters = info["strict_filters"] || info[:strict_filters]
+        end
+
+        if info.key?("strict_variables") || info.key?(:strict_variables)
+          context.strict_variables = info["strict_variables"] || info[:strict_variables]
+        end
+
+        if info.key?("global_filter") || info.key?(:global_filter)
+          context.global_filter = info["global_filter"] || info[:global_filter]
+        end
+
+        filters = if info.key?("filters")
+                    info["filters"]
+                  elsif info.key?(:filters)
+                    info[:filters]
+                  end
+        context.add_filters(filters) if filters
+
+        context
+      end
+
+      def apply_liquid_filter(context, name, input, positional, keyword)
+        ensure_loaded!
+        positional = Array(positional)
+        kwargs = keyword.is_a?(Hash) ? keyword : {}
+        context.invoke(name, input, *positional, **kwargs.transform_keys(&:to_sym))
+      end
+
       def slugify(string, mode, cased)
         ensure_loaded!
         Bridge.slugify(string, mode, cased)

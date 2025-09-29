@@ -24,3 +24,6 @@ serde_json = "1.0"
 notify = "6.1"
 flate2 = "1.0"
 brotli = "3.3"
+liquid = { version = "0.26", default-features = false, features = ["stdlib"] }
+kstring = "2.0"
+liquid-core = "0.26"
