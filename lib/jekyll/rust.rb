@@ -19,7 +19,16 @@ module Jekyll
         tags = []
         blocks = []
         Liquid::Template.tags.each do |name, klass|
-          if klass <= Liquid::Block
+          tag_class = klass
+          if tag_class.is_a?(String)
+            begin
+              # Attempt to resolve constant names like "Liquid::Include"
+              tag_class = Object.const_get(tag_class)
+            rescue NameError
+              tag_class = nil
+            end
+          end
+          if tag_class.is_a?(Class) && tag_class <= Liquid::Block
             blocks << name
           else
             tags << name

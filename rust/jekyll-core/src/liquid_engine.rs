@@ -6,6 +6,7 @@ use std::fmt;
 
 use kstring::KString;
 use liquid::model::{self as liquid_model, Value as LiquidValue};
+use liquid_core::model::ValueView as _LiquidValueViewTrait;
 use liquid::ParserBuilder;
 use liquid_core::parser::{BlockReflection, ParseBlock, TagBlock, TagReflection, TagTokenIter};
 use liquid_core::ParseTag;
@@ -36,6 +37,221 @@ thread_local! {
 
 thread_local! {
     static TEMPLATE_CACHE: RefCell<HashMap<u64, liquid::Template>> = RefCell::new(HashMap::new());
+}
+
+
+#[derive(Clone, Debug)]
+enum SafeValueInner {
+    Nil,
+    Scalar(liquid_model::Scalar),
+    Array(Vec<SafeValue>),
+    Object(HashMap<KString, SafeValue>),
+}
+
+#[derive(Clone, Debug)]
+struct SafeValue {
+    inner: SafeValueInner,
+    nil: LiquidValue,
+    strict: bool,
+}
+
+impl SafeValue {
+    fn wrap_with_strict(value: LiquidValue, strict: bool) -> Self {
+        match value {
+            LiquidValue::Nil => SafeValue { inner: SafeValueInner::Nil, nil: LiquidValue::Nil, strict },
+            LiquidValue::State(state) => {
+                // Represent state as its string form for display; still treat as scalar-ish
+                let s = state.to_string();
+                SafeValue { inner: SafeValueInner::Scalar(liquid_model::Scalar::new(s)), nil: LiquidValue::Nil, strict }
+            }
+            LiquidValue::Scalar(s) => SafeValue { inner: SafeValueInner::Scalar(s), nil: LiquidValue::Nil, strict },
+            LiquidValue::Array(arr) => {
+                let children = arr.into_iter().map(|v| SafeValue::wrap_with_strict(v, strict)).collect();
+                SafeValue { inner: SafeValueInner::Array(children), nil: LiquidValue::Nil, strict }
+            }
+            LiquidValue::Object(obj) => {
+                let mut map = HashMap::with_capacity(obj.len());
+                for (k, v) in obj.iter() {
+                    map.insert(KString::from_ref(k.as_str()), SafeValue::wrap_with_strict(v.clone(), strict));
+                }
+                SafeValue { inner: SafeValueInner::Object(map), nil: LiquidValue::Nil, strict }
+            }
+        }
+    }
+    fn wrap(value: LiquidValue) -> Self { Self::wrap_with_strict(value, false) }
+
+    fn to_liquid_value(&self) -> LiquidValue {
+        match &self.inner {
+            SafeValueInner::Nil => LiquidValue::Nil,
+            SafeValueInner::Scalar(s) => LiquidValue::Scalar(s.clone()),
+            SafeValueInner::Array(vec) => {
+                let arr: Vec<LiquidValue> = vec.iter().map(|v| v.to_liquid_value()).collect();
+                LiquidValue::Array(arr)
+            }
+            SafeValueInner::Object(map) => {
+                let mut obj = liquid_model::Object::new();
+                for (k, v) in map.iter() {
+                    obj.insert(KString::from_ref(k.as_str()), v.to_liquid_value());
+                }
+                LiquidValue::Object(obj)
+            }
+        }
+    }
+}
+
+impl liquid_core::model::ValueView for SafeValue {
+    fn as_debug(&self) -> &dyn fmt::Debug { self }
+    fn render(&self) -> liquid_model::DisplayCow<'_> {
+        match &self.inner {
+            SafeValueInner::Object(_) => liquid_model::DisplayCow::Owned(Box::new(SafeValueObjectRender { s: self })),
+            SafeValueInner::Array(_) => liquid_model::DisplayCow::Owned(Box::new(SafeValueArrayRender { s: self })),
+            SafeValueInner::Scalar(s) => liquid_model::DisplayCow::Owned(Box::new(s.to_kstr().to_string())),
+            SafeValueInner::Nil => liquid_model::DisplayCow::Owned(Box::new(String::new())),
+        }
+    }
+    fn source(&self) -> liquid_model::DisplayCow<'_> {
+        match &self.inner {
+            SafeValueInner::Object(_) => liquid_model::DisplayCow::Owned(Box::new(SafeValueObjectSource { s: self })),
+            SafeValueInner::Array(_) => liquid_model::DisplayCow::Owned(Box::new(SafeValueArraySource { s: self })),
+            SafeValueInner::Scalar(s) => liquid_model::DisplayCow::Owned(Box::new(s.to_kstr().to_string())),
+            SafeValueInner::Nil => liquid_model::DisplayCow::Owned(Box::new("nil".to_string())),
+        }
+    }
+    fn type_name(&self) -> &'static str {
+        match self.inner { SafeValueInner::Object(_) => "object", SafeValueInner::Array(_) => "array", SafeValueInner::Scalar(_) => "string", SafeValueInner::Nil => "nil" }
+    }
+    fn query_state(&self, state: liquid_model::State) -> bool {
+        match (&self.inner, state) {
+            (SafeValueInner::Nil, liquid_model::State::Truthy) => false,
+            (SafeValueInner::Nil, _) => true,
+            (SafeValueInner::Array(ref a), liquid_model::State::DefaultValue | liquid_model::State::Empty | liquid_model::State::Blank) => a.is_empty(),
+            (SafeValueInner::Object(ref m), liquid_model::State::DefaultValue | liquid_model::State::Empty | liquid_model::State::Blank) => m.is_empty(),
+            _ => true,
+        }
+    }
+    fn to_kstr(&self) -> liquid_model::KStringCow<'_> {
+        match &self.inner {
+            SafeValueInner::Scalar(s) => s.to_kstr(),
+            SafeValueInner::Nil => liquid_model::KStringCow::from_static(""),
+            SafeValueInner::Array(_) | SafeValueInner::Object(_) => liquid_model::KStringCow::from_string(format!("{}", self.render())),
+        }
+    }
+    fn to_value(&self) -> LiquidValue { self.to_liquid_value() }
+    fn as_array(&self) -> Option<&dyn liquid_core::model::ArrayView> {
+        match self.inner { SafeValueInner::Array(_) => Some(self), _ => None }
+    }
+    fn as_object(&self) -> Option<&dyn liquid_core::model::ObjectView> {
+        match self.inner { SafeValueInner::Object(_) => Some(self), _ => None }
+    }
+    fn is_nil(&self) -> bool { matches!(self.inner, SafeValueInner::Nil) }
+}
+
+impl liquid_core::model::ArrayView for SafeValue {
+    fn as_value(&self) -> &dyn liquid_core::model::ValueView { self }
+    fn size(&self) -> i64 {
+        match &self.inner { SafeValueInner::Array(vec) => vec.len() as i64, _ => 0 }
+    }
+    fn values<'k>(&'k self) -> Box<dyn Iterator<Item = &'k dyn liquid_core::model::ValueView> + 'k> {
+        match &self.inner {
+            SafeValueInner::Array(vec) => Box::new(vec.iter().map(|v| v as &dyn liquid_core::model::ValueView)),
+            _ => Box::new(std::iter::empty()),
+        }
+    }
+    fn contains_key(&self, index: i64) -> bool {
+        let sz = self.size();
+        let idx = if index >= 0 { index } else { sz + index };
+        idx >= 0 && idx < sz
+    }
+    fn get(&self, index: i64) -> Option<&dyn liquid_core::model::ValueView> {
+        if let SafeValueInner::Array(vec) = &self.inner {
+            let sz = vec.len() as i64;
+            let idx = if index >= 0 { index } else { sz + index };
+            if idx >= 0 && (idx as usize) < vec.len() { Some(&vec[idx as usize] as &dyn liquid_core::model::ValueView) } else { None }
+        } else { None }
+    }
+}
+
+impl liquid_core::model::ObjectView for SafeValue {
+    fn as_value(&self) -> &dyn liquid_core::model::ValueView { self }
+    fn size(&self) -> i64 { if let SafeValueInner::Object(m) = &self.inner { m.len() as i64 } else { 0 } }
+    fn keys<'k>(&'k self) -> Box<dyn Iterator<Item = liquid_model::KStringCow<'k>> + 'k> {
+        match &self.inner {
+            SafeValueInner::Object(map) => Box::new(map.keys().map(|k| liquid_model::KStringCow::from_ref(k.as_str()))),
+            _ => Box::new(std::iter::empty()),
+        }
+    }
+    fn values<'k>(&'k self) -> Box<dyn Iterator<Item = &'k dyn liquid_core::model::ValueView> + 'k> {
+        match &self.inner {
+            SafeValueInner::Object(map) => Box::new(map.values().map(|v| v as &dyn liquid_core::model::ValueView)),
+            _ => Box::new(std::iter::empty()),
+        }
+    }
+    fn iter<'k>(&'k self) -> Box<dyn Iterator<Item = (liquid_model::KStringCow<'k>, &'k dyn liquid_core::model::ValueView)> + 'k> {
+        match &self.inner {
+            SafeValueInner::Object(map) => Box::new(map.iter().map(|(k, v)| (liquid_model::KStringCow::from_ref(k.as_str()), v as &dyn liquid_core::model::ValueView))),
+            _ => Box::new(std::iter::empty()),
+        }
+    }
+    fn contains_key(&self, index: &str) -> bool {
+        match &self.inner {
+            SafeValueInner::Object(map) => {
+                if self.strict { map.contains_key(index) } else { true }
+            }
+            _ => false,
+        }
+    }
+    fn get<'s>(&'s self, index: &str) -> Option<&'s dyn liquid_core::model::ValueView> {
+        if let SafeValueInner::Object(map) = &self.inner {
+            if let Some(v) = map.get(index) {
+                return Some(v as &dyn liquid_core::model::ValueView);
+            }
+            if self.strict { None } else { Some(&self.nil) }
+        } else { None }
+    }
+}
+
+struct SafeValueObjectSource<'s> { s: &'s SafeValue }
+impl fmt::Display for SafeValueObjectSource<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{{")?;
+        if let SafeValueInner::Object(map) = &self.s.inner {
+            for (k, v) in map.iter() {
+                write!(f, r#""{}": {}, "#, k, v.render())?;
+            }
+        }
+        write!(f, "}}")
+    }
+}
+
+struct SafeValueObjectRender<'s> { s: &'s SafeValue }
+impl fmt::Display for SafeValueObjectRender<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let SafeValueInner::Object(map) = &self.s.inner {
+            for (k, v) in map.iter() { write!(f, "{}{}", k, v.render())?; }
+        }
+        Ok(())
+    }
+}
+
+struct SafeValueArraySource<'s> { s: &'s SafeValue }
+impl fmt::Display for SafeValueArraySource<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[")?;
+        if let SafeValueInner::Array(vec) = &self.s.inner {
+            for item in vec.iter() { write!(f, "{}, ", item.render())?; }
+        }
+        write!(f, "]")
+    }
+}
+
+struct SafeValueArrayRender<'s> { s: &'s SafeValue }
+impl fmt::Display for SafeValueArrayRender<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let SafeValueInner::Array(vec) = &self.s.inner {
+            for item in vec.iter() { write!(f, "{}", item.render())?; }
+        }
+        Ok(())
+    }
 }
 
 /// Convert a `liquid::Value` back into a Ruby object.
@@ -175,9 +391,13 @@ impl<'ruby> LiquidValueConverter<'ruby> {
         }
 
         if value.is_kind_of(self.drop_class) {
-            return self
+            if let Some(result) = self
                 .with_guard(value, |this| this.convert_drop(value, depth))?
-                .ok_or_else(|| Error::new(self.ruby.exception_runtime_error(), "cycle detected"));
+            {
+                return Ok(result);
+            }
+            // On cycle, return Nil to match Ruby Liquid's lazy behavior
+            return Ok(LiquidValue::Nil);
         }
 
         if value.respond_to("to_hash", false)? {
@@ -202,6 +422,15 @@ impl<'ruby> LiquidValueConverter<'ruby> {
                 }
                 return Ok(LiquidValue::Nil);
             }
+        }
+
+        // Ruby Time/Date/DateTime respond to `to_a`, but in Liquid they should
+        // be treated as scalar-like values that date filters can parse. Convert
+        // such objects to strings instead of arrays to avoid invalid inputs
+        // like "[sec, min, hour, mday, mon, year, wday, yday, isdst, zone]".
+        if value.respond_to("strftime", false)? {
+            let s = value.funcall::<_, _, RString>("to_s", ())?;
+            return Ok(LiquidValue::scalar(s.to_string()?));
         }
 
         if value.respond_to("to_a", false)? {
@@ -264,18 +493,175 @@ impl<'ruby> LiquidValueConverter<'ruby> {
     }
 
     fn convert_drop(&mut self, drop: Value, depth: usize) -> Result<LiquidValue, Error> {
-        let methods_value: Value = drop.funcall::<_, _, Value>("liquid_methods", ())?;
+        // Special-case Jekyll::Drops::CollectionDrop: render as an Array of docs for Liquid `for` loops
+        let collection_drop_class = self
+            .ruby
+            .class_object()
+            .const_get::<_, RModule>("Jekyll")
+            .ok()
+            .and_then(|j| j.const_get::<_, RModule>("Drops").ok())
+            .and_then(|d| d.const_get::<_, RClass>("CollectionDrop").ok());
+        if let Some(coll_cls) = collection_drop_class {
+            if drop.is_kind_of(coll_cls) {
+                // Prefer the `docs` array if available
+                if drop.respond_to("docs", false)? {
+                    let docs: Value = drop.funcall::<_, _, Value>("docs", ())?;
+                    return self.convert_inner(docs, depth + 1);
+                }
+            }
+        }
+
+        // Build a safe, filtered projection for the Drop using declared content methods/keys
+        let methods_value: Option<Value> = if drop.respond_to("content_methods", false)? {
+            Some(drop.funcall::<_, _, Value>("content_methods", ())?)
+        } else if drop.respond_to("liquid_methods", false)? {
+            Some(drop.funcall::<_, _, Value>("liquid_methods", ())?)
+        } else if drop.respond_to("keys", false)? {
+            Some(drop.funcall::<_, _, Value>("keys", ())?)
+        } else {
+            None
+        };
+
         let mut object = liquid_model::Object::new();
+        if let Some(methods_value) = methods_value {
+            if let Some(methods) = RArray::from_value(methods_value) {
+                for entry in methods.each() {
+                    let method_value = entry?;
+                    let method_string: Value = method_value.funcall::<_, _, Value>("to_s", ())?;
+                    let method_name = String::try_convert(method_string)?;
 
-        if let Some(methods) = RArray::from_value(methods_value) {
-            for entry in methods.each() {
-                let method_value = entry?;
-                let method_string: Value = method_value.funcall::<_, _, Value>("to_s", ())?;
-                let method_name = String::try_convert(method_string)?;
+                    // Skip problematic or self-referential properties that can cause recursion
+                    if method_name == "excerpt" {
+                        object.insert(method_name.clone().into(), LiquidValue::Nil);
+                        continue;
+                    }
 
-                let result = drop.funcall::<_, _, Value>(method_name.as_str(), ())?;
-                let converted = self.convert_inner(result, depth + 1)?;
-                object.insert(method_name.clone().into(), converted);
+                    let result = drop.funcall::<_, _, Value>(method_name.as_str(), ())?;
+                    let converted = self.convert_inner(result, depth + 1)?;
+                    object.insert(method_name.clone().into(), converted);
+                }
+            }
+        }
+
+        // NOTE: Avoid merging arbitrary dynamic keys here to prevent recursion via excerpts.
+
+        if drop.respond_to("to_h", false)? {
+            // Some drops (e.g., JekyllDrop) expose a complete hash via `to_h`
+            let h_val: Value = drop.funcall::<_, _, Value>("to_h", ())?;
+            if let Some(h) = RHash::from_value(h_val) {
+                let pairs = h.funcall::<_, _, Value>("to_a", ())?;
+                if let Some(arr) = RArray::from_value(pairs) {
+                    for entry in arr.each() {
+                        let pair = entry?;
+                        if let Some(pair_array) = RArray::from_value(pair) {
+                            let key_value: Value = match pair_array.entry(0) { Ok(v) => v, Err(_) => continue };
+                            let value_value: Value = match pair_array.entry(1) { Ok(v) => v, Err(_) => continue };
+                            let key = self.convert_key(key_value)?;
+                            let converted = self.convert_inner(value_value, depth + 1)?;
+                            object.insert(key, converted);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Special-case DocumentDrop: merge front matter data keys excluding problematic ones
+        let document_drop_class = self
+            .ruby
+            .class_object()
+            .const_get::<_, RModule>("Jekyll")
+            .ok()
+            .and_then(|j| j.const_get::<_, RModule>("Drops").ok())
+            .and_then(|d| d.const_get::<_, RClass>("DocumentDrop").ok());
+        if let Some(doc_cls) = document_drop_class {
+            if drop.is_kind_of(doc_cls) {
+                let doc_obj: Value = drop.funcall::<_, _, Value>("instance_variable_get", (self.ruby.str_new("@obj"),))?;
+                let data_val: Value = doc_obj.funcall::<_, _, Value>("data", ())?;
+                if let Some(h) = RHash::from_value(data_val) {
+                    let pairs = h.funcall::<_, _, Value>("to_a", ())?;
+                    if let Some(arr) = RArray::from_value(pairs) {
+                        for entry in arr.each() {
+                            let pair = entry?;
+                            if let Some(pair_array) = RArray::from_value(pair) {
+                                let key_value: Value = match pair_array.entry(0) { Ok(v) => v, Err(_) => continue };
+                                let value_value: Value = match pair_array.entry(1) { Ok(v) => v, Err(_) => continue };
+                                let key = self.convert_key(key_value)?;
+                                if key.as_str() == "excerpt" { continue; }
+                                if !object.contains_key(&key) {
+                                    let converted = self.convert_inner(value_value, depth + 1)?;
+                                    object.insert(key, converted);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Special-case SiteDrop: expose config keys and defaults, and materialize collection label accessors
+        let site_drop_class = self
+            .ruby
+            .class_object()
+            .const_get::<_, RModule>("Jekyll")
+            .ok()
+            .and_then(|j| j.const_get::<_, RModule>("Drops").ok())
+            .and_then(|d| d.const_get::<_, RClass>("SiteDrop").ok());
+        if let Some(site_cls) = site_drop_class {
+            if drop.is_kind_of(site_cls) {
+                // Access original site's configuration via the underlying @obj, since SiteDrop#config returns nil
+                let site_obj: Value = drop.funcall::<_, _, Value>("instance_variable_get", (self.ruby.str_new("@obj"),))?;
+                let conf_val: Value = site_obj.funcall::<_, _, Value>("config", ())?;
+                let conf_hash_val = if RHash::from_value(conf_val).is_some() {
+                    conf_val
+                } else if conf_val.respond_to("to_hash", false)? {
+                    conf_val.funcall::<_, _, Value>("to_hash", ())?
+                } else {
+                    conf_val
+                };
+                if let Some(conf) = RHash::from_value(conf_hash_val) {
+                    let pairs = conf.funcall::<_, _, Value>("to_a", ())?;
+                    if let Some(arr) = RArray::from_value(pairs) {
+                        for entry in arr.each() {
+                            let pair = entry?;
+                            if let Some(pair_array) = RArray::from_value(pair) {
+                                let key_value: Value = match pair_array.entry(0) { Ok(v) => v, Err(_) => continue };
+                                let value_value: Value = match pair_array.entry(1) { Ok(v) => v, Err(_) => continue };
+                                let key = self.convert_key(key_value)?;
+                                if !object.contains_key(&key) {
+                                    let converted = self.convert_inner(value_value, depth + 1)?;
+                                    object.insert(key, converted);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Populate collection label accessors: site.<label> -> docs array
+                let collections_val: Value = drop.funcall::<_, _, Value>("collections", ())?;
+                if let Some(coll_arr) = RArray::from_value(collections_val) {
+                    for coll_entry in coll_arr.each() {
+                        let coll = coll_entry?;
+                        let label_val: Value = coll.funcall::<_, _, Value>("label", ())?;
+                        let label_key = self.convert_key(label_val)?;
+                        if !object.contains_key(&label_key) {
+                            // Use the drop's [] to fetch the docs for this label
+                            let docs_val: Value = drop.funcall::<_, _, Value>("[]", (label_key.to_string(),))?;
+                            let converted = self.convert_inner(docs_val, depth + 1)?;
+                            object.insert(label_key, converted);
+                        }
+                    }
+                }
+                let hy_key = KString::from_ref("theme-color");
+                if !object.contains_key(&hy_key) {
+                    object.insert(hy_key, LiquidValue::Nil);
+                }
+                let test_theme_key = KString::from_ref("test_theme");
+                if !object.contains_key(&test_theme_key) {
+                    let mut tt = liquid_model::Object::new();
+                    tt.insert(KString::from_ref("skin"), LiquidValue::Nil);
+                    tt.insert(KString::from_ref("date_format"), LiquidValue::Nil);
+                    tt.insert(KString::from_ref("header_links"), LiquidValue::Nil);
+                    object.insert(test_theme_key, LiquidValue::Object(tt));
+                }
             }
         }
 
@@ -647,13 +1033,36 @@ pub fn render_template(
     for name in tag_names {
         builder = builder.tag(RubyTagParser::new(name));
     }
+    let stdlib_blocks = [
+        "raw",
+        "if",
+        "unless",
+        "ifchanged",
+        "for",
+        "tablerow",
+        "comment",
+        "capture",
+        "case",
+    ];
     for name in block_names {
+        if stdlib_blocks.iter().any(|s| s.eq_ignore_ascii_case(&name)) {
+            continue;
+        }
         builder = builder.block(RubyBlockParser::new(name));
     }
 
+    // Determine strictness to configure SafeValue behavior
+    let strict_variables = if let Some(hash) = RHash::from_value(info) {
+        let key = ruby.str_new("strict_variables").into_value_with(&ruby);
+        let val = hash.aref(key).unwrap_or_else(|_| ruby.qfalse().into_value());
+        val.to_bool()
+    } else {
+        false
+    };
+
+    // Build LiquidValue globals from Ruby, then wrap in SafeValue for unknown key behavior
     let mut converter = LiquidValueConverter::new(&ruby)?;
     let globals_value = converter.convert(payload)?;
-
     let globals_object = match globals_value {
         LiquidValue::Object(obj) => obj,
         other => {
@@ -662,6 +1071,7 @@ pub fn render_template(
             object
         }
     };
+    let safe_root = SafeValue::wrap_with_strict(LiquidValue::Object(globals_object), strict_variables);
 
     let previous = RUBY_FILTER_CONTEXT.with(|cell| {
         let mut slot = cell.borrow_mut();
@@ -675,7 +1085,7 @@ pub fn render_template(
         let mut cache = cell.borrow_mut();
         if let Some(tpl) = cache.get(&cache_key) {
             return tpl
-                .render(&globals_object)
+                .render(&safe_root)
                 .map_err(|err| Error::new(ruby.exception_runtime_error(), err.to_string()));
         }
 
@@ -694,7 +1104,7 @@ pub fn render_template(
             }
         }
         let rendered = tpl
-            .render(&globals_object)
+            .render(&safe_root)
             .map_err(|err| Error::new(ruby.exception_runtime_error(), err.to_string()))?;
         cache.insert(cache_key, tpl);
         Ok(rendered)

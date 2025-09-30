@@ -998,111 +998,140 @@ fn build_render_info(ctx: &RenderingContext, site: Value, payload: Value) -> Res
 
 fn render_liquid_template(
     ctx: &RenderingContext,
-    site: Value,
+    _site: Value,
     document: Value,
     payload: Value,
     info: Value,
     content: Value,
     path: Option<Value>,
 ) -> Result<Value, Error> {
-    // Honor strict flags by delegating to Ruby Liquid to preserve exact behavior
-    let strict_filters: Value = info.funcall("[]", (ctx.str("strict_filters"),))?;
-    let strict_variables: Value = info.funcall("[]", (ctx.str("strict_variables"),))?;
-    if (!strict_filters.is_nil() && strict_filters.to_bool())
-        || (!strict_variables.is_nil() && strict_variables.to_bool())
-    {
-        let liquid_renderer: Value = site.funcall::<_, _, Value>("liquid_renderer", ())?;
-        let path_value = match path {
-            Some(ref value) => value.clone(),
-            None => ctx.ruby.qnil().into_value_with(ctx.ruby),
-        };
-        let error_path = match path {
-            Some(value) => value,
-            None => document.funcall::<_, _, Value>("relative_path", ())?,
-        };
-        let file = liquid_renderer.funcall::<_, _, Value>("file", (path_value,))?;
-        let template = file.funcall::<_, _, Value>("parse", (content,))?;
-
-        if let Some(warnings) = RArray::from_value(template.funcall::<_, _, Value>("warnings", ())?) {
-            for entry in warnings.each() {
-                let warning = entry?;
-                let formatted: Value = ctx
-                    .liquid_renderer_class
-                    .funcall::<_, _, Value>("format_error", (warning, error_path.clone()))?;
-                ctx.logger
-                    .funcall::<_, _, Value>("warn", (ctx.str("Liquid Warning:"), formatted))?;
-            }
-        }
-
-        return match template.funcall::<_, _, Value>("render!", (payload, info)) {
-            Ok(output) => Ok(output),
-            Err(err) => {
-                if let Some(exception) = err.value() {
-                    let formatted: Value = ctx
-                        .liquid_renderer_class
-                        .funcall::<_, _, Value>("format_error", (exception, error_path.clone()))?;
-                    ctx.logger
-                        .funcall::<_, _, Value>("error", (ctx.str("Liquid Exception:"), formatted))?;
-                }
-                Err(err)
-            }
-        };
-    }
-
-    if let Ok(content_string) = String::try_convert(content) {
-        match crate::liquid_engine::render_template(&content_string, payload, info, path) {
-            Ok(rendered) => {
-                let rendered_value = ctx
-                    .ruby
-                    .str_new(rendered.as_str())
-                    .into_value_with(ctx.ruby);
-                return Ok(rendered_value);
-            }
-            Err(err) => {
-                ctx.logger.funcall::<_, _, Value>(
-                    "debug",
-                    (
-                        ctx.str("Rust liquid engine fallback"),
-                        ctx.str(&format!("using Ruby renderer: {}", err)),
-                    ),
-                )?;
-            }
-        }
-    }
-
-    let liquid_renderer: Value = site.funcall::<_, _, Value>("liquid_renderer", ())?;
-    let path_value = match path {
-        Some(ref value) => value.clone(),
-        None => ctx.ruby.qnil().into_value_with(ctx.ruby),
-    };
     let error_path = match path {
         Some(value) => value,
         None => document.funcall::<_, _, Value>("relative_path", ())?,
     };
-    let file = liquid_renderer.funcall::<_, _, Value>("file", (path_value,))?;
-    let template = file.funcall::<_, _, Value>("parse", (content,))?;
 
-    if let Some(warnings) = RArray::from_value(template.funcall::<_, _, Value>("warnings", ())?) {
-        for entry in warnings.each() {
-            let warning = entry?;
-            let formatted: Value = ctx
-                .liquid_renderer_class
-                .funcall::<_, _, Value>("format_error", (warning, error_path.clone()))?;
-            ctx.logger
-                .funcall::<_, _, Value>("warn", (ctx.str("Liquid Warning:"), formatted))?;
+    // Coerce content to String
+    let content_string = match String::try_convert(content) {
+        Ok(s) => s,
+        Err(_) => {
+            let s: RString = content.funcall("to_s", ())?;
+            s.to_string()?
+        }
+    };
+
+    // Read strictness flags from info
+    let strict_filters_val: Value = info.funcall::<_, _, Value>("[]", (ctx.str("strict_filters"),))?;
+    let strict_variables_val: Value = info.funcall::<_, _, Value>("[]", (ctx.str("strict_variables"),))?;
+    let mut strict_filters = strict_filters_val.to_bool();
+    let mut strict_variables = strict_variables_val.to_bool();
+    if !(strict_filters || strict_variables) {
+        // Fallback: read directly from site.config.liquid
+        let cfg: Value = _site.funcall::<_, _, Value>("config", ())?;
+        let liq: Value = cfg.funcall::<_, _, Value>("[]", (ctx.str("liquid"),))?;
+        if !liq.is_nil() {
+            let sf: Value = liq.funcall::<_, _, Value>("[]", (ctx.str("strict_filters"),))?;
+            let sv: Value = liq.funcall::<_, _, Value>("[]", (ctx.str("strict_variables"),))?;
+            strict_filters = strict_filters || sf.to_bool();
+            strict_variables = strict_variables || sv.to_bool();
         }
     }
 
-    match template.funcall::<_, _, Value>("render!", (payload, info)) {
-        Ok(output) => Ok(output),
-        Err(err) => {
-            if let Some(exception) = err.value() {
-                let formatted: Value = ctx
-                    .liquid_renderer_class
-                    .funcall::<_, _, Value>("format_error", (exception, error_path.clone()))?;
-                ctx.logger
-                    .funcall::<_, _, Value>("error", (ctx.str("Liquid Exception:"), formatted))?;
+    // In strict modes, delegate rendering to Ruby Liquid to match error semantics exactly
+    if strict_filters || strict_variables {
+        let liquid_renderer: Value = _site.funcall::<_, _, Value>("liquid_renderer", ())?;
+        let path_value = match path {
+            Some(ref value) => value.clone(),
+            None => ctx.ruby.qnil().into_value_with(ctx.ruby),
+        };
+        let file = liquid_renderer.funcall::<_, _, Value>("file", (path_value,))?;
+        let template = file.funcall::<_, _, Value>("parse", (content,))?;
+        match template.funcall::<_, _, Value>("render!", (payload, info)) {
+            Ok(v) => return Ok(v),
+            Err(rb_err) => {
+                if let Some(exc) = rb_err.value() {
+                    let formatted: Value = ctx
+                        .liquid_renderer_class
+                        .funcall::<_, _, Value>("format_error", (exc, error_path))?;
+                    ctx.logger
+                        .funcall::<_, _, Value>("error", (ctx.str("Liquid Exception:"), formatted))?;
+                }
+                return Err(rb_err);
             }
+        }
+    }
+
+    match crate::liquid_engine::render_template(&content_string, payload, info, path) {
+        Ok(rendered) => {
+            let rendered_value = ctx
+                .ruby
+                .str_new(rendered.as_str())
+                .into_value_with(ctx.ruby);
+            Ok(rendered_value)
+        }
+        Err(err) => {
+            // If the error is about unknown variables/indices, temporarily fallback to Ruby Liquid
+            let msg_s = err.to_string();
+            if msg_s.contains("Unknown filter") && !strict_filters {
+                // In non-strict mode, let Ruby Liquid tolerate unknown filters
+                let liquid_renderer: Value = _site.funcall::<_, _, Value>("liquid_renderer", ())?;
+                let path_value = match path {
+                    Some(ref value) => value.clone(),
+                    None => ctx.ruby.qnil().into_value_with(ctx.ruby),
+                };
+                let file = liquid_renderer.funcall::<_, _, Value>("file", (path_value,))?;
+                let template = file.funcall::<_, _, Value>("parse", (content,))?;
+                let rendered: Value = template.funcall::<_, _, Value>("render", (payload, info))?;
+                return Ok(rendered);
+            }
+            if msg_s.contains("Unknown filter") {
+                // Ask Ruby Liquid to format the error consistently
+                let liquid_renderer: Value = _site.funcall::<_, _, Value>("liquid_renderer", ())?;
+                let path_value = match path {
+                    Some(ref value) => value.clone(),
+                    None => ctx.ruby.qnil().into_value_with(ctx.ruby),
+                };
+                let file = liquid_renderer.funcall::<_, _, Value>("file", (path_value,))?;
+                let template = file.funcall::<_, _, Value>("parse", (content,))?;
+                match template.funcall::<_, _, Value>("render!", (payload, info)) {
+                    Ok(_) => {}
+                    Err(rb_err) => {
+                        if let Some(exc) = rb_err.value() {
+                            let formatted: Value = ctx
+                                .liquid_renderer_class
+                                .funcall::<_, _, Value>("format_error", (exc, error_path))?;
+                            ctx.logger.funcall::<_, _, Value>(
+                                "error",
+                                (ctx.str("Liquid Exception:"), formatted),
+                            )?;
+                        }
+                    }
+                }
+                return Err(err);
+            }
+            if (msg_s.contains("Unknown index") || msg_s.contains("Unknown variable")) && !strict_variables {
+                let liquid_renderer: Value = _site.funcall::<_, _, Value>("liquid_renderer", ())?;
+                let path_value = match path {
+                    Some(ref value) => value.clone(),
+                    None => ctx.ruby.qnil().into_value_with(ctx.ruby),
+                };
+                let file = liquid_renderer.funcall::<_, _, Value>("file", (path_value,))?;
+                let template = file.funcall::<_, _, Value>("parse", (content,))?;
+                return template.funcall::<_, _, Value>("render!", (payload, info));
+            }
+
+            // Otherwise, format and log the Liquid error using Ruby's formatter
+            let mut cleaned = msg_s.replace("liquid: ", "");
+            if let Some(s) = cleaned.strip_prefix("RuntimeError: ") { cleaned = s.to_string(); }
+            let msg = ctx.ruby.str_new(&cleaned);
+            let exception_obj = ctx
+                .ruby
+                .exception_runtime_error()
+                .new_instance((msg,))?;
+            let formatted: Value = ctx
+                .liquid_renderer_class
+                .funcall::<_, _, Value>("format_error", (exception_obj, error_path))?;
+            ctx.logger
+                .funcall::<_, _, Value>("error", (ctx.str("Liquid Exception:"), formatted))?;
             Err(err)
         }
     }
@@ -1331,6 +1360,10 @@ fn render_layout(
 
     let layout_content: Value = layout.funcall::<_, _, Value>("content", ())?;
     let layout_path: Value = layout.funcall::<_, _, Value>("path", ())?;
+    // Update Ruby LiquidRenderer stats table for the layout path to preserve CLI output parity
+    let liquid_renderer: Value = site.funcall::<_, _, Value>("liquid_renderer", ())?;
+    let file = liquid_renderer.funcall::<_, _, Value>("file", (layout_path,))?;
+    let _ = file.funcall::<_, _, Value>("parse", (layout_content,))?;
     render_liquid_template(
         ctx,
         site,
