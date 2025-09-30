@@ -47,5 +47,11 @@ module Jekyll
     def output_ext
       @output_ext ||= Jekyll::Rust.renderer_output_ext(site, document)
     end
+
+    # Compatibility shim for legacy tests expecting this method
+    def render_document
+      Jekyll::Rust.renderer_run(site, document, payload, layouts)
+      nil
+    end
   end
 end

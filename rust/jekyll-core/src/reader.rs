@@ -141,24 +141,47 @@ fn reader_walk(site: Value, rel_dir: RString) -> Result<Value, Error> {
                     dirs,
                 )?;
             } else {
-                let is_bad: bool = ef.funcall("symlink?", (ruby.str_new(&full_str),))?;
+                let entry_value = ruby.str_new(&full_str);
+                // Skip unsafe symlinks in safe mode
+                let is_bad: bool = ef.funcall("symlink?", (entry_value,))?;
                 if is_bad {
                     continue;
                 }
-                let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
-                let rust: RModule = jekyll.const_get("Rust")?;
-                let bridge2: RModule = rust.const_get("Bridge")?;
-                let has_header: bool =
-                    bridge2.funcall("has_yaml_header?", (ruby.str_new(&full_str),))?;
+                // If this is a symlink, always treat as static (even if it has YAML header)
+                let is_symlink: bool = file.funcall("symlink?", (entry_value,))?;
                 let rel_path = if rel_prefix.is_empty() {
                     entry_str
                 } else {
                     format!("{}/{}", rel_prefix, entry_str)
                 };
-                if has_header {
-                    pages.push(ruby.str_new(&rel_path))?;
+                if is_symlink {
+                    // If symlink points outside source, treat as static; otherwise, treat normally
+                    let outside: bool = ef.funcall("symlink_outside_site_source?", (entry_value,))?;
+                    if outside {
+                        statics.push(ruby.str_new(&rel_path))?;
+                    } else {
+                        let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
+                        let rust: RModule = jekyll.const_get("Rust")?;
+                        let bridge2: RModule = rust.const_get("Bridge")?;
+                        let has_header: bool =
+                            bridge2.funcall("has_yaml_header?", (ruby.str_new(&full_str),))?;
+                        if has_header {
+                            pages.push(ruby.str_new(&rel_path))?;
+                        } else {
+                            statics.push(ruby.str_new(&rel_path))?;
+                        }
+                    }
                 } else {
-                    statics.push(ruby.str_new(&rel_path))?;
+                    let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
+                    let rust: RModule = jekyll.const_get("Rust")?;
+                    let bridge2: RModule = rust.const_get("Bridge")?;
+                    let has_header: bool =
+                        bridge2.funcall("has_yaml_header?", (ruby.str_new(&full_str),))?;
+                    if has_header {
+                        pages.push(ruby.str_new(&rel_path))?;
+                    } else {
+                        statics.push(ruby.str_new(&rel_path))?;
+                    }
                 }
             }
         }

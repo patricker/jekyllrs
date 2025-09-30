@@ -1,0 +1,43 @@
+name: Native Gem Build
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-native-gem:
+    name: "Build native gem (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+
+      - name: Build Rust + Package gem
+        shell: bash
+        run: |
+          set -euxo pipefail
+          bash script/rust-build
+          bundle exec rake build:with_rust
+          ls -la pkg
+
+      - name: Upload gem artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jekyll-gem-${{ runner.os }}
+          path: pkg/*.gem
+

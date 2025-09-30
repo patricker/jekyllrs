@@ -26,7 +26,27 @@ fn document_read(path: String, file_opts: Value) -> Result<Value, Error> {
 
     let content_value: Value = if let Some(hash) = RHash::from_value(file_opts) {
         if hash.len() > 0 {
-            let kwargs = KwArgs(hash);
+            // Ensure keyword-args use symbol keys
+            let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
+            let rust: RModule = jekyll.const_get("Rust")?;
+            let sym_hash_val: Value = rust.funcall("symbolize_hash_keys", (hash,))?;
+            let sym_hash = RHash::from_value(sym_hash_val).ok_or_else(|| {
+                Error::new(ruby.exception_runtime_error(), "expected Hash from symbolize_hash_keys")
+            })?;
+
+            // If an encoding is specified, use mode: "rb:ENC" to ensure compatibility
+            let enc_key = ruby.to_symbol("encoding").into_value_with(&ruby);
+            let mode_key = ruby.to_symbol("mode").into_value_with(&ruby);
+            let enc_value: Value = sym_hash.aref(enc_key)?;
+            if !enc_value.is_nil() {
+                let enc = String::try_convert(enc_value.clone())?;
+                let mode_string = format!("rb:{}", enc);
+                sym_hash.aset(mode_key, ruby.str_new(&mode_string))?;
+                // Remove encoding to avoid conflicts
+                let _: Value = sym_hash.delete(enc_key)?;
+            }
+
+            let kwargs = KwArgs(sym_hash);
             file_class.funcall("read", (args, kwargs))?
         } else {
             file_class.funcall("read", (args,))?

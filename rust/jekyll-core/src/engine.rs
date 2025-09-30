@@ -16,6 +16,15 @@ pub fn run_site_phases(
     site: Value,
     profile_enabled: bool,
 ) -> Result<Option<Vec<(String, f64)>>, Error> {
+    // Clear per-thread caches between builds unless incremental is enabled.
+    let ruby = ruby_handle()?;
+    let config: Value = site.funcall("config", ())?;
+    let incr: Value = config.funcall("[]", (ruby.str_new("incremental"),))?;
+    let incremental = !incr.is_nil() && incr.to_bool();
+    if !incremental {
+        crate::liquid_engine::clear_template_cache();
+    }
+
     if profile_enabled {
         let profiler: Value = site.funcall("profiler", ())?;
         let _ = profiler.funcall::<_, _, Value>("profile_process", ())?;

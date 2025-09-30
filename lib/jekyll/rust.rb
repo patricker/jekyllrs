@@ -12,6 +12,22 @@ module Jekyll
         strainer.filter_methods.to_a
       end
 
+      # Returns a Hash with keys "tags" and "blocks" listing registered tag names.
+      # Blocks are tags whose class is a subclass of Liquid::Block
+      def liquid_tag_kinds
+        ensure_loaded!
+        tags = []
+        blocks = []
+        Liquid::Template.tags.each do |name, klass|
+          if klass <= Liquid::Block
+            blocks << name
+          else
+            tags << name
+          end
+        end
+        { "tags" => tags, "blocks" => blocks }
+      end
+
       def prepare_liquid_filter_context(payload, info)
         ensure_loaded!
         info ||= {}
@@ -57,6 +73,21 @@ module Jekyll
         positional = Array(positional)
         kwargs = keyword.is_a?(Hash) ? keyword : {}
         context.invoke(name, input, *positional, **kwargs.transform_keys(&:to_sym))
+      end
+
+      # Render a tag via Ruby Liquid using an existing Context.
+      # If body is provided (string), treat it as a block body and append a closing tag.
+      def apply_liquid_tag(context, name, markup, body)
+        ensure_loaded!
+        markup_s = markup.to_s
+        # Construct a minimal template that exercises the tag under the given context
+        if body.nil?
+          source = "{% #{name} #{markup_s} %}"
+        else
+          source = "{% #{name} #{markup_s} %}#{body}{% end#{name} %}"
+        end
+        tmpl = Liquid::Template.parse(source)
+        tmpl.render!(context)
       end
 
       def slugify(string, mode, cased)

@@ -86,7 +86,9 @@ module Jekyll
     #
     # Return document date string.
     def date
-      data["date"] ||= (draft? ? source_file_mtime : site.time)
+      explicit = data["date"]
+      return explicit if explicit
+      draft? ? source_file_mtime : site.time
     end
 
     # Return document file modification time in the form of a Time object.

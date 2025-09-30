@@ -1,10 +1,14 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 use magnus::r_hash::ForEach;
 use magnus::{
-    function, prelude::*, Error, IntoValue, RArray, RClass, RHash, RModule, RString, Ruby, Value,
+    function, prelude::*, Error, ExceptionClass, IntoValue, RArray, RClass, RHash, RModule, RString,
+    Ruby, Value,
 };
+
+use once_cell::sync::Lazy;
 
 use crate::ruby_utils::ruby_handle;
 
@@ -12,21 +16,29 @@ trait RustConverter: Sync {
     #[allow(dead_code)]
     fn name(&self) -> &'static str;
     fn priority(&self) -> i32;
-    fn matches(&self, ext: &str) -> bool;
+    fn matches(
+        &self,
+        ctx: &RenderingContext,
+        site: Value,
+        ext: &str,
+    ) -> Result<bool, Error>;
     fn convert(
         &self,
         ctx: &RenderingContext,
+        site: Value,
         document: Value,
         content: Value,
     ) -> Result<Value, Error>;
     fn output_ext(
         &self,
         ctx: &RenderingContext,
+        site: Value,
         original_ext: Value,
     ) -> Result<Option<Value>, Error>;
     fn highlighter_options(
         &self,
         _ctx: &RenderingContext,
+        _site: Value,
     ) -> Result<Option<(Value, Value)>, Error> {
         Ok(None)
     }
@@ -56,13 +68,19 @@ impl RustConverter for IdentityConverter {
         -100
     }
 
-    fn matches(&self, _ext: &str) -> bool {
-        true
+    fn matches(
+        &self,
+        _ctx: &RenderingContext,
+        _site: Value,
+        _ext: &str,
+    ) -> Result<bool, Error> {
+        Ok(true)
     }
 
     fn convert(
         &self,
         _ctx: &RenderingContext,
+        _site: Value,
         _document: Value,
         content: Value,
     ) -> Result<Value, Error> {
@@ -72,6 +90,7 @@ impl RustConverter for IdentityConverter {
     fn output_ext(
         &self,
         _ctx: &RenderingContext,
+        _site: Value,
         original_ext: Value,
     ) -> Result<Option<Value>, Error> {
         if original_ext.is_nil() {
@@ -83,9 +102,153 @@ impl RustConverter for IdentityConverter {
 }
 
 static IDENTITY_CONVERTER: IdentityConverter = IdentityConverter;
-static RUST_CONVERTERS: &[&dyn RustConverter] = &[&IDENTITY_CONVERTER];
+static RUST_CONVERTERS: Lazy<Mutex<Vec<&'static dyn RustConverter>>> = Lazy::new(|| {
+    Mutex::new(vec![&IDENTITY_CONVERTER as &dyn RustConverter])
+});
+
+static KRAMDOWN_CONVERTER: KramdownConverter = KramdownConverter;
+
+fn rust_converters() -> Vec<&'static dyn RustConverter> {
+    let guard = RUST_CONVERTERS
+        .lock()
+        .expect("rust converter registry poisoned");
+    guard.clone()
+}
+
+#[allow(dead_code)]
+fn register_rust_converter(converter: &'static dyn RustConverter) {
+    let mut guard = RUST_CONVERTERS
+        .lock()
+        .expect("rust converter registry poisoned");
+    guard.push(converter);
+}
+
+struct KramdownConverter;
+
+impl KramdownConverter {
+    fn default_extensions() -> &'static [&'static str] {
+        &[".markdown", ".mkdown", ".mkd", ".md"]
+    }
+
+    fn extensions_from_config(
+        &self,
+        ctx: &RenderingContext,
+        config: Value,
+    ) -> Result<Vec<String>, Error> {
+        let markdown_ext_key = ctx.str("markdown_ext");
+        let ext_value: Value = config.funcall("[]", (markdown_ext_key,))?;
+        if ext_value.is_nil() {
+            return Ok(Self::default_extensions()
+                .iter()
+                .map(|ext| ext.to_string())
+                .collect());
+        }
+
+        let ext_string = String::try_convert(ext_value)?;
+        let extensions = ext_string
+            .split(',')
+            .map(|part| {
+                let trimmed = part.trim();
+                if trimmed.starts_with('.') {
+                    trimmed.to_ascii_lowercase()
+                } else {
+                    format!(".{}", trimmed.to_ascii_lowercase())
+                }
+            })
+            .collect();
+        Ok(extensions)
+    }
+
+    fn is_kramdown_enabled(
+        &self,
+        ctx: &RenderingContext,
+        config: Value,
+    ) -> Result<bool, Error> {
+        let markdown_key = ctx.str("markdown");
+        let markdown_engine: Value = config.funcall("[]", (markdown_key,))?;
+        if markdown_engine.is_nil() {
+            return Ok(true);
+        }
+        let engine = String::try_convert(markdown_engine)?;
+        Ok(engine.eq_ignore_ascii_case("kramdown"))
+    }
+
+    fn parser_class(&self, ctx: &RenderingContext) -> Option<RClass> {
+        ctx.markdown_parser_class
+    }
+}
+
+impl RustConverter for KramdownConverter {
+    fn name(&self) -> &'static str {
+        "Kramdown"
+    }
+
+    fn priority(&self) -> i32 {
+        5
+    }
+
+    fn matches(
+        &self,
+        ctx: &RenderingContext,
+        site: Value,
+        ext: &str,
+    ) -> Result<bool, Error> {
+        let config: Value = site.funcall("config", ())?;
+        if !self.is_kramdown_enabled(ctx, config)? {
+            return Ok(false);
+        }
+
+        let extensions = self.extensions_from_config(ctx, config)?;
+        Ok(extensions
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(ext)))
+    }
+
+    fn convert(
+        &self,
+        ctx: &RenderingContext,
+        site: Value,
+        _document: Value,
+        content: Value,
+    ) -> Result<Value, Error> {
+        let parser_class = match self.parser_class(ctx) {
+            Some(class) => class,
+            None => {
+                return Err(Error::new(
+                    ctx.ruby.exception_runtime_error(),
+                    "Kramdown parser class not available",
+                ))
+            }
+        };
+
+        let config: Value = site.funcall("config", ())?;
+        let config_dup: Value = config.funcall("dup", ())?;
+
+        let parser_instance: Value = parser_class.funcall("new", (config_dup,))?;
+        parser_instance.funcall("convert", (content,))
+    }
+
+    fn output_ext(
+        &self,
+        ctx: &RenderingContext,
+        _site: Value,
+        _original_ext: Value,
+    ) -> Result<Option<Value>, Error> {
+        Ok(Some(ctx.str(".html")))
+    }
+
+    fn highlighter_options(
+        &self,
+        ctx: &RenderingContext,
+        _site: Value,
+    ) -> Result<Option<(Value, Value)>, Error> {
+        Ok(Some((ctx.str("\n"), ctx.str("\n"))))
+    }
+}
 
 pub fn define_into(bridge: &RModule) -> Result<(), Error> {
+    register_rust_converter(&KRAMDOWN_CONVERTER);
+
     bridge.define_singleton_method("render_site", function!(render_site, 1))?;
     bridge.define_singleton_method("renderer_run", function!(renderer_run, 4))?;
     bridge.define_singleton_method("renderer_convert", function!(renderer_convert, 3))?;
@@ -111,6 +274,8 @@ struct RenderingContext<'ruby> {
     excerpt_class: RClass,
     plugin_priorities: Value,
     identity_converter_class: RClass,
+    markdown_converter_class: Option<RClass>,
+    markdown_parser_class: Option<RClass>,
 }
 
 impl<'ruby> RenderingContext<'ruby> {
@@ -125,6 +290,10 @@ impl<'ruby> RenderingContext<'ruby> {
         let plugin_priorities: Value = plugin_class.const_get("PRIORITIES")?;
         let converters_module: RModule = jekyll.const_get("Converters")?;
         let identity_converter_class: RClass = converters_module.const_get("Identity")?;
+        let markdown_converter_class = converters_module.const_get::<_, RClass>("Markdown").ok();
+        let markdown_parser_class = markdown_converter_class
+            .as_ref()
+            .and_then(|markdown_class| markdown_class.const_get::<_, RClass>("KramdownParser").ok());
         Ok(Self {
             ruby,
             hooks,
@@ -134,6 +303,8 @@ impl<'ruby> RenderingContext<'ruby> {
             excerpt_class,
             plugin_priorities,
             identity_converter_class,
+            markdown_converter_class,
+            markdown_parser_class,
         })
     }
 
@@ -166,7 +337,8 @@ impl SiteConverterRegistry {
         array_object_id: i64,
         array_hash: i64,
     ) -> Result<Self, Error> {
-        let mut entries = Vec::with_capacity(converters.len() + RUST_CONVERTERS.len());
+        let rust_converters = rust_converters();
+        let mut entries = Vec::with_capacity(converters.len() + rust_converters.len());
         let mut identity_converter = None;
         let mut order = 0;
 
@@ -195,11 +367,11 @@ impl SiteConverterRegistry {
             order += 1;
         }
 
-        for converter in RUST_CONVERTERS {
+        for converter in rust_converters {
             entries.push(ConverterEntry {
                 priority: converter.priority(),
                 order,
-                kind: ConverterKind::Rust(*converter),
+                kind: ConverterKind::Rust(converter),
             });
             order += 1;
         }
@@ -220,7 +392,8 @@ impl SiteConverterRegistry {
         array_object_id: i64,
         array_hash: i64,
     ) -> Result<(), Error> {
-        let mut entries = Vec::with_capacity(converters.len() + RUST_CONVERTERS.len());
+        let rust_converters = rust_converters();
+        let mut entries = Vec::with_capacity(converters.len() + rust_converters.len());
         let mut identity_converter = None;
         let mut order = 0;
 
@@ -249,11 +422,11 @@ impl SiteConverterRegistry {
             order += 1;
         }
 
-        for converter in RUST_CONVERTERS {
+        for converter in rust_converters {
             entries.push(ConverterEntry {
                 priority: converter.priority(),
                 order,
-                kind: ConverterKind::Rust(*converter),
+                kind: ConverterKind::Rust(converter),
             });
             order += 1;
         }
@@ -268,6 +441,8 @@ impl SiteConverterRegistry {
 
     fn converters_for(
         &mut self,
+        ctx: &RenderingContext,
+        site: Value,
         ext_value: Value,
         ext_string: &str,
     ) -> Result<Vec<ConverterKind>, Error> {
@@ -290,7 +465,10 @@ impl SiteConverterRegistry {
                     let matched: Value = converter.funcall("matches", (ext_value,))?;
                     matched.to_bool()
                 }
-                ConverterKind::Rust(converter) => converter.matches(ext_string),
+                ConverterKind::Rust(converter) => {
+                    let site_clone = site;
+                    converter.matches(ctx, site_clone, ext_string)?
+                }
             };
 
             if matches {
@@ -408,13 +586,16 @@ fn converter_chain_for_site(
             registry.update_from_values(ctx, values.as_slice(), array_object_id, array_hash)?;
         }
 
-        registry.converters_for(ext_value, ext_string)
+        registry.converters_for(ctx, site, ext_value, ext_string)
     })
 }
 
 pub(crate) fn render_site(site: Value) -> Result<(), Error> {
     let ruby = ruby_handle()?;
     let ctx = RenderingContext::new(&ruby)?;
+
+    // Validate markdown processor configuration to mirror Ruby behavior
+    validate_markdown_processor(&ctx, site)?;
 
     site.funcall::<_, _, Value>("relative_permalinks_are_deprecated", ())?;
 
@@ -438,6 +619,51 @@ pub(crate) fn render_site(site: Value) -> Result<(), Error> {
     Ok(())
 }
 
+fn validate_markdown_processor(ctx: &RenderingContext, site: Value) -> Result<(), Error> {
+    let config: Value = site.funcall("config", ())?;
+    let markdown_key = ctx.str("markdown");
+    let markdown_val: Value = config.funcall("[]", (markdown_key,))?;
+    if markdown_val.is_nil() {
+        return Ok(());
+    }
+
+    let name = String::try_convert(markdown_val)?;
+    // default supported engine
+    if name.eq_ignore_ascii_case("kramdown") {
+        return Ok(());
+    }
+
+    // Only allow custom class names with [A-Za-z0-9_]+ and that are defined under
+    // Jekyll::Converters::Markdown
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+    let jekyll: RModule = ctx.ruby.class_object().const_get("Jekyll")?;
+    let errors: RModule = jekyll.const_get("Errors")?;
+    let fatal: ExceptionClass = errors.const_get("FatalException")?;
+        return Err(Error::new(
+            fatal,
+            format!("Invalid Markdown processor given: {}", name),
+        ));
+    }
+
+    let jekyll: RModule = ctx.ruby.class_object().const_get("Jekyll")?;
+    let converters: RModule = jekyll.const_get("Converters")?;
+    let markdown_class: RClass = converters.const_get("Markdown")?;
+    let defined: Value = markdown_class.funcall("const_defined?", (ctx.ruby.str_new(&name),))?;
+    if defined.to_bool() {
+        return Ok(());
+    }
+
+    let errors: RModule = jekyll.const_get("Errors")?;
+    let fatal: ExceptionClass = errors.const_get("FatalException")?;
+    Err(Error::new(
+        fatal,
+        format!("Invalid Markdown processor given: {}", name),
+    ))
+}
+
 fn renderer_run(
     site: Value,
     document: Value,
@@ -457,7 +683,7 @@ fn renderer_convert(site: Value, document: Value, content: Value) -> Result<Valu
     let ruby = ruby_handle()?;
     let ctx = RenderingContext::new(&ruby)?;
     let converters = collect_converters(&ctx, site, document)?;
-    convert_content(&ctx, document, &converters, content)
+    convert_content(&ctx, site, document, &converters, content)
 }
 
 fn renderer_output_ext(site: Value, document: Value) -> Result<Value, Error> {
@@ -679,6 +905,7 @@ fn collect_converters(
 
 fn assign_highlighter_options(
     ctx: &RenderingContext,
+    site: Value,
     payload: Value,
     converters: &[ConverterKind],
 ) -> Result<(), Error> {
@@ -698,7 +925,7 @@ fn assign_highlighter_options(
             payload.funcall::<_, _, Value>("[]=", (suffix_key, suffix))?;
         }
         ConverterKind::Rust(converter) => {
-            if let Some((prefix, suffix)) = converter.highlighter_options(ctx)? {
+            if let Some((prefix, suffix)) = converter.highlighter_options(ctx, site)? {
                 payload.funcall::<_, _, Value>("[]=", (prefix_key, prefix))?;
                 payload.funcall::<_, _, Value>("[]=", (suffix_key, suffix))?;
             }
@@ -778,8 +1005,52 @@ fn render_liquid_template(
     content: Value,
     path: Option<Value>,
 ) -> Result<Value, Error> {
+    // Honor strict flags by delegating to Ruby Liquid to preserve exact behavior
+    let strict_filters: Value = info.funcall("[]", (ctx.str("strict_filters"),))?;
+    let strict_variables: Value = info.funcall("[]", (ctx.str("strict_variables"),))?;
+    if (!strict_filters.is_nil() && strict_filters.to_bool())
+        || (!strict_variables.is_nil() && strict_variables.to_bool())
+    {
+        let liquid_renderer: Value = site.funcall::<_, _, Value>("liquid_renderer", ())?;
+        let path_value = match path {
+            Some(ref value) => value.clone(),
+            None => ctx.ruby.qnil().into_value_with(ctx.ruby),
+        };
+        let error_path = match path {
+            Some(value) => value,
+            None => document.funcall::<_, _, Value>("relative_path", ())?,
+        };
+        let file = liquid_renderer.funcall::<_, _, Value>("file", (path_value,))?;
+        let template = file.funcall::<_, _, Value>("parse", (content,))?;
+
+        if let Some(warnings) = RArray::from_value(template.funcall::<_, _, Value>("warnings", ())?) {
+            for entry in warnings.each() {
+                let warning = entry?;
+                let formatted: Value = ctx
+                    .liquid_renderer_class
+                    .funcall::<_, _, Value>("format_error", (warning, error_path.clone()))?;
+                ctx.logger
+                    .funcall::<_, _, Value>("warn", (ctx.str("Liquid Warning:"), formatted))?;
+            }
+        }
+
+        return match template.funcall::<_, _, Value>("render!", (payload, info)) {
+            Ok(output) => Ok(output),
+            Err(err) => {
+                if let Some(exception) = err.value() {
+                    let formatted: Value = ctx
+                        .liquid_renderer_class
+                        .funcall::<_, _, Value>("format_error", (exception, error_path.clone()))?;
+                    ctx.logger
+                        .funcall::<_, _, Value>("error", (ctx.str("Liquid Exception:"), formatted))?;
+                }
+                Err(err)
+            }
+        };
+    }
+
     if let Ok(content_string) = String::try_convert(content) {
-        match crate::liquid_engine::render_template(&content_string, payload, info) {
+        match crate::liquid_engine::render_template(&content_string, payload, info, path) {
             Ok(rendered) => {
                 let rendered_value = ctx
                     .ruby
@@ -839,6 +1110,7 @@ fn render_liquid_template(
 
 fn convert_content(
     ctx: &RenderingContext,
+    site: Value,
     document: Value,
     converters: &[ConverterKind],
     mut content: Value,
@@ -846,7 +1118,12 @@ fn convert_content(
     for converter in converters {
         match converter {
             ConverterKind::Ruby(value) => {
-                if value.is_kind_of(ctx.identity_converter_class) {
+                if value.is_kind_of(ctx.identity_converter_class)
+                    || ctx
+                        .markdown_converter_class
+                        .map(|class| value.is_kind_of(class))
+                        .unwrap_or(false)
+                {
                     continue;
                 }
 
@@ -885,7 +1162,7 @@ fn convert_content(
                 }
             }
             ConverterKind::Rust(converter) => {
-                content = converter.convert(ctx, document, content)?;
+                content = converter.convert(ctx, site, document, content)?;
             }
         }
     }
@@ -925,6 +1202,19 @@ fn converter_output_extension(
     document: Value,
 ) -> Result<Value, Error> {
     let extname: Value = document.funcall::<_, _, Value>("extname", ())?;
+    // If this looks like a Markdown document and kramdown is enabled, prefer .html
+    if let Some(ext_str) = RString::from_value(extname).and_then(|s| s.to_string().ok()) {
+        let config: Value = site.funcall("config", ())?;
+        if KRAMDOWN_CONVERTER.is_kramdown_enabled(ctx, config)? {
+            let exts = KRAMDOWN_CONVERTER.extensions_from_config(ctx, config)?;
+            if exts
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case(ext_str.as_str()))
+            {
+                return Ok(ctx.str(".html"));
+            }
+        }
+    }
     let converters = collect_converters(ctx, site, document)?;
     let mut exts: Vec<Value> = Vec::new();
     for converter in &converters {
@@ -942,7 +1232,7 @@ fn converter_output_extension(
                 }
             }
             ConverterKind::Rust(converter) => {
-                if let Some(out_ext) = converter.output_ext(ctx, extname)? {
+                if let Some(out_ext) = converter.output_ext(ctx, site, extname)? {
                     exts.push(out_ext);
                 }
             }
@@ -950,18 +1240,22 @@ fn converter_output_extension(
     }
 
     if exts.is_empty() {
-        if extname.is_nil() {
-            return Ok(ctx.ruby.qnil().into_value_with(ctx.ruby));
-        }
-        return Ok(extname);
+        return if extname.is_nil() {
+            Ok(ctx.ruby.qnil().into_value_with(ctx.ruby))
+        } else {
+            Ok(extname)
+        };
     }
 
-    let selected = if exts.len() == 1 {
-        *exts.last().unwrap()
-    } else {
-        exts[exts.len() - 2]
-    };
-    Ok(selected)
+    // Prefer the last extension that differs from the original extname.
+    let orig = extname;
+    for ext in exts.iter().rev() {
+        if !ext.equal(orig)? {
+            return Ok(*ext);
+        }
+    }
+    // Fallback to the original extname if no converter changed it.
+    Ok(orig)
 }
 
 fn validate_layout(
@@ -1123,7 +1417,7 @@ fn render_document(
     assign_current_document(ctx, document, payload)?;
 
     let converters = collect_converters(ctx, site, document)?;
-    assign_highlighter_options(ctx, payload, &converters)?;
+    assign_highlighter_options(ctx, site, payload, &converters)?;
     assign_layout_data(ctx, document, payload, layouts)?;
 
     log_debug(ctx, "Pre-Render Hooks:", relative_path)?;
@@ -1151,7 +1445,7 @@ fn render_document(
     }
 
     log_debug(ctx, "Rendering Markup:", relative_path)?;
-    output = convert_content(ctx, document, &converters, output)?;
+    output = convert_content(ctx, site, document, &converters, output)?;
     document.funcall::<_, _, Value>("content=", (output,))?;
 
     log_debug(ctx, "Post-Convert Hooks:", relative_path)?;
