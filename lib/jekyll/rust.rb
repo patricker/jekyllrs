@@ -99,6 +99,18 @@ module Jekyll
         tmpl.render!(context)
       end
 
+      # Same as apply_liquid_tag but seeds locals into the context before rendering.
+      # `locals` should be a Hash of variable names to values.
+      def apply_liquid_tag_with_locals(context, name, markup, body, locals)
+        ensure_loaded!
+        if locals && !locals.empty?
+          locals.each do |k, v|
+            context[k.to_s] = v
+          end
+        end
+        apply_liquid_tag(context, name, markup, body)
+      end
+
       def slugify(string, mode, cased)
         ensure_loaded!
         Bridge.slugify(string, mode, cased)

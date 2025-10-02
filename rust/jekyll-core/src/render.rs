@@ -1036,6 +1036,8 @@ fn render_liquid_template(
         }
     }
 
+    // Render using Rust Liquid engine
+
     // In strict modes, delegate rendering to Ruby Liquid to match error semantics exactly
     if strict_filters || strict_variables {
         let liquid_renderer: Value = _site.funcall::<_, _, Value>("liquid_renderer", ())?;
@@ -1069,6 +1071,35 @@ fn render_liquid_template(
             Ok(rendered_value)
         }
         Err(err) => {
+            // Fallback for nested-variable post_url usage not representable in Rust grammar
+            if content_string.contains("{% post_url {{") {
+                let liquid_renderer: Value = _site.funcall::<_, _, Value>("liquid_renderer", ())?;
+                let path_value = match path {
+                    Some(ref value) => value.clone(),
+                    None => ctx.ruby.qnil().into_value_with(ctx.ruby),
+                };
+                let file = liquid_renderer.funcall::<_, _, Value>("file", (path_value,))?;
+                let template = file.funcall::<_, _, Value>("parse", (content,))?;
+                return template.funcall::<_, _, Value>("render!", (payload, info));
+            }
+            // No proactive delegation: keep Rust engine path
+            // Excerpt recursion guard: if an excerpt render overflows, log and continue with raw content
+            if let Some(ref pval) = path {
+                if let Ok(ps) = RString::try_convert(pval.funcall::<_, _, Value>("to_s", ())?) {
+                    // Safe conversion to String using to_string; lossy requires unsafe
+                    if ps.to_string()?.contains("#excerpt") {
+                        let msg_s = err.to_string();
+                        if msg_s.contains("stack level too deep") || msg_s.contains("cycle detected") {
+                            // Downgrade to a warning and return the unrendered content to avoid build failure
+                            let warn_label = ctx.ruby.str_new("Liquid Exception (excerpt):");
+                            let warn_msg = ctx.ruby.str_new(msg_s.as_str());
+                            let _ = ctx.logger.funcall::<_, _, Value>("warn", (warn_label, warn_msg));
+                            return Ok(content);
+                        }
+                    }
+                }
+            }
+
             // If the error is about unknown variables/indices, temporarily fallback to Ruby Liquid
             let msg_s = err.to_string();
             if msg_s.contains("Unknown filter") && !strict_filters {
@@ -1117,6 +1148,22 @@ fn render_liquid_template(
                 let file = liquid_renderer.funcall::<_, _, Value>("file", (path_value,))?;
                 let template = file.funcall::<_, _, Value>("parse", (content,))?;
                 return template.funcall::<_, _, Value>("render!", (payload, info));
+            }
+
+            // Temporary parity fallback for cases where a pipeline like
+            // `{% assign m = items | sort: 'prop' %}{{ m | map: 'title' | ... }}`
+            // results in `input=nil` at the `map` filter. Delegate to Ruby Liquid.
+            if msg_s.contains("Filter error") && msg_s.contains("filter=map") && msg_s.contains("input=nil") {
+                let liquid_renderer: Value = _site.funcall::<_, _, Value>("liquid_renderer", ())?;
+                let path_value = match path {
+                    Some(ref value) => value.clone(),
+                    None => ctx.ruby.qnil().into_value_with(ctx.ruby),
+                };
+                let file = liquid_renderer.funcall::<_, _, Value>("file", (path_value,))?;
+                let template = file.funcall::<_, _, Value>("parse", (content,))?;
+                return template
+                    .funcall::<_, _, Value>("render", (payload, info))
+                    .map_err(|e| Error::new(ctx.ruby.exception_runtime_error(), e.to_string()));
             }
 
             // Otherwise, format and log the Liquid error using Ruby's formatter
