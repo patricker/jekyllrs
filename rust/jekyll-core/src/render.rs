@@ -1071,17 +1071,6 @@ fn render_liquid_template(
             Ok(rendered_value)
         }
         Err(err) => {
-            // Fallback for nested-variable post_url usage not representable in Rust grammar
-            if content_string.contains("{% post_url {{") {
-                let liquid_renderer: Value = _site.funcall::<_, _, Value>("liquid_renderer", ())?;
-                let path_value = match path {
-                    Some(ref value) => value.clone(),
-                    None => ctx.ruby.qnil().into_value_with(ctx.ruby),
-                };
-                let file = liquid_renderer.funcall::<_, _, Value>("file", (path_value,))?;
-                let template = file.funcall::<_, _, Value>("parse", (content,))?;
-                return template.funcall::<_, _, Value>("render!", (payload, info));
-            }
             // No proactive delegation: keep Rust engine path
             // Excerpt recursion guard: if an excerpt render overflows, log and continue with raw content
             if let Some(ref pval) = path {
@@ -1100,46 +1089,9 @@ fn render_liquid_template(
                 }
             }
 
-            // If the error is about unknown variables/indices, temporarily fallback to Ruby Liquid
             let msg_s = err.to_string();
-            if msg_s.contains("Unknown filter") && !strict_filters {
-                // In non-strict mode, let Ruby Liquid tolerate unknown filters
-                let liquid_renderer: Value = _site.funcall::<_, _, Value>("liquid_renderer", ())?;
-                let path_value = match path {
-                    Some(ref value) => value.clone(),
-                    None => ctx.ruby.qnil().into_value_with(ctx.ruby),
-                };
-                let file = liquid_renderer.funcall::<_, _, Value>("file", (path_value,))?;
-                let template = file.funcall::<_, _, Value>("parse", (content,))?;
-                let rendered: Value = template.funcall::<_, _, Value>("render", (payload, info))?;
-                return Ok(rendered);
-            }
-            if msg_s.contains("Unknown filter") {
-                // Ask Ruby Liquid to format the error consistently
-                let liquid_renderer: Value = _site.funcall::<_, _, Value>("liquid_renderer", ())?;
-                let path_value = match path {
-                    Some(ref value) => value.clone(),
-                    None => ctx.ruby.qnil().into_value_with(ctx.ruby),
-                };
-                let file = liquid_renderer.funcall::<_, _, Value>("file", (path_value,))?;
-                let template = file.funcall::<_, _, Value>("parse", (content,))?;
-                match template.funcall::<_, _, Value>("render!", (payload, info)) {
-                    Ok(_) => {}
-                    Err(rb_err) => {
-                        if let Some(exc) = rb_err.value() {
-                            let formatted: Value = ctx
-                                .liquid_renderer_class
-                                .funcall::<_, _, Value>("format_error", (exc, error_path))?;
-                            ctx.logger.funcall::<_, _, Value>(
-                                "error",
-                                (ctx.str("Liquid Exception:"), formatted),
-                            )?;
-                        }
-                    }
-                }
-                return Err(err);
-            }
-            if (msg_s.contains("Unknown index") || msg_s.contains("Unknown variable")) && !strict_variables {
+            // Gracefully handle non-strict unknown index lookups by delegating to Ruby Liquid
+            if msg_s.contains("Unknown index") && !strict_variables {
                 let liquid_renderer: Value = _site.funcall::<_, _, Value>("liquid_renderer", ())?;
                 let path_value = match path {
                     Some(ref value) => value.clone(),
@@ -1149,11 +1101,8 @@ fn render_liquid_template(
                 let template = file.funcall::<_, _, Value>("parse", (content,))?;
                 return template.funcall::<_, _, Value>("render!", (payload, info));
             }
-
-            // Temporary parity fallback for cases where a pipeline like
-            // `{% assign m = items | sort: 'prop' %}{{ m | map: 'title' | ... }}`
-            // results in `input=nil` at the `map` filter. Delegate to Ruby Liquid.
-            if msg_s.contains("Filter error") && msg_s.contains("filter=map") && msg_s.contains("input=nil") {
+            if msg_s.contains("Unknown filter") {
+                // In non-strict mode, let Ruby Liquid handle unknown filters without failing the build.
                 let liquid_renderer: Value = _site.funcall::<_, _, Value>("liquid_renderer", ())?;
                 let path_value = match path {
                     Some(ref value) => value.clone(),
@@ -1161,10 +1110,9 @@ fn render_liquid_template(
                 };
                 let file = liquid_renderer.funcall::<_, _, Value>("file", (path_value,))?;
                 let template = file.funcall::<_, _, Value>("parse", (content,))?;
-                return template
-                    .funcall::<_, _, Value>("render", (payload, info))
-                    .map_err(|e| Error::new(ctx.ruby.exception_runtime_error(), e.to_string()));
+                return template.funcall::<_, _, Value>("render!", (payload, info));
             }
+            // No further delegation to Ruby Liquid in non-strict modes
 
             // Otherwise, format and log the Liquid error using Ruby's formatter
             let mut cleaned = msg_s.replace("liquid: ", "");

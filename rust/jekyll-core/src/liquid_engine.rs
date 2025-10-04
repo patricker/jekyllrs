@@ -52,18 +52,62 @@ fn preprocess_raw_tag_markup(content: &str) -> String {
                     while let Some(ch) = chars.next() {
                         if ch.is_alphanumeric() || ch == '_' { name.push(ch); } else { break; }
                     }
-                    if name == "post_url" {
+                    // Tags whose markup should be preserved as raw and passed to Ruby intact
+                    // Use a hex wrapper to keep the Rust parser happy even with quotes/spaces.
+                    let needs_raw = matches!(name.as_str(), "post_url" | "include" | "include_relative" | "link");
+                    if needs_raw {
                         // raw markup after name, preserve exactly
                         let raw = inner[name.len()..].trim_end_matches(|c: char| c.is_whitespace());
                         let mut rep = String::new();
                         rep.push_str("{"); rep.push('%'); if open_dash { rep.push('-'); }
-                        rep.push(' '); rep.push_str("post_url "); rep.push_str("__jekyll_raw:'");
-                        for ch in raw.chars() {
-                            match ch { '\\' => rep.push_str("\\\\"), '\'' => rep.push_str("\\'"), _ => rep.push(ch) }
-                        }
+                        rep.push(' ');
+                        rep.push_str(&name);
+                        rep.push(' ');
+                        rep.push_str("__jekyll_raw_hex:'");
+                        rep.push_str(&encode_hex(raw.as_bytes()));
                         rep.push_str("'"); if close_dash { rep.push(' '); rep.push('-'); }
                         rep.push('%'); rep.push('}');
                         out.push_str(&rep);
+                    } else if name == "highlight" {
+                        // Transform block into a single synthetic tag carrying both markup and body
+                        // Find the end of the opening tag
+                        let open_end = end;
+                        // Naive search for endhighlight (no nested highlight blocks expected)
+                        let mut search_pos = open_end;
+                        let mut body_end = None;
+                        while let Some(tag_pos_rel) = content[search_pos..].find("{%") {
+                            let tag_pos = search_pos + tag_pos_rel;
+                            // check if this is endhighlight
+                            let after = &content[tag_pos + 2..];
+                            let after_trim = after.trim_start();
+                            if after_trim.starts_with("endhighlight") {
+                                // find end of this tag
+                                if let Some(close_rel) = content[tag_pos..].find("%}") {
+                                    let close = tag_pos + close_rel + 2;
+                                    body_end = Some((tag_pos, close));
+                                    break;
+                                }
+                            }
+                            search_pos = tag_pos + 2;
+                        }
+                        if let Some((close_start, close_end)) = body_end {
+                            let raw = inner[name.len()..].trim_end_matches(|c: char| c.is_whitespace());
+                            let body = &content[open_end..close_start];
+                            let payload = format!("m:{}|b:{}", encode_hex(raw.as_bytes()), encode_hex(body.as_bytes()));
+                            let mut rep = String::new();
+                            rep.push_str("{"); rep.push('%'); if open_dash { rep.push('-'); }
+                            rep.push_str(" jekyll_highlight_block ");
+                            rep.push_str("__jekyll_raw_hex:'");
+                            rep.push_str(&encode_hex(payload.as_bytes()));
+                            rep.push_str("'"); if close_dash { rep.push(' '); rep.push('-'); }
+                            rep.push('%'); rep.push('}');
+                            out.push_str(&rep);
+                            i = close_end;
+                            continue;
+                        } else {
+                            // Fallback: copy as-is; parser will error if unmatched
+                            out.push_str(tag_text);
+                        }
                     } else {
                         out.push_str(tag_text);
                     }
@@ -88,21 +132,56 @@ fn preprocess_raw_tag_markup(content: &str) -> String {
 }
 
 fn decode_preprocessed_raw_markup(markup: &str) -> Option<String> {
-    let prefix = "__jekyll_raw:'";
     let trimmed = markup.trim_start();
+    // Hex-encoded raw wrapper (preferred)
+    let prefix_hex = "__jekyll_raw_hex:'";
+    if trimmed.starts_with(prefix_hex) {
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut it = trimmed[prefix_hex.len()..].chars();
+        while let (Some(h), Some(l)) = (it.next(), it.next()) {
+            if l == '\'' { break; }
+            if h == '\'' { break; }
+            let hv = h.to_digit(16)? as u8;
+            let lv = l.to_digit(16)? as u8;
+            bytes.push((hv << 4) | lv);
+        }
+        let s = String::from_utf8_lossy(&bytes).to_string();
+        return Some(s);
+    }
+    // Legacy single-quoted raw wrapper with backslash escapes
+    let prefix = "__jekyll_raw:'";
     if !trimmed.starts_with(prefix) { return None; }
     let mut s = String::new();
     let mut chars = trimmed[prefix.len()..].chars().peekable();
     while let Some(ch) = chars.next() {
         match ch {
-            '\\' => {
-                if let Some(next) = chars.next() { s.push(next); }
-            }
-            '\'' => { break; }
+            '\\' => if let Some(next) = chars.next() { s.push(next); },
+            '\'' => break,
             _ => s.push(ch),
         }
     }
     Some(s)
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+fn decode_hex(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let mut chars = s.chars();
+    while let (Some(h), Some(l)) = (chars.next(), chars.next()) {
+        let hv = h.to_digit(16).unwrap_or(0) as u8;
+        let lv = l.to_digit(16).unwrap_or(0) as u8;
+        out.push((hv << 4) | lv);
+    }
+    out
 }
 
 #[derive(Copy, Clone)]
@@ -572,23 +651,8 @@ impl<'ruby> LiquidValueConverter<'ruby> {
     }
 
     fn convert_drop(&mut self, drop: Value, depth: usize) -> Result<LiquidValue, Error> {
-        // Special-case Jekyll::Drops::CollectionDrop: render as an Array of docs for Liquid `for` loops
-        let collection_drop_class = self
-            .ruby
-            .class_object()
-            .const_get::<_, RModule>("Jekyll")
-            .ok()
-            .and_then(|j| j.const_get::<_, RModule>("Drops").ok())
-            .and_then(|d| d.const_get::<_, RClass>("CollectionDrop").ok());
-        if let Some(coll_cls) = collection_drop_class {
-            if drop.is_kind_of(coll_cls) {
-                // Prefer the `docs` array if available
-                if drop.respond_to("docs", false)? {
-                    let docs: Value = drop.funcall::<_, _, Value>("docs", ())?;
-                    return self.convert_inner(docs, depth + 1);
-                }
-            }
-        }
+        // Do not collapse CollectionDrop to its docs array. Preserve it as an object so
+        // property lookups like site.collections[0]["label"] behave correctly.
 
         // Build a safe, filtered projection for the Drop using declared content methods/keys
         let methods_value: Option<Value> = if drop.respond_to("content_methods", false)? {
@@ -601,6 +665,30 @@ impl<'ruby> LiquidValueConverter<'ruby> {
             None
         };
 
+        // Detect document-like drops to avoid materializing expensive properties (e.g., output/content)
+        let is_document_like_drop_method_phase = {
+            let jekyll_mod = self
+                .ruby
+                .class_object()
+                .const_get::<_, RModule>("Jekyll")
+                .ok();
+            let drops_mod = jekyll_mod
+                .as_ref()
+                .and_then(|j| j.const_get::<_, RModule>("Drops").ok());
+            let document_drop_class = drops_mod
+                .as_ref()
+                .and_then(|d| d.const_get::<_, RClass>("DocumentDrop").ok());
+            let excerpt_drop_class = drops_mod
+                .as_ref()
+                .and_then(|d| d.const_get::<_, RClass>("ExcerptDrop").ok());
+            document_drop_class
+                .as_ref()
+                .is_some_and(|cls| drop.is_kind_of(*cls))
+                || excerpt_drop_class
+                    .as_ref()
+                    .is_some_and(|cls| drop.is_kind_of(*cls))
+        };
+
         let mut object = liquid_model::Object::new();
         if let Some(methods_value) = methods_value {
             if let Some(methods) = RArray::from_value(methods_value) {
@@ -609,10 +697,49 @@ impl<'ruby> LiquidValueConverter<'ruby> {
                     let method_string: Value = method_value.funcall::<_, _, Value>("to_s", ())?;
                     let method_name = String::try_convert(method_string)?;
 
-                    // Skip problematic or self-referential properties that can cause recursion
+                    // Avoid expensive materialization on document-like drops. Allow 'output'
+                    // (already computed during render), but skip 'content' and 'to_s'.
+                    if is_document_like_drop_method_phase {
+                        if method_name == "content" || method_name == "to_s" {
+                            continue;
+                        }
+                    }
+
+                    // Handle `excerpt` specially. Only materialize for posts to avoid
+                    // expensive nested rendering on arbitrary collection documents.
                     if method_name == "excerpt" {
-                        object.insert(method_name.clone().into(), LiquidValue::Nil);
-                        continue;
+                        // Determine if this drop wraps a post (collection label == "posts")
+                        let is_post = (|| -> Result<bool, Error> {
+                            let obj: Value = drop.funcall("instance_variable_get", (self.ruby.str_new("@obj"),))?;
+                            let coll: Value = obj.funcall("collection", ())?;
+                            if coll.is_nil() { return Ok(false); }
+                            let label_val: Value = coll.funcall("label", ())?;
+                            if let Some(s) = RString::from_value(label_val) { return Ok(s.to_string()?.eq_ignore_ascii_case("posts")); }
+                            Ok(false)
+                        })().unwrap_or(false);
+
+                        if is_post {
+                            match drop.funcall::<_, _, Value>(method_name.as_str(), ()) {
+                                Ok(ex) => {
+                                    if let Ok(s) = ex.funcall::<_, _, RString>("to_s", ()) {
+                                        if let Ok(st) = s.to_string() {
+                                            object.insert(method_name.clone().into(), LiquidValue::scalar(st));
+                                            continue;
+                                        }
+                                    }
+                                    object.insert(method_name.clone().into(), LiquidValue::Nil);
+                                    continue;
+                                }
+                                Err(_) => {
+                                    object.insert(method_name.clone().into(), LiquidValue::Nil);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            // Do not compute excerpts for non-post documents during payload projection
+                            object.insert(method_name.clone().into(), LiquidValue::Nil);
+                            continue;
+                        }
                     }
 
                     let result = drop.funcall::<_, _, Value>(method_name.as_str(), ())?;
@@ -622,9 +749,55 @@ impl<'ruby> LiquidValueConverter<'ruby> {
             }
         }
 
-        // NOTE: Avoid merging arbitrary dynamic keys here to prevent recursion via excerpts.
-        // Specifically, do NOT call `to_h` for DocumentDrop/ExcerptDrop since that would
-        // force-evaluate keys like `excerpt` which can re-enter rendering and cause stack overflows.
+        // For DocumentDrop, ensure commonly used attributes like `relative_path` are present
+        let jekyll_mod = self
+            .ruby
+            .class_object()
+            .const_get::<_, RModule>("Jekyll")
+            .ok();
+        let drops_mod = jekyll_mod
+            .as_ref()
+            .and_then(|j| j.const_get::<_, RModule>("Drops").ok());
+        let document_drop_class = drops_mod
+            .as_ref()
+            .and_then(|d| d.const_get::<_, RClass>("DocumentDrop").ok());
+        if let Some(doc_cls) = document_drop_class {
+            if drop.is_kind_of(doc_cls) {
+                let rel_key = KString::from_ref("relative_path");
+                if !object.contains_key(&rel_key) {
+                    let rel_val = drop.funcall::<_, _, Value>("instance_variable_get", (self.ruby.str_new("@obj"),))
+                        .ok()
+                        .and_then(|obj| if obj.respond_to("relative_path", false).ok()? { obj.funcall("relative_path", ()).ok() } else { None })
+                        .or_else(|| if drop.respond_to("relative_path", false).ok()? { drop.funcall("relative_path", ()).ok() } else { None });
+                    if let Some(rv) = rel_val {
+                        let converted = self.convert_inner(rv, depth + 1)?;
+                        object.insert(rel_key, converted);
+                    }
+                }
+            }
+        }
+
+        // For any other Drop types, if a `relative_path` method exists (on drop or @obj), surface it.
+        let rel_key = KString::from_ref("relative_path");
+        if !object.contains_key(&rel_key) {
+            let rel_val = if drop.respond_to("relative_path", false)? {
+                Some(drop.funcall::<_, _, Value>("relative_path", ())?)
+            } else {
+                let obj = drop.funcall::<_, _, Value>("instance_variable_get", (self.ruby.str_new("@obj"),))?;
+                if obj.respond_to("relative_path", false)? {
+                    Some(obj.funcall::<_, _, Value>("relative_path", ())?)
+                } else {
+                    None
+                }
+            };
+            if let Some(rv) = rel_val {
+                let converted = self.convert_inner(rv, depth + 1)?;
+                object.insert(rel_key, converted);
+            }
+        }
+
+        // Avoid calling generic `to_h` on document-like drops to prevent recursion/huge graphs.
+        // For other drops (e.g., JekyllDrop), `to_h` exposes a stable, small set of keys.
         let is_document_like_drop = {
             let jekyll_mod = self
                 .ruby
@@ -711,7 +884,19 @@ impl<'ruby> LiquidValueConverter<'ruby> {
             }
         }
 
-        // Special-case SiteDrop: expose config keys and defaults, and materialize collection label accessors
+        // Provide a generic alias: if an object exposes `path` but not `relative_path`,
+        // mirror `path` as `relative_path` for Liquid templates expecting it.
+        {
+            let pkey = KString::from_ref("path");
+            let rkey = KString::from_ref("relative_path");
+            if object.contains_key(&pkey) && !object.contains_key(&rkey) {
+                if let Some(pval) = object.get(&pkey).cloned() {
+                    object.insert(rkey, pval);
+                }
+            }
+        }
+
+        // Special-case SiteDrop: expose config keys and defaults
         let site_drop_class = self
             .ruby
             .class_object()
@@ -748,7 +933,8 @@ impl<'ruby> LiquidValueConverter<'ruby> {
                         }
                     }
                 }
-                // Populate collection label accessors: site.<label> -> docs array
+                // Populate collection label accessors: site.<label> -> docs array, and ensure
+                // `site["label"]` access works in Liquid by projecting these into the object.
                 let collections_val: Value = drop.funcall::<_, _, Value>("collections", ())?;
                 if let Some(coll_arr) = RArray::from_value(collections_val) {
                     for coll_entry in coll_arr.each() {
@@ -971,7 +1157,7 @@ fn fetch_filter_names(_ruby: &Ruby, rust_module: RModule) -> Result<Vec<String>,
             let name: String = String::try_convert(value)?;
             // Prefer Rust-native implementations for certain core filters to avoid
             // semantic mismatches with bridged Ruby behavior.
-            if name == "sort" || name == "map" || name == "join" {
+            if name == "map" || name == "join" {
                 continue;
             }
             names.push(name);
@@ -1059,7 +1245,8 @@ impl BlockReflection for RubyBlockParser {
 
 impl ParseTag for RubyTagParser {
     fn parse(&self, mut arguments: TagTokenIter, _options: &liquid_core::parser::Language) -> LiquidResult<Box<dyn LiquidRenderable>> {
-        // Reconstruct raw markup by concatenating tokens with minimal spacing.
+        // Reconstruct raw markup by concatenating tokens with minimal spacing,
+        // inserting spaces where Ruby tag parsers expect separation (e.g., after quoted values).
         let mut parts: Vec<String> = Vec::new();
         while let Some(tok) = arguments.next() {
             parts.push(tok.as_str().to_string());
@@ -1068,9 +1255,11 @@ impl ParseTag for RubyTagParser {
         let mut prev_tail = '\0';
         for (i, part) in parts.iter().enumerate() {
             let head = part.chars().next().unwrap_or('\0');
-            let tail_alnum = prev_tail.is_alphanumeric() || prev_tail == '_' || prev_tail == '}';
-            let head_alnum = head.is_alphanumeric() || head == '_' || head == '{';
-            if i > 0 && tail_alnum && head_alnum {
+            let tail_needs_sep = prev_tail.is_alphanumeric()
+                || matches!(prev_tail, '_' | '}' | '"' | '\'' | ']' | ')');
+            let head_is_token_start = head.is_alphanumeric()
+                || matches!(head, '_' | '{' | '"' | '\'' | '[' | '(');
+            if i > 0 && tail_needs_sep && head_is_token_start {
                 markup.push(' ');
             }
             markup.push_str(part);
@@ -1091,7 +1280,7 @@ impl ParseBlock for RubyBlockParser {
         mut block: TagBlock,
         _options: &liquid_core::parser::Language,
     ) -> LiquidResult<Box<dyn LiquidRenderable>> {
-        // Reconstruct raw markup similarly to non-block tags
+        // Reconstruct raw markup similarly to non-block tags, with spacing rules as above
         let mut parts: Vec<String> = Vec::new();
         while let Some(tok) = arguments.next() {
             parts.push(tok.as_str().to_string());
@@ -1100,9 +1289,11 @@ impl ParseBlock for RubyBlockParser {
         let mut prev_tail = '\0';
         for (i, part) in parts.iter().enumerate() {
             let head = part.chars().next().unwrap_or('\0');
-            let tail_alnum = prev_tail.is_alphanumeric() || prev_tail == '_' || prev_tail == '}';
-            let head_alnum = head.is_alphanumeric() || head == '_' || head == '{';
-            if i > 0 && tail_alnum && head_alnum {
+            let tail_needs_sep = prev_tail.is_alphanumeric()
+                || matches!(prev_tail, '_' | '}' | '"' | '\'' | ']' | ')');
+            let head_is_token_start = head.is_alphanumeric()
+                || matches!(head, '_' | '{' | '"' | '\'' | '[' | '(');
+            if i > 0 && tail_needs_sep && head_is_token_start {
                 markup.push(' ');
             }
             markup.push_str(part);
@@ -1135,7 +1326,7 @@ impl LiquidRenderable for RubyTagRenderable {
             return Err(LiquidError::with_msg("Ruby tag context unavailable"));
         };
         let rust_module = rust_bridge_module(&ruby).map_err(|e| LiquidError::with_msg(e.to_string()))?;
-        let body_value = match &self.body {
+        let mut body_value = match &self.body {
             Some(s) => ruby.str_new(s).into_value_with(&ruby),
             None => ruby.qnil().into_value_with(&ruby),
         };
@@ -1145,35 +1336,129 @@ impl LiquidRenderable for RubyTagRenderable {
         } else {
             self.markup.clone()
         };
-        // If markup still contains Liquid output (e.g., {{ slug }}), resolve it against the current runtime
-        let mut locals_hash: Option<Value> = None;
-        if let Some(inner) = extract_simple_output_var(&markup_to_send) {
-            use liquid_core::model::ScalarCow;
-            let path = [ScalarCow::new(inner)];
-            if let Ok(val) = _runtime.get(&path) {
-                // Seed local into Ruby Context to allow Ruby-side templates to resolve
-                let ruby_val = liquid_value_to_ruby(&ruby, &val.to_value())
-                    .map_err(|e| LiquidError::with_msg(e.to_string()))?;
-                let h = ruby.hash_new();
-                h.aset(ruby.str_new(inner), ruby_val)
-                    .map_err(|e| LiquidError::with_msg(e.to_string()))?;
-                locals_hash = Some(h.into_value_with(&ruby));
-                // Also replace markup with the resolved string for tags that expect plain strings
-                markup_to_send = val.to_kstr().to_string();
+        // Special-case our synthetic highlight block: payload is hex-encoded markup and body
+        let mut ruby_tag_name = self.name.as_str();
+        if self.name == "jekyll_highlight_block" {
+            // payload format: m:<hex>|b:<hex>
+            let payload = markup_to_send.clone();
+            let mut markup_decoded = String::new();
+            let mut body_decoded = String::new();
+            if let Some(mpos) = payload.find("m:") {
+                if let Some(bpos) = payload[mpos+2..].find("|b:") {
+                    let mhex = &payload[mpos+2..mpos+2+bpos];
+                    let bhex = &payload[mpos+2+bpos+3..];
+                    markup_decoded = String::from_utf8_lossy(&decode_hex(mhex)).to_string();
+                    body_decoded = String::from_utf8_lossy(&decode_hex(bhex)).to_string();
+                }
             }
+            if !markup_decoded.is_empty() {
+                markup_to_send = markup_decoded;
+                body_value = ruby.str_new(&body_decoded).into_value_with(&ruby);
+                ruby_tag_name = "highlight";
+            }
+        }
+        // If markup still contains Liquid output (e.g., {{ slug }}), resolve it against the current runtime
+        // Additionally, seed simple unquoted identifiers used as values (e.g., local=var) into the Ruby Context
+        let mut locals_hash: Option<Value> = None;
+        {
+            use liquid_core::model::ScalarCow;
+            if let Some(inner) = extract_simple_output_var(&markup_to_send) {
+                let path = [ScalarCow::new(inner)];
+                if let Ok(val) = _runtime.get(&path) {
+                    let ruby_val = liquid_value_to_ruby(&ruby, &val.to_value())
+                        .map_err(|e| LiquidError::with_msg(e.to_string()))?;
+                    let h = ruby.hash_new();
+                    h.aset(ruby.str_new(inner), ruby_val)
+                        .map_err(|e| LiquidError::with_msg(e.to_string()))?;
+                    locals_hash = Some(h.into_value_with(&ruby));
+                    markup_to_send = val.to_kstr().to_string();
+                }
+            }
+            // Seed simple identifier assignments like key=var (unquoted)
+            let mut h_opt = locals_hash.map(|v| RHash::from_value(v)).flatten();
+            let mut ensure_hash = || -> Result<RHash, LiquidError> {
+                if let Some(h) = h_opt { return Ok(h); }
+                let h = ruby.hash_new();
+                h_opt = Some(h);
+                Ok(h_opt.unwrap())
+            };
+            let mut i = 0usize;
+            let chars: Vec<char> = markup_to_send.chars().collect();
+            let mut in_quote: Option<char> = None;
+            while i < chars.len() {
+                let c = chars[i];
+                if let Some(q) = in_quote {
+                    if c == q { in_quote = None; }
+                    i += 1; continue;
+                }
+                if c == '\'' || c == '"' { in_quote = Some(c); i += 1; continue; }
+                if c == '=' {
+                    // find key start (identifier to the left)
+                    let k_end = i;
+                    let mut k_start = k_end;
+                    while k_start > 0 && (chars[k_start-1].is_ascii_alphanumeric() || chars[k_start-1] == '_') {
+                        k_start -= 1;
+                    }
+                    // skip '=' and whitespace
+                    let mut v_start = i + 1;
+                    while v_start < chars.len() && chars[v_start].is_whitespace() { v_start += 1; }
+                    // only handle unquoted simple identifiers
+                    let mut v_end = v_start;
+                    while v_end < chars.len() && (chars[v_end].is_ascii_alphanumeric() || chars[v_end] == '_' || chars[v_end] == '.') {
+                        v_end += 1;
+                    }
+                    if v_start < v_end {
+                        let key: String = chars[k_start..k_end].iter().collect();
+                        let value_ident: String = chars[v_start..v_end].iter().collect();
+                        // only seed simple identifiers without dot
+                        if !key.is_empty() && !value_ident.contains('.') {
+                            let path = [ScalarCow::new(value_ident.as_str())];
+                            if let Ok(val) = _runtime.get(&path) {
+                                let ruby_val = liquid_value_to_ruby(&ruby, &val.to_value())
+                                    .map_err(|e| LiquidError::with_msg(e.to_string()))?;
+                                let h = ensure_hash()?;
+                                h.aset(ruby.str_new(value_ident.as_str()), ruby_val)
+                                    .map_err(|e| LiquidError::with_msg(e.to_string()))?;
+                            }
+                        }
+                    }
+                }
+                i += 1;
+            }
+            if let Some(h) = h_opt { locals_hash = Some(h.into_value_with(&ruby)); }
+            // Also seed simple output variables like {{ name }} that may be used in tag markup concatenations
+            let mut h_opt2 = locals_hash.map(|v| RHash::from_value(v)).flatten();
+            let mut ensure_hash2 = || -> Result<RHash, LiquidError> {
+                if let Some(h) = h_opt2 { return Ok(h); }
+                let h = ruby.hash_new();
+                h_opt2 = Some(h);
+                Ok(h_opt2.unwrap())
+            };
+            let idents = extract_all_simple_output_vars(&markup_to_send);
+            for ident in idents {
+                let path = [ScalarCow::new(ident.as_str())];
+                if let Ok(val) = _runtime.get(&path) {
+                    let ruby_val = liquid_value_to_ruby(&ruby, &val.to_value())
+                        .map_err(|e| LiquidError::with_msg(e.to_string()))?;
+                    let h = ensure_hash2()?;
+                    h.aset(ruby.str_new(ident.as_str()), ruby_val)
+                        .map_err(|e| LiquidError::with_msg(e.to_string()))?;
+                }
+            }
+            if let Some(h) = h_opt2 { locals_hash = Some(h.into_value_with(&ruby)); }
         }
         let out: Value = if let Some(locals) = locals_hash {
             rust_module
                 .funcall(
                     "apply_liquid_tag_with_locals",
-                    (ctx.context, self.name.as_str(), ruby.str_new(&markup_to_send), body_value, locals),
+                    (ctx.context, ruby_tag_name, ruby.str_new(&markup_to_send), body_value, locals),
                 )
                 .map_err(|e| LiquidError::with_msg(e.to_string()))?
         } else {
             rust_module
                 .funcall(
                     "apply_liquid_tag",
-                    (ctx.context, self.name.as_str(), ruby.str_new(&markup_to_send), body_value),
+                    (ctx.context, ruby_tag_name, ruby.str_new(&markup_to_send), body_value),
                 )
                 .map_err(|e| LiquidError::with_msg(e.to_string()))?
         };
@@ -1202,6 +1487,30 @@ fn extract_simple_output_var(s: &str) -> Option<&str> {
     }
 }
 
+fn extract_all_simple_output_vars(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes: Vec<char> = s.chars().collect();
+    let mut i = 0usize;
+    while i + 3 < bytes.len() {
+        if bytes[i] == '{' && bytes[i + 1] == '{' {
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j].is_whitespace() { j += 1; }
+            let start = j;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == '_') { j += 1; }
+            let ident_ok = j > start;
+            while j < bytes.len() && bytes[j].is_whitespace() { j += 1; }
+            if ident_ok && j + 1 < bytes.len() && bytes[j] == '}' && bytes[j + 1] == '}' {
+                let ident: String = bytes[start..(start + (j - start))].iter().collect();
+                out.push(ident);
+                i = j + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 pub fn render_template(
     content: &str,
     payload: Value,
@@ -1217,14 +1526,20 @@ pub fn render_template(
     for name in &filter_names {
         builder = builder.filter(RubyFilterParser::new(name.clone()));
     }
-    let (tag_names, block_names) = fetch_tag_kinds(&ruby, rust_module)?;
-    for name in tag_names {
+    let (mut tag_names, mut block_names) = fetch_tag_kinds(&ruby, rust_module)?;
+    // Ensure core Jekyll blocks are recognized even if not present in Liquid::Template.tags yet
+    if !block_names.iter().any(|n| n.eq_ignore_ascii_case("highlight")) {
+        block_names.push("highlight".to_string());
+    }
+    for name in tag_names.drain(..) {
         // Avoid bridging stdlib tags that mutate runtime (e.g., 'assign')
         if name.eq_ignore_ascii_case("assign") {
             continue;
         }
         builder = builder.tag(RubyTagParser::new(name));
     }
+    // Register synthetic helper tags used by the preprocessor
+    builder = builder.tag(RubyTagParser::new("jekyll_highlight_block".to_string()));
     let stdlib_blocks = [
         "raw",
         "if",
@@ -1236,7 +1551,7 @@ pub fn render_template(
         "capture",
         "case",
     ];
-    for name in block_names {
+    for name in block_names.drain(..) {
         if stdlib_blocks.iter().any(|s| s.eq_ignore_ascii_case(&name)) {
             continue;
         }

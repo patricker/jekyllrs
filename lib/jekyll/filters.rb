@@ -188,7 +188,27 @@ module Jekyll
       # Normalize Hash input to its values for selection semantics
       input = input.values if input.is_a?(Hash) # FIXME: maintain parity with existing behavior
 
+      # Specialized handling for Liquid literals `empty` / `blank`
+      # warn "DEBUG where value class=#{value.class} inspect=#{value.inspect}"
+      if value.is_a?(Liquid::Expression::MethodLiteral) || (value.is_a?(String) && %w(empty blank).include?(value))
+        lit = value.is_a?(String) ? value : value.to_s
+        sel = input.select do |object|
+          prop = item_property(object, property)
+          case lit
+          when 'empty'
+            prop.nil? || (prop.respond_to?(:empty?) && prop.empty?)
+          when 'blank'
+            prop.nil? || (prop.is_a?(String) ? prop.strip.empty? : (prop.respond_to?(:empty?) && prop.empty?))
+          end
+        end
+        return sel.to_a
+      end
+
       if Jekyll::Rust.respond_to?(:where_filter_fast) && input.is_a?(Array)
+        # Normalize Liquid method literals to strings for the Rust fast-path
+        if value.is_a?(Liquid::Expression::MethodLiteral)
+          value = value.to_s
+        end
         begin
           fast = Jekyll::Rust.where_filter_fast(input, property, value)
           return fast if fast.is_a?(Array)
@@ -443,8 +463,25 @@ module Jekyll
       when NilClass
         return true if property.nil?
       when Liquid::Expression::MethodLiteral # `empty` or `blank`
-        target = target.to_s
-        return true if property == target || Array(property).join == target
+        t = target.to_s
+        case t
+        when "empty"
+          return true if property.nil?
+          return true if property.respond_to?(:empty?) && property.empty?
+          # Arrays and Hashes respond_to?(:empty?) but special-case for clarity
+          return true if property.is_a?(Array) && property.empty?
+          return true if property.is_a?(Hash) && property.empty?
+        when "blank"
+          return true if property.nil?
+          # Strings: whitespace-only counts as blank
+          return true if property.is_a?(String) && property.strip.empty?
+          # Arrays / Hashes: no elements counts as blank
+          return true if property.is_a?(Array) && property.empty?
+          return true if property.is_a?(Hash) && property.empty?
+        else
+          # Fallback to string comparison semantics
+          return true if property == t || Array(property).join == t
+        end
       else
         target = target.to_s
         if property.is_a? String

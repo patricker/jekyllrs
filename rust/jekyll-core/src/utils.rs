@@ -819,16 +819,32 @@ fn where_filter_fast2(input: Value, property: Value, target: Value) -> Result<Va
         let val = fetch_nested_prop(&ruby, obj, &prop_str)?;
         let matched = match &target_kind {
             TargetKind::Nil => val.is_nil(),
-            TargetKind::MethodLiteral(expected) => {
-                if let Some(rs) = RString::from_value(val) {
-                    rs.to_string()? == *expected
+            TargetKind::MethodLiteral(_expected) => {
+                // Treat method literals as Liquid's special literals like `empty`.
+                // Match nil as empty too.
+                if val.is_nil() {
+                    true
+                } else if let Some(rs) = RString::from_value(val) {
+                    rs.to_string()?.is_empty()
+                } else if let Some(a) = RArray::from_value(val) {
+                    let alen: i64 = i64::try_convert(a.funcall("length", ())?)?;
+                    alen == 0
+                } else if let Some(h) = RHash::from_value(val) {
+                    let hlen: i64 = i64::try_convert(h.funcall("length", ())?)?;
+                    hlen == 0
                 } else {
-                    let array = arrayify_for_filter(&ruby, val)?;
-                    let joined: RString = array.funcall("join", ())?;
-                    joined.to_string()? == *expected
+                    let vs: RString = val.funcall("to_s", ())?;
+                    vs.to_string()?.is_empty()
                 }
             }
             TargetKind::String(expected) => {
+                if expected.is_empty() || expected == "empty" {
+                    // In Jekyll, `empty` matches nil as well as empty strings/arrays/hashes
+                    let is_emp = if val.is_nil() { true } else { is_empty_value(&ruby, val)? };
+                    is_emp
+                } else if expected == "blank" {
+                    is_blank_value(&ruby, val)?
+                } else {
                 if let Some(rs) = RString::from_value(val) {
                     rs.to_string()? == *expected
                 } else {
@@ -842,6 +858,7 @@ fn where_filter_fast2(input: Value, property: Value, target: Value) -> Result<Va
                         }
                     }
                     any_match
+                }
                 }
             }
         };
