@@ -15,6 +15,7 @@ static DATE_REQUIRED: OnceCell<()> = OnceCell::new();
 
 pub fn define_into(bridge: &RModule) -> Result<(), Error> {
     bridge.define_singleton_method("document_read", function!(document_read, 2))?;
+    bridge.define_singleton_method("yaml_load_file", function!(yaml_load_file, 1))?;
     Ok(())
 }
 
@@ -98,6 +99,39 @@ fn parse_front_matter(ruby: &Ruby, source: &str) -> Result<Value, Error> {
                 0.into_value_with(ruby),
                 ruby.str_new(&message).into_value_with(ruby),
                 ruby.qnil().into_value_with(ruby),
+            ))?;
+            Err(Error::from(exception))
+        }
+    }
+}
+
+fn yaml_load_file(path: String) -> Result<Value, Error> {
+    let ruby = ruby_handle()?;
+    // Read entire file as UTF-8 (Ruby default behavior for SafeYAML.load_file is IO read in Ruby)
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(Error::new(
+                ruby.exception_runtime_error(),
+                format!("failed to read YAML file {}: {}", path, e),
+            ))
+        }
+    };
+
+    match serde_yaml::from_str::<YamlValue>(&content) {
+        Ok(value) => yaml_value_to_ruby(&ruby, value),
+        Err(err) => {
+            // Mirror parse_front_matter error mapping to Psych::SyntaxError
+            let psych: RModule = ruby.class_object().const_get("Psych")?;
+            let syntax_error: ExceptionClass = psych.const_get("SyntaxError")?;
+            let message = format!("{} in {}", err.to_string(), path);
+            let exception = syntax_error.new_instance((
+                ruby.qnil().into_value_with(&ruby),
+                0.into_value_with(&ruby),
+                0.into_value_with(&ruby),
+                0.into_value_with(&ruby),
+                ruby.str_new(&message).into_value_with(&ruby),
+                ruby.qnil().into_value_with(&ruby),
             ))?;
             Err(Error::from(exception))
         }

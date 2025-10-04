@@ -171,6 +171,11 @@ module Jekyll
         Bridge.document_read(path, file_opts)
       end
 
+      def yaml_load_file(path)
+        ensure_loaded!
+        Bridge.yaml_load_file(path)
+      end
+
       def safe_glob(dir, patterns, flags)
         ensure_loaded!
         Bridge.safe_glob(dir, patterns, flags)

@@ -305,7 +305,7 @@ module Jekyll
       Jekyll.logger.debug "Reading:", relative_path
 
       if yaml_file?
-        @data = SafeYAML.load_file(path)
+        @data = Jekyll::Rust.yaml_load_file(path)
       else
         begin
           merge_defaults

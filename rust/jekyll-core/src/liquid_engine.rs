@@ -1092,6 +1092,28 @@ impl Filter for WhereFilter {
             .funcall::<_, _, Value>("where_filter_fast", (input_value, prop_r, target_r))
             .map_err(|e| LiquidError::with_msg(e.to_string()))?;
 
+        if result.is_nil() {
+            // Fallback to Ruby Liquid's where for unsupported cases
+            let ctx_opt = RUBY_FILTER_CONTEXT.with(|cell| cell.borrow().clone());
+            if let Some(ctx) = ctx_opt {
+                let positional_value = {
+                    let arr = ruby.ary_new_capa(2);
+                    arr.push(ruby.str_new(&prop_str)).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+                    arr.push(target_r).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+                    arr.into_value_with(&ruby)
+                };
+                let keyword_value = ruby.hash_new().into_value_with(&ruby);
+                let result_value: Value = rust_module
+                    .funcall(
+                        "apply_liquid_filter",
+                        (ctx.context, "where", input_value, positional_value, keyword_value),
+                    )
+                    .map_err(|e| LiquidError::with_msg(e.to_string()))?;
+                let mut conv = LiquidValueConverter::new(&ruby).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+                return conv.convert(result_value).map_err(|e| LiquidError::with_msg(e.to_string()));
+            }
+        }
+
         let mut conv = LiquidValueConverter::new(&ruby).map_err(|e| LiquidError::with_msg(e.to_string()))?;
         conv.convert(result).map_err(|e| LiquidError::with_msg(e.to_string()))
     }
@@ -1128,6 +1150,29 @@ impl Filter for WhereExpFilter {
         let result = rust_module
             .funcall::<_, _, Value>("where_exp_fast", (input_r, var_r, expr_r))
             .map_err(|e| LiquidError::with_msg(e.to_string()))?;
+
+        if result.is_nil() {
+            // Fallback to Ruby Liquid's where_exp for complex expressions
+            let ctx_opt = RUBY_FILTER_CONTEXT.with(|cell| cell.borrow().clone());
+            if let Some(ctx) = ctx_opt {
+                let positional_value = {
+                    let arr = ruby.ary_new_capa(2);
+                    arr.push(ruby.str_new(&var)).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+                    arr.push(ruby.str_new(&expr)).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+                    arr.into_value_with(&ruby)
+                };
+                let keyword_value = ruby.hash_new().into_value_with(&ruby);
+                let result_value: Value = rust_module
+                    .funcall(
+                        "apply_liquid_filter",
+                        (ctx.context, "where_exp", input_r, positional_value, keyword_value),
+                    )
+                    .map_err(|e| LiquidError::with_msg(e.to_string()))?;
+                let mut conv = LiquidValueConverter::new(&ruby).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+                return conv.convert(result_value).map_err(|e| LiquidError::with_msg(e.to_string()));
+            }
+        }
+
         let mut conv = LiquidValueConverter::new(&ruby).map_err(|e| LiquidError::with_msg(e.to_string()))?;
         conv.convert(result).map_err(|e| LiquidError::with_msg(e.to_string()))
     }
@@ -1346,6 +1391,78 @@ impl Filter for StripIndexFilter {
     }
 }
 
+#[derive(Clone)]
+struct UniqFilterParser;
+impl FilterReflection for UniqFilterParser {
+    fn name(&self) -> &str { "uniq" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for UniqFilterParser {
+    fn parse(&self, _arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        Ok(Box::new(UniqFilter))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct UniqFilter;
+impl fmt::Display for UniqFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "uniq") } }
+impl Filter for UniqFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, _runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        if let Some(arr) = input.as_array() {
+            use std::collections::HashSet;
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut out: Vec<LiquidValue> = Vec::with_capacity(arr.size() as usize);
+            for i in 0..arr.size() {
+                if let Some(v) = arr.get(i) {
+                    let s = v.to_kstr().to_string();
+                    if seen.insert(s) {
+                        out.push(v.to_value());
+                    }
+                }
+            }
+            return Ok(LiquidValue::array(out));
+        }
+        Ok(LiquidValue::Nil)
+    }
+}
+
+#[derive(Clone)]
+struct CompactFilterParser;
+impl FilterReflection for CompactFilterParser {
+    fn name(&self) -> &str { "compact" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for CompactFilterParser {
+    fn parse(&self, _arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        Ok(Box::new(CompactFilter))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct CompactFilter;
+impl fmt::Display for CompactFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "compact") } }
+impl Filter for CompactFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, _runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        if let Some(arr) = input.as_array() {
+            let mut out: Vec<LiquidValue> = Vec::new();
+            out.reserve(arr.size() as usize);
+            for i in 0..arr.size() {
+                if let Some(v) = arr.get(i) {
+                    if !v.is_nil() {
+                        out.push(v.to_value());
+                    }
+                }
+            }
+            return Ok(LiquidValue::array(out));
+        }
+        Ok(LiquidValue::Nil)
+    }
+}
+
 
 struct RubyFilter {
     name: String,
@@ -1460,6 +1577,8 @@ fn fetch_filter_names(_ruby: &Ruby, rust_module: RModule) -> Result<Vec<String>,
                 || name == "absolute_url"
                 || name == "relative_url"
                 || name == "strip_index"
+                || name == "uniq"
+                || name == "compact"
             {
                 continue;
             }
@@ -1838,7 +1957,9 @@ pub fn render_template(
         .filter(FindFilterParser)
         .filter(AbsoluteUrlFilterParser)
         .filter(RelativeUrlFilterParser)
-        .filter(StripIndexFilterParser);
+        .filter(StripIndexFilterParser)
+        .filter(UniqFilterParser)
+        .filter(CompactFilterParser);
     let (mut tag_names, mut block_names) = fetch_tag_kinds(&ruby, rust_module)?;
     // Ensure core Jekyll blocks are recognized even if not present in Liquid::Template.tags yet
     if !block_names.iter().any(|n| n.eq_ignore_ascii_case("highlight")) {
