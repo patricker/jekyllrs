@@ -128,28 +128,33 @@ Got it—no runtime fallbacks to Ruby, no “compat flags,” and `jekyllrs` is 
 
 * **Engine**
 
-  * [ ] Integrate `liquid` (Rust) or a fork that you can extend.
-  * [ ] Implement Jekyll‑specific behaviors: `strict_filters`, `strict_variables`, whitespace trim, `incremental` affects caching, `{% highlight %}` passthrough, etc.
+  * [x] Integrate `liquid` (Rust) and extend in‑tree.
+  * [x] Implement core Jekyll behaviors in Rust engine:
+    - `strict_filters`/`strict_variables` respected (delegates to Ruby Liquid when strict),
+    - `{% highlight %}` passthrough via synthetic block,
+    - template caching keyed by path/mtime/filters.
+    - Note: whitespace trim semantics tracked separately if diffs arise in tests.
 
 * **Ruby bridge for filters/tags**
 
-  * [ ] Filters: when a filter isn’t implemented in Rust, marshal args to Ruby and run the Ruby filter; cache arity & fast‑path conversions (`String`, `i64`, `f64`, `bool`, arrays/maps).
-  * [ ] Tags: provide a tag provider that, for unknown tags, invokes Ruby’s tag class with a small shim (text capture, context, rendering of inner body if block tag).
-  * [ ] Implement core Jekyll filters in Rust (`where`, `where_exp`, `sort`, `group_by`, URL helpers) and keep the bridge for everything else.
-    *Files:* `rust/jekyll-core/src/liquid_engine.rs` (new), expand `utils.rs`‐based filters.
+  * [x] Filters: for filters not implemented in Rust, marshal args to Ruby and run the Ruby filter (arity resolved by Liquid), fast‑path common scalars/arrays/maps.
+  * [x] Tags: tag provider that defers to Ruby’s tag class with body capture when needed.
+  * [ ] Implement core Jekyll filters natively in Rust (`where`, `where_exp`, `sort`, `group_by`, URL helpers) and keep the bridge for everything else.
+    - Implemented: `where`, `where_exp`, `sort` (with `nils:`), `group_by`, `find` (via Rust fast paths).
+    *Files:* `rust/jekyll-core/src/liquid_engine.rs`, expand `utils.rs`‐based filters.
 
 * **Drop semantics**
 
-  * [ ] Create a `RubyDrop` adapter that implements Liquid’s object protocol by forwarding to Ruby `Drop`/Hash where needed (property access, `[]`, `respond_to?`).
-  * [ ] For common hot paths (`PageDrop`, `SiteDrop`), implement Rust‑native projections that consult Ruby only on misses.
+  * [x] Convert Ruby Drops/Hashes to Liquid values with cycle‑guard; expose stable projections for `SiteDrop`/`DocumentDrop` keys while deferring heavy keys.
+  * [ ] Optional: `RubyDrop` adapter implementing `ValueView` with on‑demand forwarding when needed.
 
 * **Template caching**
 
-  * [ ] Cache parsed templates (keyed by path + mtime) and partials; expose a `build_epoch` to invalidate between rebuilds.
+  * [x] Cache parsed templates (keyed by path + mtime + filters); invalidate on path/mtime change; cap cache size.
 
 * **Remove Ruby Liquid**
 
-  * [ ] Rip out `require 'liquid'` from the render path; keep the gem as a dev dependency if needed for tests that specifically assert Liquid parse errors/messages, or port those expectations.
+  * [ ] Remove Ruby Liquid from render path entirely. Note: current engine delegates only for strict modes and unknown filters; remove remaining delegation once native filters/tags cover gaps.
 
 **Acceptance**
 

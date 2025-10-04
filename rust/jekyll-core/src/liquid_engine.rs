@@ -1055,6 +1055,298 @@ impl ParseFilter for RubyFilterParser {
     }
 }
 
+// Native filters that bridge to Rust fast paths on the Jekyll::Rust module
+
+#[derive(Clone)]
+struct WhereFilterParser;
+impl FilterReflection for WhereFilterParser {
+    fn name(&self) -> &str { "where" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for WhereFilterParser {
+    fn parse(&self, mut arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        let positional: Vec<Expression> = arguments.positional.by_ref().collect();
+        Ok(Box::new(WhereFilter { positional }))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct WhereFilter { positional: Vec<Expression> }
+impl fmt::Display for WhereFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "where") } }
+impl Filter for WhereFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        if self.positional.len() < 2 { return Ok(LiquidValue::Nil); }
+        let ruby = ruby_handle().map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let rust_module = rust_bridge_module(&ruby).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+
+        let input_value = liquid_value_to_ruby(&ruby, &input.to_value()).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let prop_val = self.positional[0].evaluate(runtime)?.into_owned();
+        let prop_str = prop_val.to_kstr().to_string();
+        let prop_r = ruby.str_new(&prop_str).into_value_with(&ruby);
+        let target_val = self.positional[1].evaluate(runtime)?.into_owned();
+        let target_r = liquid_value_to_ruby(&ruby, &target_val).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+
+        let result = rust_module
+            .funcall::<_, _, Value>("where_filter_fast", (input_value, prop_r, target_r))
+            .map_err(|e| LiquidError::with_msg(e.to_string()))?;
+
+        let mut conv = LiquidValueConverter::new(&ruby).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        conv.convert(result).map_err(|e| LiquidError::with_msg(e.to_string()))
+    }
+}
+
+#[derive(Clone)]
+struct WhereExpFilterParser;
+impl FilterReflection for WhereExpFilterParser {
+    fn name(&self) -> &str { "where_exp" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for WhereExpFilterParser {
+    fn parse(&self, mut arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        let positional: Vec<Expression> = arguments.positional.by_ref().collect();
+        Ok(Box::new(WhereExpFilter { positional }))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct WhereExpFilter { positional: Vec<Expression> }
+impl fmt::Display for WhereExpFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "where_exp") } }
+impl Filter for WhereExpFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        if self.positional.len() < 2 { return Ok(LiquidValue::Nil); }
+        let ruby = ruby_handle().map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let rust_module = rust_bridge_module(&ruby).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let input_r = liquid_value_to_ruby(&ruby, &input.to_value()).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let var = self.positional[0].evaluate(runtime)?.into_owned().to_kstr().to_string();
+        let var_r = ruby.str_new(&var).into_value_with(&ruby);
+        let expr = self.positional[1].evaluate(runtime)?.into_owned().to_kstr().to_string();
+        let expr_r = ruby.str_new(&expr).into_value_with(&ruby);
+        let result = rust_module
+            .funcall::<_, _, Value>("where_exp_fast", (input_r, var_r, expr_r))
+            .map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let mut conv = LiquidValueConverter::new(&ruby).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        conv.convert(result).map_err(|e| LiquidError::with_msg(e.to_string()))
+    }
+}
+
+#[derive(Clone)]
+struct SortFilterParser;
+impl FilterReflection for SortFilterParser {
+    fn name(&self) -> &str { "sort" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for SortFilterParser {
+    fn parse(&self, mut arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        let positional: Vec<Expression> = arguments.positional.by_ref().collect();
+        let keyword: Vec<(String, Expression)> = arguments.keyword.by_ref().map(|(n,e)| (n.to_string(), e)).collect();
+        Ok(Box::new(SortFilter { positional, keyword }))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct SortFilter { positional: Vec<Expression>, keyword: Vec<(String, Expression)> }
+impl fmt::Display for SortFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "sort") } }
+impl Filter for SortFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        let ruby = ruby_handle().map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let rust_module = rust_bridge_module(&ruby).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let input_r = liquid_value_to_ruby(&ruby, &input.to_value()).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let prop = if let Some(expr) = self.positional.get(0) {
+            expr.evaluate(runtime)?.into_owned().to_kstr().to_string()
+        } else { String::new() };
+        let prop_r = ruby.str_new(&prop).into_value_with(&ruby);
+        let mut nils = "first".to_string();
+        for (k, v) in &self.keyword {
+            if k.eq_ignore_ascii_case("nils") {
+                nils = v.evaluate(runtime)?.into_owned().to_kstr().to_string();
+            }
+        }
+        let nils_r = ruby.str_new(&nils).into_value_with(&ruby);
+        let result = rust_module
+            .funcall::<_, _, Value>("sort_filter_fast", (input_r, prop_r, nils_r))
+            .map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let mut conv = LiquidValueConverter::new(&ruby).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        conv.convert(result).map_err(|e| LiquidError::with_msg(e.to_string()))
+    }
+}
+
+#[derive(Clone)]
+struct GroupByFilterParser;
+impl FilterReflection for GroupByFilterParser {
+    fn name(&self) -> &str { "group_by" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for GroupByFilterParser {
+    fn parse(&self, mut arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        let positional: Vec<Expression> = arguments.positional.by_ref().collect();
+        Ok(Box::new(GroupByFilter { positional }))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct GroupByFilter { positional: Vec<Expression> }
+impl fmt::Display for GroupByFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "group_by") } }
+impl Filter for GroupByFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        if self.positional.is_empty() { return Ok(LiquidValue::Nil); }
+        let ruby = ruby_handle().map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let rust_module = rust_bridge_module(&ruby).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let input_r = liquid_value_to_ruby(&ruby, &input.to_value()).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let prop = self.positional[0].evaluate(runtime)?.into_owned().to_kstr().to_string();
+        let prop_r = ruby.str_new(&prop).into_value_with(&ruby);
+        let result = rust_module
+            .funcall::<_, _, Value>("group_by_fast", (input_r, prop_r))
+            .map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let mut conv = LiquidValueConverter::new(&ruby).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        conv.convert(result).map_err(|e| LiquidError::with_msg(e.to_string()))
+    }
+}
+
+#[derive(Clone)]
+struct FindFilterParser;
+impl FilterReflection for FindFilterParser {
+    fn name(&self) -> &str { "find" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for FindFilterParser {
+    fn parse(&self, mut arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        let positional: Vec<Expression> = arguments.positional.by_ref().collect();
+        Ok(Box::new(FindFilter { positional }))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct FindFilter { positional: Vec<Expression> }
+impl fmt::Display for FindFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "find") } }
+impl Filter for FindFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        if self.positional.len() < 2 { return Ok(LiquidValue::Nil); }
+        let ruby = ruby_handle().map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let rust_module = rust_bridge_module(&ruby).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let input_r = liquid_value_to_ruby(&ruby, &input.to_value()).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let prop = self.positional[0].evaluate(runtime)?.into_owned().to_kstr().to_string();
+        let prop_r = ruby.str_new(&prop).into_value_with(&ruby);
+        let target_val = self.positional[1].evaluate(runtime)?.into_owned();
+        let target_r = liquid_value_to_ruby(&ruby, &target_val).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let result = rust_module
+            .funcall::<_, _, Value>("find_filter_fast", (input_r, prop_r, target_r))
+            .map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let mut conv = LiquidValueConverter::new(&ruby).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        conv.convert(result).map_err(|e| LiquidError::with_msg(e.to_string()))
+    }
+}
+
+#[derive(Clone)]
+struct AbsoluteUrlFilterParser;
+impl FilterReflection for AbsoluteUrlFilterParser {
+    fn name(&self) -> &str { "absolute_url" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for AbsoluteUrlFilterParser {
+    fn parse(&self, _arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        Ok(Box::new(AbsoluteUrlFilter))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct AbsoluteUrlFilter;
+impl fmt::Display for AbsoluteUrlFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "absolute_url") } }
+impl Filter for AbsoluteUrlFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, _runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        let ruby = ruby_handle().map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let rust_module = rust_bridge_module(&ruby).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let ctx_opt = RUBY_FILTER_CONTEXT.with(|cell| cell.borrow().clone());
+        let Some(ctx) = ctx_opt else { return Err(LiquidError::with_msg("Ruby filter context unavailable")); };
+        let regs: Value = ctx.context.funcall("registers", ()).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let site_key = ruby.sym_new("site").into_value_with(&ruby);
+        let site: Value = regs.funcall("[]", (site_key,)).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let input_r = liquid_value_to_ruby(&ruby, &input.to_value()).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let result = rust_module
+            .funcall::<_, _, Value>("url_filters_absolute_url", (site, input_r))
+            .map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let mut conv = LiquidValueConverter::new(&ruby).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        conv.convert(result).map_err(|e| LiquidError::with_msg(e.to_string()))
+    }
+}
+
+#[derive(Clone)]
+struct RelativeUrlFilterParser;
+impl FilterReflection for RelativeUrlFilterParser {
+    fn name(&self) -> &str { "relative_url" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for RelativeUrlFilterParser {
+    fn parse(&self, _arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        Ok(Box::new(RelativeUrlFilter))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct RelativeUrlFilter;
+impl fmt::Display for RelativeUrlFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "relative_url") } }
+impl Filter for RelativeUrlFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, _runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        let ruby = ruby_handle().map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let rust_module = rust_bridge_module(&ruby).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let ctx_opt = RUBY_FILTER_CONTEXT.with(|cell| cell.borrow().clone());
+        let Some(ctx) = ctx_opt else { return Err(LiquidError::with_msg("Ruby filter context unavailable")); };
+        let regs: Value = ctx.context.funcall("registers", ()).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let site_key = ruby.sym_new("site").into_value_with(&ruby);
+        let site: Value = regs.funcall("[]", (site_key,)).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let input_r = liquid_value_to_ruby(&ruby, &input.to_value()).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let result = rust_module
+            .funcall::<_, _, Value>("url_filters_relative_url", (site, input_r))
+            .map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let mut conv = LiquidValueConverter::new(&ruby).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        conv.convert(result).map_err(|e| LiquidError::with_msg(e.to_string()))
+    }
+}
+
+#[derive(Clone)]
+struct StripIndexFilterParser;
+impl FilterReflection for StripIndexFilterParser {
+    fn name(&self) -> &str { "strip_index" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for StripIndexFilterParser {
+    fn parse(&self, _arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        Ok(Box::new(StripIndexFilter))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct StripIndexFilter;
+impl fmt::Display for StripIndexFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "strip_index") } }
+impl Filter for StripIndexFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, _runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        let ruby = ruby_handle().map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let rust_module = rust_bridge_module(&ruby).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let input_r = liquid_value_to_ruby(&ruby, &input.to_value()).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let result = rust_module
+            .funcall::<_, _, Value>("url_filters_strip_index", (input_r,))
+            .map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let mut conv = LiquidValueConverter::new(&ruby).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        conv.convert(result).map_err(|e| LiquidError::with_msg(e.to_string()))
+    }
+}
+
+
 struct RubyFilter {
     name: String,
     positional: Vec<Expression>,
@@ -1157,7 +1449,18 @@ fn fetch_filter_names(_ruby: &Ruby, rust_module: RModule) -> Result<Vec<String>,
             let name: String = String::try_convert(value)?;
             // Prefer Rust-native implementations for certain core filters to avoid
             // semantic mismatches with bridged Ruby behavior.
-            if name == "map" || name == "join" {
+            // Exclude filters we implement natively below.
+            if name == "map"
+                || name == "join"
+                || name == "where"
+                || name == "where_exp"
+                || name == "sort"
+                || name == "group_by"
+                || name == "find"
+                || name == "absolute_url"
+                || name == "relative_url"
+                || name == "strip_index"
+            {
                 continue;
             }
             names.push(name);
@@ -1526,6 +1829,16 @@ pub fn render_template(
     for name in &filter_names {
         builder = builder.filter(RubyFilterParser::new(name.clone()));
     }
+    // Register native Jekyll filters implemented via Rust fast paths
+    builder = builder
+        .filter(WhereFilterParser)
+        .filter(WhereExpFilterParser)
+        .filter(SortFilterParser)
+        .filter(GroupByFilterParser)
+        .filter(FindFilterParser)
+        .filter(AbsoluteUrlFilterParser)
+        .filter(RelativeUrlFilterParser)
+        .filter(StripIndexFilterParser);
     let (mut tag_names, mut block_names) = fetch_tag_kinds(&ruby, rust_module)?;
     // Ensure core Jekyll blocks are recognized even if not present in Liquid::Template.tags yet
     if !block_names.iter().any(|n| n.eq_ignore_ascii_case("highlight")) {
