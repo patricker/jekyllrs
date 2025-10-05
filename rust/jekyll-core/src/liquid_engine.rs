@@ -1260,6 +1260,78 @@ impl Filter for GroupByFilter {
 }
 
 #[derive(Clone)]
+struct MapFilterParser;
+impl FilterReflection for MapFilterParser {
+    fn name(&self) -> &str { "map" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for MapFilterParser {
+    fn parse(&self, mut arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        let positional: Vec<Expression> = arguments.positional.by_ref().collect();
+        Ok(Box::new(MapFilter { positional }))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct MapFilter { positional: Vec<Expression> }
+impl fmt::Display for MapFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "map") } }
+impl Filter for MapFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        if self.positional.is_empty() { return Ok(LiquidValue::Nil); }
+        let ruby = ruby_handle().map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let rust_module = rust_bridge_module(&ruby).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let input_r = liquid_value_to_ruby(&ruby, &input.to_value()).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let prop = self.positional[0].evaluate(runtime)?.into_owned().to_kstr().to_string();
+        let prop_r = ruby.str_new(&prop).into_value_with(&ruby);
+        let result = rust_module
+            .funcall::<_, _, Value>("map_filter_fast", (input_r, prop_r))
+            .map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        let mut conv = LiquidValueConverter::new(&ruby).map_err(|e| LiquidError::with_msg(e.to_string()))?;
+        conv.convert(result).map_err(|e| LiquidError::with_msg(e.to_string()))
+    }
+}
+
+#[derive(Clone)]
+struct JoinFilterParser;
+impl FilterReflection for JoinFilterParser {
+    fn name(&self) -> &str { "join" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for JoinFilterParser {
+    fn parse(&self, mut arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        let positional: Vec<Expression> = arguments.positional.by_ref().collect();
+        Ok(Box::new(JoinFilter { positional }))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct JoinFilter { positional: Vec<Expression> }
+impl fmt::Display for JoinFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "join") } }
+impl Filter for JoinFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        let delim = if let Some(expr) = self.positional.get(0) {
+            expr.evaluate(runtime)?.into_owned().to_kstr().to_string()
+        } else {
+            " ".to_string()
+        };
+        if let Some(arr) = input.as_array() {
+            let mut parts: Vec<String> = Vec::with_capacity(arr.size() as usize);
+            for i in 0..arr.size() {
+                if let Some(v) = arr.get(i) {
+                    parts.push(v.to_kstr().to_string());
+                }
+            }
+            return Ok(LiquidValue::scalar(parts.join(&delim)));
+        }
+        Ok(LiquidValue::Nil)
+    }
+}
+
+#[derive(Clone)]
 struct FindFilterParser;
 impl FilterReflection for FindFilterParser {
     fn name(&self) -> &str { "find" }
@@ -1954,6 +2026,8 @@ pub fn render_template(
     }
     // Register native Jekyll filters implemented via Rust fast paths
     builder = builder
+        .filter(MapFilterParser)
+        .filter(JoinFilterParser)
         .filter(WhereFilterParser)
         .filter(WhereExpFilterParser)
         .filter(SortFilterParser)

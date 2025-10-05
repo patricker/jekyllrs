@@ -9,6 +9,14 @@ module Jekyll
       # Accumulates per-hook timings
       @hook_stats = Hash.new { |h, k| h[k] = Hash.new { |h2, k2| h2[k2] = { :count => 0, :total => 0.0 } } }
       @hook_stats_mutex = Mutex.new
+
+      # Ensure hook timing structures are initialized (defensive against reloads)
+      def ensure_hook_stats!
+        @hook_stats ||= Hash.new do |h, k|
+          h[k] = Hash.new { |h2, k2| h2[k2] = { :count => 0, :total => 0.0 } }
+        end
+        @hook_stats_mutex ||= Mutex.new
+      end
       def liquid_filter_names
         ensure_loaded!
         strainer = Liquid::Strainer.send(:class_variable_get, :@@global_strainer)
@@ -358,12 +366,14 @@ module Jekyll
       # Hook hub entrypoint (centralized path for plugins)
       # Times execution and logs at debug level; exceptions propagate unchanged.
       def hooks_trigger(owner, event, *args)
+        ensure_hook_stats!
         start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         Jekyll::Hooks.trigger(owner, event, *args)
       ensure
         elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start
         # Aggregate per-hook stats safely
         begin
+          ensure_hook_stats!
           @hook_stats_mutex.synchronize do
             stats = @hook_stats[owner.to_sym][event.to_sym]
             stats[:count] += 1
@@ -380,18 +390,31 @@ module Jekyll
 
       # Reset accumulated hook stats
       def hooks_reset
+        ensure_hook_stats!
         @hook_stats_mutex.synchronize { @hook_stats.clear }
       end
 
       # Print a tabulated summary of hook timings if enabled
       # Shows when config['profile_hooks'] is truthy or logger is in debug mode
       def hooks_log_summary(site)
+        ensure_hook_stats!
         cfg = site.respond_to?(:config) ? site.config : {}
         enabled = (cfg && (cfg['profile_hooks'] || cfg['profile'])) || (Jekyll.logger.level == :debug)
         return unless enabled
         rows = [["HOOK", "CALLS", "TOTAL_S", "AVG_MS"]]
+        # Snapshot without Marshal to avoid dumping Hash with default proc
         snapshot = nil
-        @hook_stats_mutex.synchronize { snapshot = Marshal.load(Marshal.dump(@hook_stats)) }
+        @hook_stats_mutex.synchronize do
+          snap = {}
+          @hook_stats.each do |owner, events|
+            ev = {}
+            events.each do |event, st|
+              ev[event] = { :count => st[:count], :total => st[:total] }
+            end
+            snap[owner] = ev
+          end
+          snapshot = snap
+        end
         snapshot.each do |owner, events|
           events.each do |event, st|
             total = st[:total]; count = st[:count]
@@ -623,6 +646,11 @@ module Jekyll
       def find_filter_fast(input, property, value)
         ensure_loaded!
         Bridge.find_filter_fast(input, property, value)
+      end
+
+      def map_filter_fast(input, property)
+        ensure_loaded!
+        Bridge.map_filter_fast(input, property)
       end
 
       private

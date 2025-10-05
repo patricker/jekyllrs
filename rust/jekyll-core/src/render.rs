@@ -1096,6 +1096,13 @@ fn render_liquid_template(
         }
     }
 
+    // Update LiquidRenderer stats for this template when a path is known (profile output)
+    if let Some(ref p) = path {
+        let liquid_renderer: Value = _site.funcall::<_, _, Value>("liquid_renderer", ())?;
+        let file = liquid_renderer.funcall::<_, _, Value>("file", (p.clone(),))?;
+        let _ = file.funcall::<_, _, Value>("parse", (content,))?;
+    }
+
     // Render using Rust Liquid engine
 
     // In strict modes, delegate rendering to Ruby Liquid to match error semantics exactly

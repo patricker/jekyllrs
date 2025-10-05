@@ -158,6 +158,7 @@ pub fn define_into(bridge: &RModule) -> Result<(), Error> {
     bridge.define_singleton_method("group_by_fast", function!(group_by_fast, 2))?;
     bridge.define_singleton_method("find_filter_fast", function!(find_filter_fast, 3))?;
     bridge.define_singleton_method("where_exp_fast", function!(where_exp_fast, 3))?;
+    bridge.define_singleton_method("map_filter_fast", function!(map_filter_fast, 2))?;
     Ok(())
 }
 
@@ -1087,4 +1088,21 @@ fn find_filter_fast(input: Value, property: Value, target: Value) -> Result<Valu
         }
     }
     Ok(ruby.qnil().into_value_with(&ruby))
+}
+
+fn map_filter_fast(input: Value, property: Value) -> Result<Value, Error> {
+    let ruby = ruby_handle()?;
+    let arr = match RArray::from_value(input) {
+        Some(a) => a,
+        None => return Ok(ruby.qnil().into_value_with(&ruby)),
+    };
+    let prop = property.funcall::<_, _, RString>("to_s", ())?.to_string()?;
+    let out = ruby.ary_new();
+    let len: i64 = i64::try_convert(arr.funcall("length", ())?)?;
+    for i in 0..len {
+        let obj: Value = arr.funcall("[]", (i,))?;
+        let val = fetch_nested_prop(&ruby, obj, &prop)?;
+        out.push(val)?;
+    }
+    Ok(out.into_value_with(&ruby))
 }

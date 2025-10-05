@@ -139,8 +139,8 @@ Got it—no runtime fallbacks to Ruby, no “compat flags,” and `jekyllrs` is 
 
   * [x] Filters: for filters not implemented in Rust, marshal args to Ruby and run the Ruby filter (arity resolved by Liquid), fast‑path common scalars/arrays/maps.
   * [x] Tags: tag provider that defers to Ruby’s tag class with body capture when needed.
-  * [x] Implement core Jekyll filters natively in Rust (`where`, `where_exp`, `sort`, `group_by`, URL helpers) and keep the bridge for everything else.
-    - Implemented: `where`, `where_exp`, `sort` (with `nils:` positional and keyword), `group_by`, `find`, URL helpers (`absolute_url`, `relative_url`, `strip_index`), and collection utilities (`uniq`, `compact`).
+  * [x] Implement core Jekyll filters natively in Rust (`map`, `join`, `where`, `where_exp`, `sort`, `group_by`, URL helpers) and keep the bridge for everything else.
+    - Implemented: `map`, `join`, `where`, `where_exp`, `sort` (with `nils:` positional and keyword), `group_by`, `find`, URL helpers (`absolute_url`, `relative_url`, `strip_index`), and collection utilities (`uniq`, `compact`).
     *Files:* `rust/jekyll-core/src/liquid_engine.rs`, `rust/jekyll-core/src/utils.rs`.
 
 * **Drop semantics**
