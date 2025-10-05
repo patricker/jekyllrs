@@ -93,6 +93,9 @@ pub(crate) fn engine_build_process(options: Value) -> Result<Value, Error> {
         if let Some(ref timings) = timings {
             crate::engine::emit_build_summary(site, timings)?;
         }
+        // Emit hook summary if enabled (profile/profile_hooks)
+        let rust: RModule = jekyll.const_get("Rust")?;
+        let _ = rust.funcall::<_, _, Value>("hooks_log_summary", (site,))?;
     }
 
     // Watch handling
