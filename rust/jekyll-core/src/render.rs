@@ -323,7 +323,6 @@ pub fn define_into(bridge: &RModule) -> Result<(), Error> {
 
 struct RenderingContext<'ruby> {
     ruby: &'ruby Ruby,
-    hooks: RModule,
     logger: Value,
     liquid_renderer_class: Value,
     utils: Value,
@@ -337,7 +336,6 @@ struct RenderingContext<'ruby> {
 impl<'ruby> RenderingContext<'ruby> {
     fn new(ruby: &'ruby Ruby) -> Result<Self, Error> {
         let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
-        let hooks: RModule = jekyll.const_get("Hooks")?;
         let logger: Value = jekyll.funcall::<_, _, Value>("logger", ())?;
         let liquid_renderer_class: Value = jekyll.const_get("LiquidRenderer")?;
         let utils: Value = jekyll.const_get("Utils")?;
@@ -352,7 +350,6 @@ impl<'ruby> RenderingContext<'ruby> {
             .and_then(|markdown_class| markdown_class.const_get::<_, RClass>("KramdownParser").ok());
         Ok(Self {
             ruby,
-            hooks,
             logger,
             liquid_renderer_class,
             utils,
@@ -658,20 +655,21 @@ pub(crate) fn render_site(site: Value) -> Result<(), Error> {
     let payload: Value = site.funcall::<_, _, Value>("site_payload", ())?;
     let layouts: Value = site.funcall::<_, _, Value>("layouts", ())?;
 
-    let site_symbol = ctx.symbol("site");
     let pre_render_symbol = ctx.symbol("pre_render");
     let post_render_symbol = ctx.symbol("post_render");
 
-    ctx.hooks
-        .funcall::<_, _, Value>("trigger", (site_symbol, pre_render_symbol, site, payload))?;
+    // Centralized site-level hooks via Bridge
+    let jekyll: RModule = ctx.ruby.class_object().const_get("Jekyll")?;
+    let rust: RModule = jekyll.const_get("Rust")?;
+    let bridge: RModule = rust.const_get("Bridge")?;
+    let _ = bridge.funcall::<_, _, Value>("hook_trigger_site", (site, pre_render_symbol, payload))?;
 
     let regenerator: Value = site.funcall::<_, _, Value>("regenerator", ())?;
 
     render_collections(&ctx, site, payload, layouts, regenerator)?;
     render_pages(&ctx, site, payload, layouts, regenerator)?;
 
-    ctx.hooks
-        .funcall::<_, _, Value>("trigger", (site_symbol, post_render_symbol, site, payload))?;
+    let _ = bridge.funcall::<_, _, Value>("hook_trigger_site", (site, post_render_symbol, payload))?;
     Ok(())
 }
 
@@ -835,7 +833,10 @@ fn render_collections(
                 if should_render(&regenerator, document)? {
                     let output = render_document(ctx, site, document, payload, layouts)?;
                     document.funcall::<_, _, Value>("output=", (output,))?;
-                    document.funcall::<_, _, Value>("trigger_hooks", (post_render_symbol,))?;
+                    let jekyll: RModule = ctx.ruby.class_object().const_get("Jekyll")?;
+                    let rust: RModule = jekyll.const_get("Rust")?;
+                    let bridge: RModule = rust.const_get("Bridge")?;
+                    let _ = bridge.funcall::<_, _, Value>("hook_trigger_document", (document, post_render_symbol, ctx.ruby.qnil().into_value_with(ctx.ruby)))?;
                 }
             }
         }
@@ -864,7 +865,10 @@ fn render_pages(
         if should_render(&regenerator, document)? {
             let output = render_document(ctx, site, document, payload, layouts)?;
             document.funcall::<_, _, Value>("output=", (output,))?;
-            document.funcall::<_, _, Value>("trigger_hooks", (post_render_symbol,))?;
+            let jekyll: RModule = ctx.ruby.class_object().const_get("Jekyll")?;
+            let rust: RModule = jekyll.const_get("Rust")?;
+            let bridge: RModule = rust.const_get("Bridge")?;
+            let _ = bridge.funcall::<_, _, Value>("hook_trigger_document", (document, post_render_symbol, ctx.ruby.qnil().into_value_with(ctx.ruby)))?;
         }
     }
 
@@ -1506,7 +1510,11 @@ fn render_document(
 
     log_debug(ctx, "Pre-Render Hooks:", relative_path)?;
     let pre_render_symbol = ctx.symbol("pre_render");
-    document.funcall::<_, _, Value>("trigger_hooks", (pre_render_symbol, payload))?;
+    // Centralized hook firing via Bridge
+    let jekyll: RModule = ctx.ruby.class_object().const_get("Jekyll")?;
+    let rust: RModule = jekyll.const_get("Rust")?;
+    let bridge: RModule = rust.const_get("Bridge")?;
+    let _ = bridge.funcall::<_, _, Value>("hook_trigger_document", (document, pre_render_symbol, payload))?;
 
     let info = build_render_info(ctx, site, payload)?;
 
@@ -1534,7 +1542,7 @@ fn render_document(
 
     log_debug(ctx, "Post-Convert Hooks:", relative_path)?;
     let post_convert_symbol = ctx.symbol("post_convert");
-    document.funcall::<_, _, Value>("trigger_hooks", (post_convert_symbol,))?;
+    let _ = bridge.funcall::<_, _, Value>("hook_trigger_document", (document, post_convert_symbol, ctx.ruby.qnil().into_value_with(ctx.ruby)))?;
 
     output = document.funcall::<_, _, Value>("content", ())?;
 

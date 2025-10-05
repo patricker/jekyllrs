@@ -225,6 +225,7 @@ Got it—no runtime fallbacks to Ruby, no “compat flags,” and `jekyllrs` is 
 * **Hook hub**
 
   * [ ] A single Rust module that fires `:pre_render`, `:post_render`, `:post_write`, generators, etc., in the exact order.
+    - [x] Site-level `:pre_render`/`:post_render` routed via `Bridge.hook_trigger_site` (centralized + profiled)
   * [ ] Maintain object identity where plugins expect it; cache Ruby wrappers for frequently accessed Rust structs.
 
 * **Profiling**

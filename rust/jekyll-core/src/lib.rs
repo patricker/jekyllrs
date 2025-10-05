@@ -13,6 +13,7 @@ mod fs_walk;
 mod include_tag;
 mod liquid;
 mod liquid_engine;
+mod hook_hub;
 mod merge;
 mod path_manager;
 mod reader;
@@ -70,6 +71,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     cli_serve::define_into(&bridge)?;
     reader::define_into(&bridge)?;
     include_tag::define_into(&bridge)?;
+    hook_hub::define_into(&bridge)?;
     render::define_into(&bridge)?;
 
     Ok(())
