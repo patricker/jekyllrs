@@ -387,7 +387,7 @@ module Jekyll
       # Shows when config['profile_hooks'] is truthy or logger is in debug mode
       def hooks_log_summary(site)
         cfg = site.respond_to?(:config) ? site.config : {}
-        enabled = (cfg && cfg['profile_hooks']) || (Jekyll.logger.level == :debug)
+        enabled = (cfg && (cfg['profile_hooks'] || cfg['profile'])) || (Jekyll.logger.level == :debug)
         return unless enabled
         rows = [["HOOK", "CALLS", "TOTAL_S", "AVG_MS"]]
         snapshot = nil

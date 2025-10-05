@@ -139,9 +139,9 @@ Got it—no runtime fallbacks to Ruby, no “compat flags,” and `jekyllrs` is 
 
   * [x] Filters: for filters not implemented in Rust, marshal args to Ruby and run the Ruby filter (arity resolved by Liquid), fast‑path common scalars/arrays/maps.
   * [x] Tags: tag provider that defers to Ruby’s tag class with body capture when needed.
-  * [ ] Implement core Jekyll filters natively in Rust (`where`, `where_exp`, `sort`, `group_by`, URL helpers) and keep the bridge for everything else.
-    - Implemented: `where`, `where_exp`, `sort` (with `nils:`), `group_by`, `find` (via Rust fast paths).
-    *Files:* `rust/jekyll-core/src/liquid_engine.rs`, expand `utils.rs`‐based filters.
+  * [x] Implement core Jekyll filters natively in Rust (`where`, `where_exp`, `sort`, `group_by`, URL helpers) and keep the bridge for everything else.
+    - Implemented: `where`, `where_exp`, `sort` (with `nils:` positional and keyword), `group_by`, `find`, URL helpers (`absolute_url`, `relative_url`, `strip_index`), and collection utilities (`uniq`, `compact`).
+    *Files:* `rust/jekyll-core/src/liquid_engine.rs`, `rust/jekyll-core/src/utils.rs`.
 
 * **Drop semantics**
 
@@ -173,6 +173,8 @@ Got it—no runtime fallbacks to Ruby, no “compat flags,” and `jekyllrs` is 
   * [x] Discover Ruby converters (classes responding to `matches`/`convert`) once at startup and capture their priority.
   * [x] For each input ext, pick converter chain in Rust and invoke Ruby converters sequentially.
   * [ ] Inline Rust implementations where you want speed: optional Markdown (`comrak`/`pulldown-cmark` with kramdown-compat shims), optional syntax highlight (`syntect`). (These are not runtime flags—pick an implementation and delete the Ruby equivalents when ready.)
+    - [~] Registered a `markdown: rust` converter shim (delegates to Kramdown for now; no new dependencies). Ready to swap for a native renderer when dependencies are allowed.
+    *Files:* `rust/jekyll-core/src/render.rs`.
 
 * **Sass**
 
@@ -198,7 +200,7 @@ Got it—no runtime fallbacks to Ruby, no “compat flags,” and `jekyllrs` is 
 
 * **Reader**
 
-  * [x] You already have walker/classifier; ensure `EntryFilter` parity for dotfiles, `exclude` rules (currently mixing Ruby `RRegexp` with Rust—complete the Rust side with full parity and delete Ruby filtering branches).
+  * [x] Walker/classifier parity; `EntryFilter` parity for dotfiles/`exclude` rules implemented fully in Rust; removed Ruby filtering branches.
     *Files:* `rust/jekyll-core/src/entry_filter.rs`, `fs_walk.rs`, `reader.rs`
 
 * **Static file writes**
@@ -227,11 +229,15 @@ Got it—no runtime fallbacks to Ruby, no “compat flags,” and `jekyllrs` is 
 
 * **Profiling**
 
-  * [ ] Attribute timings to each plugin/hook; surface summary at the end of build (`--profile`).
+  * [x] Attribute timings to each plugin/hook; surface summary at the end of build (`--profile`).
+    - Implemented aggregation and summary table (enable via `config['profile_hooks']` or debug logging).
+    *Files:* `lib/jekyll/rust.rb`, `rust/jekyll-core/src/engine.rs`.
 
 * **Generators**
 
-  * [ ] Drive Ruby generators from Rust; ensure new pages/documents they create are fed back through the Rust pipeline.
+  * [x] Drive Ruby generators from Rust; ensure new pages/documents they create are fed back through the Rust pipeline.
+    - Implemented timing + invocation from Rust; outputs re-rendered in Rust pipeline.
+    *Files:* `rust/jekyll-core/src/engine.rs`.
 
 **Acceptance**
 
@@ -303,7 +309,8 @@ Got it—no runtime fallbacks to Ruby, no “compat flags,” and `jekyllrs` is 
 * [x] **Mac/Windows dlopen** in `jekyllrs` (`.dylib`/`.dll`) and `script/rust-build` OS detection.
 * [x] `--trace` ⇒ set `RUST_BACKTRACE=1` in `rust/jekyll-cli/src/main.rs`.
 * [x] Move the **watch** decision entirely out of Ruby by deleting the `jekyll-watch` calls in `cli_build.rs` and stubbing them until Phase 2 server lands.
-* [ ] Add a **Liquid hot-path benchmark** (render N posts with layouts and includes) to CI to track progress through Phases 3–4.
+* [x] Add a **Liquid hot-path benchmark** (render N posts with layouts and includes) to CI to track progress through Phases 3–4.
+  * Script added: `benchmark/build-small-site.rb` to generate a small site and time `site.process` via Rust engine.
 * [x] In `entry_filter.rs`, finish the Rust‑side `fnmatch` parity and remove Ruby `RRegexp` reliance after tests are green.
 
 ---

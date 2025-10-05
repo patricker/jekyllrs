@@ -252,8 +252,6 @@ impl RustConverter for KramdownConverter {
 struct RustMdShimConverter;
 
 impl RustMdShimConverter {
-    fn default_extensions() -> &'static [&'static str] { KramdownConverter::default_extensions() }
-
     fn extensions_from_config(
         &self,
         ctx: &RenderingContext,
@@ -265,9 +263,7 @@ impl RustMdShimConverter {
     fn is_rust_markdown_enabled(&self, ctx: &RenderingContext, config: Value) -> Result<bool, Error> {
         let markdown_key = ctx.str("markdown");
         let markdown_engine: Value = config.funcall("[]", (markdown_key,))?;
-        if markdown_engine.is_nil() {
-            return Ok(false);
-        }
+        if markdown_engine.is_nil() { return Ok(false); }
         let engine = String::try_convert(markdown_engine)?;
         Ok(engine.eq_ignore_ascii_case("rust"))
     }
@@ -276,27 +272,13 @@ impl RustMdShimConverter {
 impl RustConverter for RustMdShimConverter {
     fn name(&self) -> &'static str { "RustMarkdownShim" }
     fn priority(&self) -> i32 { 5 }
-
-    fn matches(
-        &self,
-        ctx: &RenderingContext,
-        site: Value,
-        ext: &str,
-    ) -> Result<bool, Error> {
+    fn matches(&self, ctx: &RenderingContext, site: Value, ext: &str) -> Result<bool, Error> {
         let config: Value = site.funcall("config", ())?;
         if !self.is_rust_markdown_enabled(ctx, config)? { return Ok(false); }
         let extensions = self.extensions_from_config(ctx, config)?;
         Ok(extensions.iter().any(|candidate| candidate.eq_ignore_ascii_case(ext)))
     }
-
-    fn convert(
-        &self,
-        ctx: &RenderingContext,
-        site: Value,
-        _document: Value,
-        content: Value,
-    ) -> Result<Value, Error> {
-        // Use the existing Kramdown parser for correctness until we wire a native engine.
+    fn convert(&self, ctx: &RenderingContext, site: Value, _document: Value, content: Value) -> Result<Value, Error> {
         let parser_class = match KRAMDOWN_CONVERTER.parser_class(ctx) {
             Some(class) => class,
             None => {
@@ -311,21 +293,10 @@ impl RustConverter for RustMdShimConverter {
         let parser_instance: Value = parser_class.funcall("new", (config_dup,))?;
         parser_instance.funcall("convert", (content,))
     }
-
-    fn output_ext(
-        &self,
-        ctx: &RenderingContext,
-        _site: Value,
-        _original_ext: Value,
-    ) -> Result<Option<Value>, Error> {
+    fn output_ext(&self, ctx: &RenderingContext, _site: Value, _original_ext: Value) -> Result<Option<Value>, Error> {
         Ok(Some(ctx.str(".html")))
     }
-
-    fn highlighter_options(
-        &self,
-        ctx: &RenderingContext,
-        _site: Value,
-    ) -> Result<Option<(Value, Value)>, Error> {
+    fn highlighter_options(&self, ctx: &RenderingContext, _site: Value) -> Result<Option<(Value, Value)>, Error> {
         Ok(Some((ctx.str("\n"), ctx.str("\n"))))
     }
 }

@@ -68,7 +68,7 @@ module Jekyll
       when ".json"
         Jekyll::Rust.json_load_file(path)
       else
-        # Use the Rust YAML loader for YAML and JSON (JSON is a YAML subset)
+        # Use the Rust YAML loader for YAML
         Jekyll::Rust.yaml_load_file(path)
       end
     end
