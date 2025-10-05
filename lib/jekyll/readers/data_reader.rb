@@ -62,11 +62,14 @@ module Jekyll
 
       case File.extname(path).downcase
       when ".csv"
-        CSV.read(path, **csv_config).map { |row| convert_row(row) }
+        Jekyll::Rust.data_reader_csv_read(path, csv_config).map { |row| convert_row(row) }
       when ".tsv"
-        CSV.read(path, **tsv_config).map { |row| convert_row(row) }
+        Jekyll::Rust.data_reader_tsv_read(path, tsv_config).map { |row| convert_row(row) }
+      when ".json"
+        Jekyll::Rust.json_load_file(path)
       else
-        SafeYAML.load_file(path)
+        # Use the Rust YAML loader for YAML and JSON (JSON is a YAML subset)
+        Jekyll::Rust.yaml_load_file(path)
       end
     end
 

@@ -107,6 +107,7 @@ static RUST_CONVERTERS: Lazy<Mutex<Vec<&'static dyn RustConverter>>> = Lazy::new
 });
 
 static KRAMDOWN_CONVERTER: KramdownConverter = KramdownConverter;
+static RUST_MD_SHIM_CONVERTER: RustMdShimConverter = RustMdShimConverter;
 
 fn rust_converters() -> Vec<&'static dyn RustConverter> {
     let guard = RUST_CONVERTERS
@@ -246,7 +247,91 @@ impl RustConverter for KramdownConverter {
     }
 }
 
+// A shim that allows using Ruby's Kramdown parser when `markdown: rust` is set.
+// This scaffolds a Rust-native Markdown converter slot without changing behavior yet.
+struct RustMdShimConverter;
+
+impl RustMdShimConverter {
+    fn default_extensions() -> &'static [&'static str] { KramdownConverter::default_extensions() }
+
+    fn extensions_from_config(
+        &self,
+        ctx: &RenderingContext,
+        config: Value,
+    ) -> Result<Vec<String>, Error> {
+        KRAMDOWN_CONVERTER.extensions_from_config(ctx, config)
+    }
+
+    fn is_rust_markdown_enabled(&self, ctx: &RenderingContext, config: Value) -> Result<bool, Error> {
+        let markdown_key = ctx.str("markdown");
+        let markdown_engine: Value = config.funcall("[]", (markdown_key,))?;
+        if markdown_engine.is_nil() {
+            return Ok(false);
+        }
+        let engine = String::try_convert(markdown_engine)?;
+        Ok(engine.eq_ignore_ascii_case("rust"))
+    }
+}
+
+impl RustConverter for RustMdShimConverter {
+    fn name(&self) -> &'static str { "RustMarkdownShim" }
+    fn priority(&self) -> i32 { 5 }
+
+    fn matches(
+        &self,
+        ctx: &RenderingContext,
+        site: Value,
+        ext: &str,
+    ) -> Result<bool, Error> {
+        let config: Value = site.funcall("config", ())?;
+        if !self.is_rust_markdown_enabled(ctx, config)? { return Ok(false); }
+        let extensions = self.extensions_from_config(ctx, config)?;
+        Ok(extensions.iter().any(|candidate| candidate.eq_ignore_ascii_case(ext)))
+    }
+
+    fn convert(
+        &self,
+        ctx: &RenderingContext,
+        site: Value,
+        _document: Value,
+        content: Value,
+    ) -> Result<Value, Error> {
+        // Use the existing Kramdown parser for correctness until we wire a native engine.
+        let parser_class = match KRAMDOWN_CONVERTER.parser_class(ctx) {
+            Some(class) => class,
+            None => {
+                return Err(Error::new(
+                    ctx.ruby.exception_runtime_error(),
+                    "Kramdown parser class not available",
+                ))
+            }
+        };
+        let config: Value = site.funcall("config", ())?;
+        let config_dup: Value = config.funcall("dup", ())?;
+        let parser_instance: Value = parser_class.funcall("new", (config_dup,))?;
+        parser_instance.funcall("convert", (content,))
+    }
+
+    fn output_ext(
+        &self,
+        ctx: &RenderingContext,
+        _site: Value,
+        _original_ext: Value,
+    ) -> Result<Option<Value>, Error> {
+        Ok(Some(ctx.str(".html")))
+    }
+
+    fn highlighter_options(
+        &self,
+        ctx: &RenderingContext,
+        _site: Value,
+    ) -> Result<Option<(Value, Value)>, Error> {
+        Ok(Some((ctx.str("\n"), ctx.str("\n"))))
+    }
+}
+
 pub fn define_into(bridge: &RModule) -> Result<(), Error> {
+    register_rust_converter(&RUST_MD_SHIM_CONVERTER);
     register_rust_converter(&KRAMDOWN_CONVERTER);
 
     bridge.define_singleton_method("render_site", function!(render_site, 1))?;

@@ -23,7 +23,7 @@ module Jekyll
     # Returns an Array of the file and directory paths
     def obsolete_files
       out = (existing_files - new_files - new_dirs + replaced_files).to_a
-      Jekyll::Hooks.trigger :clean, :on_obsolete, out
+      Jekyll::Rust.hooks_trigger :clean, :on_obsolete, out
       out
     end
 

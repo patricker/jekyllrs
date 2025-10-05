@@ -6,6 +6,9 @@ require "liquid"
 module Jekyll
   module Rust
     class << self
+      # Accumulates per-hook timings
+      @hook_stats = Hash.new { |h, k| h[k] = Hash.new { |h2, k2| h2[k2] = { :count => 0, :total => 0.0 } } }
+      @hook_stats_mutex = Mutex.new
       def liquid_filter_names
         ensure_loaded!
         strainer = Liquid::Strainer.send(:class_variable_get, :@@global_strainer)
@@ -174,6 +177,11 @@ module Jekyll
       def yaml_load_file(path)
         ensure_loaded!
         Bridge.yaml_load_file(path)
+      end
+
+      def json_load_file(path)
+        ensure_loaded!
+        Bridge.json_load_file(path)
       end
 
       def safe_glob(dir, patterns, flags)
@@ -347,6 +355,62 @@ module Jekyll
         Bridge.render_site(site)
       end
 
+      # Hook hub entrypoint (centralized path for plugins)
+      # Times execution and logs at debug level; exceptions propagate unchanged.
+      def hooks_trigger(owner, event, *args)
+        start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        Jekyll::Hooks.trigger(owner, event, *args)
+      ensure
+        elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start
+        # Aggregate per-hook stats safely
+        begin
+          @hook_stats_mutex.synchronize do
+            stats = @hook_stats[owner.to_sym][event.to_sym]
+            stats[:count] += 1
+            stats[:total] += elapsed
+          end
+        rescue StandardError
+          # best-effort; ignore aggregation errors
+        end
+        # Avoid string allocations when debug disabled
+        if Jekyll.logger.level == :debug
+          Jekyll.logger.debug "Hooks:", "#{owner}.#{event} (#{format('%.6f', elapsed)}s)"
+        end
+      end
+
+      # Reset accumulated hook stats
+      def hooks_reset
+        @hook_stats_mutex.synchronize { @hook_stats.clear }
+      end
+
+      # Print a tabulated summary of hook timings if enabled
+      # Shows when config['profile_hooks'] is truthy or logger is in debug mode
+      def hooks_log_summary(site)
+        cfg = site.respond_to?(:config) ? site.config : {}
+        enabled = (cfg && cfg['profile_hooks']) || (Jekyll.logger.level == :debug)
+        return unless enabled
+        rows = [["HOOK", "CALLS", "TOTAL_S", "AVG_MS"]]
+        snapshot = nil
+        @hook_stats_mutex.synchronize { snapshot = Marshal.load(Marshal.dump(@hook_stats)) }
+        snapshot.each do |owner, events|
+          events.each do |event, st|
+            total = st[:total]; count = st[:count]
+            next if count <= 0
+            avg_ms = (total / count) * 1000.0
+            rows << [
+              "#{owner}.#{event}",
+              count.to_s,
+              format('%.6f', total),
+              format('%.3f', avg_ms),
+            ]
+          end
+        end
+        # Sort by TOTAL_S desc, then HOOK name
+        rows = [rows.first] + rows.drop(1).sort_by { |r| [-r[2].to_f, r[0]] }
+        table = Jekyll::Profiler.tabulate(rows)
+        Jekyll.logger.info "\nHook Summary:", table
+      end
+
       def renderer_run(site, document, payload = nil, layouts = nil)
         ensure_loaded!
         Bridge.renderer_run(site, document, payload, layouts)
@@ -443,6 +507,17 @@ module Jekyll
       def data_reader_entries(site, dir)
         ensure_loaded!
         Bridge.data_reader_entries(site, dir)
+      end
+
+      # CSV/TSV readers used by DataReader
+      def data_reader_csv_read(path, options)
+        ensure_loaded!
+        Bridge.data_reader_csv_read(path, options)
+      end
+
+      def data_reader_tsv_read(path, options)
+        ensure_loaded!
+        Bridge.data_reader_tsv_read(path, options)
       end
 
       def layout_entries(site, dir)

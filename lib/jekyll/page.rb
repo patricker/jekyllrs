@@ -53,7 +53,7 @@ module Jekyll
         site.frontmatter_defaults.find(relative_path, type, key)
       end
 
-      Jekyll::Hooks.trigger :pages, :post_init, self
+      Jekyll::Rust.hooks_trigger :pages, :post_init, self
     end
 
     # The generated directory into which the page will be placed
@@ -176,7 +176,7 @@ module Jekyll
     end
 
     def trigger_hooks(hook_name, *args)
-      Jekyll::Hooks.trigger :pages, hook_name, self, *args
+      Jekyll::Rust.hooks_trigger :pages, hook_name, self, *args
     end
 
     def write?

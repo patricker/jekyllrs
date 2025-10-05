@@ -415,7 +415,7 @@ impl fmt::Display for SafeValueArrayRender<'_> {
 /// Convert a `liquid::Value` back into a Ruby object.
 pub fn liquid_value_to_ruby(ruby: &Ruby, value: &LiquidValue) -> Result<Value, Error> {
     match value {
-        LiquidValue::Nil => Ok(ruby.qnil().into_value()),
+        LiquidValue::Nil => Ok(ruby.qnil().into_value_with(ruby)),
         LiquidValue::State(state) => {
             let stringified = state.to_string();
             Ok(ruby.str_new(stringified.as_str()).into_value_with(ruby))
@@ -429,9 +429,9 @@ pub fn liquid_value_to_ruby(ruby: &Ruby, value: &LiquidValue) -> Result<Value, E
 fn scalar_to_ruby(ruby: &Ruby, scalar: &liquid_model::Scalar) -> Result<Value, Error> {
     if let Some(boolean) = scalar.to_bool() {
         return Ok(if boolean {
-            ruby.qtrue().into_value()
+            ruby.qtrue().into_value_with(ruby)
         } else {
-            ruby.qfalse().into_value()
+            ruby.qfalse().into_value_with(ruby)
         });
     }
 
@@ -1206,7 +1206,11 @@ impl Filter for SortFilter {
             expr.evaluate(runtime)?.into_owned().to_kstr().to_string()
         } else { String::new() };
         let prop_r = ruby.str_new(&prop).into_value_with(&ruby);
-        let mut nils = "first".to_string();
+        let mut nils = if let Some(expr) = self.positional.get(1) {
+            expr.evaluate(runtime)?.into_owned().to_kstr().to_string()
+        } else {
+            "first".to_string()
+        };
         for (k, v) in &self.keyword {
             if k.eq_ignore_ascii_case("nils") {
                 nils = v.evaluate(runtime)?.into_owned().to_kstr().to_string();
@@ -1995,7 +1999,9 @@ pub fn render_template(
     // Determine strictness to configure SafeValue behavior
     let strict_variables = if let Some(hash) = RHash::from_value(info) {
         let key = ruby.str_new("strict_variables").into_value_with(&ruby);
-        let val = hash.aref(key).unwrap_or_else(|_| ruby.qfalse().into_value());
+        let val = hash
+            .aref(key)
+            .unwrap_or_else(|_| ruby.qfalse().into_value_with(&ruby));
         val.to_bool()
     } else {
         false

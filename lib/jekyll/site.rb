@@ -35,7 +35,7 @@ module Jekyll
       reset
       setup
 
-      Jekyll::Hooks.trigger :site, :after_init, self
+      Jekyll::Rust.hooks_trigger :site, :after_init, self
     end
 
     # Public: Set the site's configuration. This handles side-effects caused by
@@ -116,7 +116,7 @@ module Jekyll
       raise ArgumentError, "limit_posts must be a non-negative number" if limit_posts.negative?
 
       Jekyll::Cache.clear_if_config_changed config
-      Jekyll::Hooks.trigger :site, :after_reset, self
+      Jekyll::Rust.hooks_trigger :site, :after_reset, self
       nil
     end
     # rubocop:enable Metrics/MethodLength
@@ -180,7 +180,7 @@ module Jekyll
     def read
       reader.read
       limit_posts!
-      Jekyll::Hooks.trigger :site, :post_read, self
+      Jekyll::Rust.hooks_trigger :site, :post_read, self
       nil
     end
 
@@ -239,7 +239,7 @@ module Jekyll
       end
 
       regenerator.write_metadata
-      Jekyll::Hooks.trigger :site, :post_write, self
+      Jekyll::Rust.hooks_trigger :site, :post_write, self
       nil
     end
 

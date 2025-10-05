@@ -1005,7 +1005,7 @@ fn group_by_fast(input: Value, property: Value) -> Result<Value, Error> {
                 items.push(v).unwrap();
             }
         }
-        let h = RHash::new();
+        let h = ruby.hash_new();
         h.aset("name", ruby.str_new(&name))?;
         h.aset("items", items)?;
         let size = i64::try_convert(items.funcall("length", ())?)?;

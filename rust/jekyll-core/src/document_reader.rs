@@ -4,6 +4,7 @@ use magnus::{
 use once_cell::sync::OnceCell;
 use regex::Regex;
 use serde_yaml::{self, value::TaggedValue, Value as YamlValue};
+use serde_json::{self, Value as JsonValue};
 
 use crate::{
     ruby_utils::ruby_handle,
@@ -16,6 +17,7 @@ static DATE_REQUIRED: OnceCell<()> = OnceCell::new();
 pub fn define_into(bridge: &RModule) -> Result<(), Error> {
     bridge.define_singleton_method("document_read", function!(document_read, 2))?;
     bridge.define_singleton_method("yaml_load_file", function!(yaml_load_file, 1))?;
+    bridge.define_singleton_method("json_load_file", function!(json_load_file, 1))?;
     Ok(())
 }
 
@@ -138,6 +140,27 @@ fn yaml_load_file(path: String) -> Result<Value, Error> {
     }
 }
 
+fn json_load_file(path: String) -> Result<Value, Error> {
+    let ruby = ruby_handle()?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(Error::new(
+                ruby.exception_runtime_error(),
+                format!("failed to read JSON file {}: {}", path, e),
+            ))
+        }
+    };
+
+    match serde_json::from_str::<JsonValue>(&content) {
+        Ok(value) => json_value_to_ruby(&ruby, value),
+        Err(err) => Err(Error::new(
+            ruby.exception_runtime_error(),
+            format!("failed to parse JSON in {}: {}", path, err),
+        )),
+    }
+}
+
 fn yaml_value_to_ruby(ruby: &Ruby, value: YamlValue) -> Result<Value, Error> {
     match value {
         YamlValue::Null => Ok(ruby.qnil().into_value_with(ruby)),
@@ -176,6 +199,45 @@ fn yaml_value_to_ruby(ruby: &Ruby, value: YamlValue) -> Result<Value, Error> {
             Ok(hash.into_value_with(ruby))
         }
         YamlValue::Tagged(boxed) => yaml_tagged_value_to_ruby(ruby, *boxed),
+    }
+}
+
+fn json_value_to_ruby(ruby: &Ruby, value: JsonValue) -> Result<Value, Error> {
+    match value {
+        JsonValue::Null => Ok(ruby.qnil().into_value_with(ruby)),
+        JsonValue::Bool(b) => Ok(b.into_value_with(ruby)),
+        JsonValue::Number(num) => {
+            if let Some(i) = num.as_i64() {
+                Ok(i.into_value_with(ruby))
+            } else if let Some(u) = num.as_u64() {
+                if u <= i64::MAX as u64 {
+                    Ok((u as i64).into_value_with(ruby))
+                } else {
+                    Ok((u as f64).into_value_with(ruby))
+                }
+            } else if let Some(f) = num.as_f64() {
+                Ok(f.into_value_with(ruby))
+            } else {
+                Ok(ruby.qnil().into_value_with(ruby))
+            }
+        }
+        JsonValue::String(s) => Ok(ruby.str_new(&s).into_value_with(ruby)),
+        JsonValue::Array(arr) => {
+            let out = ruby.ary_new();
+            for item in arr {
+                out.push(json_value_to_ruby(ruby, item)?)?;
+            }
+            Ok(out.into_value_with(ruby))
+        }
+        JsonValue::Object(map) => {
+            let h = ruby.hash_new();
+            for (k, v) in map {
+                let key = ruby.str_new(&k);
+                let val = json_value_to_ruby(ruby, v)?;
+                h.aset(key, val)?;
+            }
+            Ok(h.into_value_with(ruby))
+        }
     }
 }
 

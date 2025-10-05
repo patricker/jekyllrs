@@ -1,5 +1,5 @@
 use magnus::{
-    function, prelude::*, Error, IntoValue, RArray, RHash, RModule, RString, Ruby, Symbol, Value,
+    function, prelude::*, Error, IntoValue, RArray, RHash, RModule, RString, Ruby, Value,
 };
 
 use crate::ruby_utils::ruby_handle;
@@ -20,6 +20,14 @@ pub fn define_into(bridge: &RModule) -> Result<(), Error> {
         "data_reader_entries",
         function!(data_reader_entries_native, 2),
     )?;
+    bridge.define_singleton_method(
+        "data_reader_csv_read",
+        function!(data_reader_csv_read, 2),
+    )?;
+    bridge.define_singleton_method(
+        "data_reader_tsv_read",
+        function!(data_reader_tsv_read, 2),
+    )?;
     bridge.define_singleton_method("layout_entries", function!(layout_entries_walk, 2))?;
     Ok(())
 }
@@ -30,15 +38,15 @@ fn reader_classify(site: Value, base: RString) -> Result<Value, Error> {
     let file: Value = ruby.class_object().const_get("File")?;
     let base_path = base.to_string()?;
     let is_dir: bool = file.funcall("directory?", (ruby.str_new(&base_path),))?;
-    let result = RHash::new();
+    let result = ruby.hash_new();
 
     let dirs = ruby.ary_new();
     let pages = ruby.ary_new();
     let statics = ruby.ary_new();
     if !is_dir {
-        result.aset(Symbol::new("dirs"), dirs)?;
-        result.aset(Symbol::new("pages"), pages)?;
-        result.aset(Symbol::new("static"), statics)?;
+        result.aset(ruby.to_symbol("dirs"), dirs)?;
+        result.aset(ruby.to_symbol("pages"), pages)?;
+        result.aset(ruby.to_symbol("static"), statics)?;
         return Ok(result.into_value_with(&ruby));
     }
 
@@ -72,9 +80,9 @@ fn reader_classify(site: Value, base: RString) -> Result<Value, Error> {
         }
     }
 
-    result.aset(Symbol::new("dirs"), dirs)?;
-    result.aset(Symbol::new("pages"), pages)?;
-    result.aset(Symbol::new("static"), statics)?;
+    result.aset(ruby.to_symbol("dirs"), dirs)?;
+    result.aset(ruby.to_symbol("pages"), pages)?;
+    result.aset(ruby.to_symbol("static"), statics)?;
     Ok(result.into_value_with(&ruby))
 }
 
@@ -197,10 +205,10 @@ fn reader_walk(site: Value, rel_dir: RString) -> Result<Value, Error> {
         &ruby, site, file, bridge, ef, &base_path, "", &pages, &statics, &dirs,
     )?;
 
-    let result = RHash::new();
-    result.aset(Symbol::new("pages"), pages)?;
-    result.aset(Symbol::new("static"), statics)?;
-    result.aset(Symbol::new("dirs"), dirs)?;
+    let result = ruby.hash_new();
+    result.aset(ruby.to_symbol("pages"), pages)?;
+    result.aset(ruby.to_symbol("static"), statics)?;
+    result.aset(ruby.to_symbol("dirs"), dirs)?;
     Ok(result.into_value_with(&ruby))
 }
 
@@ -393,11 +401,11 @@ fn data_reader_entries_native(site: Value, dir: RString) -> Result<Value, Error>
     let dir_str = dir.to_string()?;
 
     let is_dir: bool = file.funcall("directory?", (ruby.str_new(&dir_str),))?;
-    let result = RHash::new();
+    let result = ruby.hash_new();
     let files = ruby.ary_new();
     let dirs = ruby.ary_new();
-    result.aset(Symbol::new("files"), files)?;
-    result.aset(Symbol::new("dirs"), dirs)?;
+    result.aset(ruby.to_symbol("files"), files)?;
+    result.aset(ruby.to_symbol("dirs"), dirs)?;
 
     if !is_dir {
         return Ok(result.into_value_with(&ruby));
@@ -441,4 +449,35 @@ fn data_reader_entries_native(site: Value, dir: RString) -> Result<Value, Error>
     }
 
     Ok(result.into_value_with(&ruby))
+}
+
+fn csv_read_common(path: RString, options: Value) -> Result<Value, Error> {
+    let ruby = ruby_handle()?;
+    // Ensure CSV is available (jekyll.rb requires it, but be safe)
+    let _ = ruby.eval::<Value>("CSV");
+    let csv_mod: Value = ruby.class_object().const_get("CSV")?;
+
+    if let Some(hash) = RHash::from_value(options) {
+        // Ensure symbol keys for Ruby 3 keyword arguments
+        let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
+        let rust: RModule = jekyll.const_get("Rust")?;
+        let sym_hash_val: Value = rust.funcall("symbolize_hash_keys", (hash,))?;
+        let sym_hash = RHash::from_value(sym_hash_val).ok_or_else(|| {
+            Error::new(ruby.exception_runtime_error(), "expected Hash from symbolize_hash_keys")
+        })?;
+        let kwargs = magnus::KwArgs(sym_hash);
+        let result: Value = csv_mod.funcall("read", (path, kwargs))?;
+        Ok(result)
+    } else {
+        let result: Value = csv_mod.funcall("read", (path,))?;
+        Ok(result)
+    }
+}
+
+fn data_reader_csv_read(path: RString, options: Value) -> Result<Value, Error> {
+    csv_read_common(path, options)
+}
+
+fn data_reader_tsv_read(path: RString, options: Value) -> Result<Value, Error> {
+    csv_read_common(path, options)
 }

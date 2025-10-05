@@ -209,7 +209,7 @@ module Jekyll
       end.run
 
       Jekyll.logger.debug "Post-Render Hooks:", relative_path
-      Jekyll::Hooks.trigger hook_owner, :post_render, self
+      Jekyll::Rust.hooks_trigger hook_owner, :post_render, self
     ensure
       @renderer = nil # this will allow the modifications above to disappear
     end
@@ -224,7 +224,7 @@ module Jekyll
       FileUtils.mkdir_p(File.dirname(path))
       Jekyll.logger.debug "Writing:", path
       File.write(path, output, :mode => "wb")
-      Jekyll::Hooks.trigger hook_owner, :post_write, self
+      Jekyll::Rust.hooks_trigger hook_owner, :post_write, self
     end
 
     # Accessor for data properties by Liquid.

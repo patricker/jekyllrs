@@ -75,6 +75,10 @@ pub fn emit_build_summary(site: Value, timings: &[(String, f64)]) -> Result<(), 
 
 fn engine_build_site(site: Value) -> Result<(), Error> {
     let ruby = ruby_handle()?;
+    // Reset hook profiling stats at the start of a build
+    let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
+    let rust: RModule = jekyll.const_get("Rust")?;
+    let _ = rust.funcall::<_, _, Value>("hooks_reset", ())?;
     let config: Value = site.funcall("config", ())?;
     let profile_key = ruby.str_new("profile");
     let profile_val: Value = config.funcall("[]", (profile_key,))?;
@@ -84,6 +88,9 @@ fn engine_build_site(site: Value) -> Result<(), Error> {
     if let Some(ref timings) = timings {
         emit_build_summary(site, timings)?;
     }
+
+    // Emit hook summary if enabled
+    let _ = rust.funcall::<_, _, Value>("hooks_log_summary", (site,))?;
 
     Ok(())
 }

@@ -305,7 +305,19 @@ module Jekyll
       Jekyll.logger.debug "Reading:", relative_path
 
       if yaml_file?
-        @data = Jekyll::Rust.yaml_load_file(path)
+        # If this YAML file actually contains front matter, treat it like a normal document
+        # to avoid attempting to parse the entire file as pure YAML.
+        if Jekyll::Rust.has_yaml_header?(path)
+          begin
+            merge_defaults
+            read_content(**opts)
+            read_post_data
+          rescue StandardError => e
+            handle_read_error(e)
+          end
+        else
+          @data = Jekyll::Rust.yaml_load_file(path)
+        end
       else
         begin
           merge_defaults
@@ -393,8 +405,8 @@ module Jekyll
     end
 
     def trigger_hooks(hook_name, *args)
-      Jekyll::Hooks.trigger collection.label.to_sym, hook_name, self, *args if collection
-      Jekyll::Hooks.trigger :documents, hook_name, self, *args
+      Jekyll::Rust.hooks_trigger collection.label.to_sym, hook_name, self, *args if collection
+      Jekyll::Rust.hooks_trigger :documents, hook_name, self, *args
     end
 
     def id
