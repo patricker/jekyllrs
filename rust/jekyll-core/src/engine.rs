@@ -39,6 +39,21 @@ pub fn run_site_phases(
         } else {
             let _: Value = site.funcall::<_, _, Value>(phase, ())?;
         }
+        // Fire site-level hooks after specific phases via the centralized hook hub
+        if phase == "reset" || phase == "read" || phase == "write" {
+            let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
+            let rust: RModule = jekyll.const_get("Rust")?;
+            let bridge: RModule = rust.const_get("Bridge")?;
+            let payload = ruby.qnil().into_value_with(&ruby);
+            let event = if phase == "reset" {
+                ruby.str_new("after_reset")
+            } else if phase == "read" {
+                ruby.str_new("post_read")
+            } else {
+                ruby.str_new("post_write")
+            };
+            let _ = bridge.funcall::<_, _, Value>("hook_trigger_site", (site, event, payload))?;
+        }
         let elapsed = start.elapsed().as_secs_f64();
         timings.push((phase.to_uppercase(), elapsed));
     }

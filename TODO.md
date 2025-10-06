@@ -226,6 +226,8 @@ Got it—no runtime fallbacks to Ruby, no “compat flags,” and `jekyllrs` is 
 
   * [ ] A single Rust module that fires `:pre_render`, `:post_render`, `:post_write`, generators, etc., in the exact order.
     - [x] Site-level `:pre_render`/`:post_render` routed via `Bridge.hook_trigger_site` (centralized + profiled)
+    - [x] Site-level `:post_write` routed via `Bridge.hook_trigger_site` from Rust `engine` after the write phase; removed direct Ruby trigger in `lib/jekyll/site.rb#write` to avoid double firing.
+    - [x] Site-level `:after_reset` and `:post_read` fired from Rust `engine` after `reset` and `read` phases; removed direct Ruby triggers in `lib/jekyll/site.rb`.
   * [ ] Maintain object identity where plugins expect it; cache Ruby wrappers for frequently accessed Rust structs.
 
 * **Profiling**
