@@ -9,6 +9,8 @@ use magnus::{
 };
 
 use once_cell::sync::Lazy;
+use comrak::Options as ComrakOptions;
+use regex::Regex;
 
 use crate::ruby_utils::ruby_handle;
 
@@ -107,7 +109,7 @@ static RUST_CONVERTERS: Lazy<Mutex<Vec<&'static dyn RustConverter>>> = Lazy::new
 });
 
 static KRAMDOWN_CONVERTER: KramdownConverter = KramdownConverter;
-static RUST_MD_SHIM_CONVERTER: RustMdShimConverter = RustMdShimConverter;
+static RUST_MD_NATIVE_CONVERTER: RustMarkdownNativeConverter = RustMarkdownNativeConverter;
 
 fn rust_converters() -> Vec<&'static dyn RustConverter> {
     let guard = RUST_CONVERTERS
@@ -247,11 +249,11 @@ impl RustConverter for KramdownConverter {
     }
 }
 
-// A shim that allows using Ruby's Kramdown parser when `markdown: rust` is set.
-// This scaffolds a Rust-native Markdown converter slot without changing behavior yet.
-struct RustMdShimConverter;
+// Native Markdown converter using comrak. Config is mapped from Jekyll's
+// kramdown settings for parity where practical.
+struct RustMarkdownNativeConverter;
 
-impl RustMdShimConverter {
+impl RustMarkdownNativeConverter {
     fn extensions_from_config(
         &self,
         ctx: &RenderingContext,
@@ -260,38 +262,106 @@ impl RustMdShimConverter {
         KRAMDOWN_CONVERTER.extensions_from_config(ctx, config)
     }
 
-    fn is_rust_markdown_enabled(&self, ctx: &RenderingContext, config: Value) -> Result<bool, Error> {
+    fn is_kramdown_enabled(&self, ctx: &RenderingContext, config: Value) -> Result<bool, Error> {
+        // Honor existing `markdown` setting; treat nil or 'kramdown' as enabled
         let markdown_key = ctx.str("markdown");
         let markdown_engine: Value = config.funcall("[]", (markdown_key,))?;
-        if markdown_engine.is_nil() { return Ok(false); }
+        if markdown_engine.is_nil() {
+            return Ok(true);
+        }
         let engine = String::try_convert(markdown_engine)?;
-        Ok(engine.eq_ignore_ascii_case("rust"))
+        Ok(engine.eq_ignore_ascii_case("kramdown"))
+    }
+
+    fn comrak_options_from_config(&self, ctx: &RenderingContext, site: Value) -> Result<ComrakOptions, Error> {
+        let config: Value = site.funcall("config", ())?;
+        let mut opts = ComrakOptions::default();
+        // Allow raw HTML to match Kramdown
+        opts.render.unsafe_ = true;
+        // Enable footnotes by default to match Kramdown capabilities
+        opts.extension.footnotes = true;
+        if let Ok(kramdown) = config.funcall::<_, _, Value>("[]", (ctx.str("kramdown"),)) {
+            if !kramdown.is_nil() {
+                // hard_wrap -> hardbreaks
+                if let Ok(hw) = kramdown.funcall::<_, _, Value>("[]", (ctx.str("hard_wrap"),)) {
+                    if !hw.is_nil() && hw.to_bool() {
+                        opts.render.hardbreaks = true;
+                    }
+                }
+                // smart punctuation approximation
+                if let Ok(sq) = kramdown.funcall::<_, _, Value>("[]", (ctx.str("smart_quotes"),)) {
+                    if !sq.is_nil() { opts.parse.smart = true; }
+                }
+                // input: enable some GFM-like bits when requested
+                if let Ok(input) = kramdown.funcall::<_, _, Value>("[]", (ctx.str("input"),)) {
+                    if !input.is_nil() {
+                        let s = String::try_convert(input)?;
+                        if s.eq_ignore_ascii_case("GFM") || s.to_ascii_lowercase().contains("gfm") {
+                            opts.extension.table = true;
+                            opts.extension.tasklist = true;
+                            opts.extension.strikethrough = true;
+                            opts.extension.autolink = true;
+                        }
+                    }
+                }
+            }
+        }
+        // Enable a subset commonly used by sites
+        opts.extension.table = true;
+        opts.extension.strikethrough = true;
+        Ok(opts)
     }
 }
 
-impl RustConverter for RustMdShimConverter {
-    fn name(&self) -> &'static str { "RustMarkdownShim" }
+impl RustConverter for RustMarkdownNativeConverter {
+    fn name(&self) -> &'static str { "RustMarkdownNative" }
     fn priority(&self) -> i32 { 5 }
     fn matches(&self, ctx: &RenderingContext, site: Value, ext: &str) -> Result<bool, Error> {
         let config: Value = site.funcall("config", ())?;
-        if !self.is_rust_markdown_enabled(ctx, config)? { return Ok(false); }
+        if !self.is_kramdown_enabled(ctx, config)? { return Ok(false); }
         let extensions = self.extensions_from_config(ctx, config)?;
         Ok(extensions.iter().any(|candidate| candidate.eq_ignore_ascii_case(ext)))
     }
     fn convert(&self, ctx: &RenderingContext, site: Value, _document: Value, content: Value) -> Result<Value, Error> {
-        let parser_class = match KRAMDOWN_CONVERTER.parser_class(ctx) {
-            Some(class) => class,
-            None => {
-                return Err(Error::new(
-                    ctx.ruby.exception_runtime_error(),
-                    "Kramdown parser class not available",
-                ))
+        let content_s = String::try_convert(content)?;
+        let opts = self.comrak_options_from_config(ctx, site)?;
+        let mut html = comrak::markdown_to_html(&content_s, &opts);
+
+        // Approximate Kramdown's default guess_lang behavior for inline code
+        // by tagging bare <code> elements when guess_lang is not explicitly false.
+        let config: Value = site.funcall("config", ())?;
+        let kd: Value = config.funcall("[]", (ctx.str("kramdown"),))?;
+        let guess = if kd.is_nil() {
+            true
+        } else {
+            match kd.funcall::<_, _, Value>("[]", (ctx.str("guess_lang"),)) {
+                Ok(v) if !v.is_nil() => v.to_bool(),
+                _ => true,
             }
         };
-        let config: Value = site.funcall("config", ())?;
-        let config_dup: Value = config.funcall("dup", ())?;
-        let parser_instance: Value = parser_class.funcall("new", (config_dup,))?;
-        parser_instance.funcall("convert", (content,))
+        if guess {
+            html = html.replace(
+                "<code>",
+                "<code class=\"language-plaintext highlighter-rouge\">",
+            );
+        }
+
+        // Inject heading IDs similar to Kramdown's auto_ids when enabled (default true)
+        let auto_ids = if kd.is_nil() {
+            true
+        } else {
+            match kd.funcall::<_, _, Value>("[]", (ctx.str("auto_ids"),)) {
+                Ok(v) if !v.is_nil() => v.to_bool(),
+                _ => true,
+            }
+        };
+        if auto_ids {
+            html = inject_heading_ids_like_kramdown(&html);
+        }
+
+        // Normalize footnote markup closer to Kramdown expectations
+        html = normalize_footnotes_kramdown_like(&html);
+        Ok(ctx.ruby.str_new(&html).into_value_with(ctx.ruby))
     }
     fn output_ext(&self, ctx: &RenderingContext, _site: Value, _original_ext: Value) -> Result<Option<Value>, Error> {
         Ok(Some(ctx.str(".html")))
@@ -301,9 +371,70 @@ impl RustConverter for RustMdShimConverter {
     }
 }
 
+fn inject_heading_ids_like_kramdown(input: &str) -> String {
+    static RE_SIMPLE_HEADER: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+        Regex::new(r"(?i)<h([1-6])>([^<]+)</h\1>").expect("valid header regex")
+    });
+    RE_SIMPLE_HEADER
+        .replace_all(input, |caps: &regex::Captures| {
+            let level = &caps[1];
+            let text = caps[2].trim();
+            let id = slugify_heading_kramdown_like(text);
+            format!("<h{lvl} id=\"{id}\">{text}</h{lvl}>", lvl = level, id = id, text = text)
+        })
+        .into_owned()
+}
+
+fn slugify_heading_kramdown_like(text: &str) -> String {
+    // Transliterate to ASCII, downcase, replace non-alnum with dashes, collapse repeats
+    let ascii = deunicode::deunicode(text);
+    static NON_ALNUM: once_cell::sync::Lazy<Regex> =
+        once_cell::sync::Lazy::new(|| Regex::new(r"[^A-Za-z0-9]+").unwrap());
+    let mut slug = NON_ALNUM.replace_all(&ascii, "-").into_owned();
+    slug.make_ascii_lowercase();
+    slug.trim_matches('-').to_string()
+}
+
+fn normalize_footnotes_kramdown_like(input: &str) -> String {
+    let mut out = input.to_string();
+    // Transform <sup id="fnref1"><a href="#fn1">1</a></sup> to kramdown-like markup
+    let re_sup = Regex::new("<sup id=\\\"fnref(\\d+)\\\"><a href=\\\"#fn\\1\\\"[^>]*>\\d+</a></sup>")
+        .expect("valid sup regex");
+    out = re_sup
+        .replace_all(&out, |caps: &regex::Captures| {
+            let n = &caps[1];
+            format!(
+                "<sup id=\"fnref:{n}\"><a href=\"#fn:{n}\" class=\"footnote\" rel=\"footnote\" role=\"doc-noteref\">{n}</a></sup>",
+                n = n
+            )
+        })
+        .into_owned();
+
+    // Fix footnote definition ids id="fn1" => id="fn:1"
+    let re_def = Regex::new("id=\\\"fn(\\d+)\\\"").expect("valid def id regex");
+    out = re_def
+        .replace_all(&out, |caps: &regex::Captures| format!("id=\"fn:{}\"", &caps[1]))
+        .into_owned();
+
+    // Transform backlinks: <a href="#fnref1" ...>.*</a> => nbsp + desired link
+    let re_back = Regex::new("<a href=\\\"#fnref(\\d+)\\\"[^>]*>.*?</a>").expect("valid backref regex");
+    out = re_back
+        .replace_all(&out, |caps: &regex::Captures| {
+            let n = &caps[1];
+            format!(
+                "&nbsp;<a href=\"#fnref:{n}\" class=\"reversefootnote\" role=\"doc-backlink\">&#8617;</a>",
+                n = n
+            )
+        })
+        .into_owned();
+
+    out
+}
+
 pub fn define_into(bridge: &RModule) -> Result<(), Error> {
-    register_rust_converter(&RUST_MD_SHIM_CONVERTER);
-    register_rust_converter(&KRAMDOWN_CONVERTER);
+    // Register native Markdown converter (comrak-based). Ruby Kramdown class is
+    // still referenced for config/extension parsing but is not registered here.
+    register_rust_converter(&RUST_MD_NATIVE_CONVERTER);
 
     bridge.define_singleton_method("render_site", function!(render_site, 1))?;
     bridge.define_singleton_method("renderer_run", function!(renderer_run, 4))?;
@@ -367,6 +498,20 @@ impl<'ruby> RenderingContext<'ruby> {
 
     fn str(&self, value: &str) -> Value {
         self.ruby.str_new(value).into_value_with(self.ruby)
+    }
+
+    fn env_true(&self, key: &str) -> bool {
+        if let Ok(env) = self.ruby.class_object().const_get::<_, RHash>("ENV") {
+            let k = self.ruby.str_new(key).into_value_with(self.ruby);
+            if let Ok(v) = env.aref(k) {
+                if let Some(s) = RString::from_value(v) {
+                    if let Ok(st) = s.to_string() {
+                        return !st.is_empty() && st != "0" && st.to_ascii_lowercase() != "false";
+                    }
+                }
+            }
+        }
+        false
     }
 }
 
@@ -682,8 +827,8 @@ fn validate_markdown_processor(ctx: &RenderingContext, site: Value) -> Result<()
     }
 
     let name = String::try_convert(markdown_val)?;
-    // default supported engine
-    if name.eq_ignore_ascii_case("kramdown") {
+    // default supported engines
+    if name.eq_ignore_ascii_case("kramdown") || name.eq_ignore_ascii_case("rust") {
         return Ok(());
     }
 
@@ -1506,6 +1651,11 @@ fn render_document(
     layouts: Value,
 ) -> Result<Value, Error> {
     let relative_path: Value = document.funcall::<_, _, Value>("relative_path", ())?;
+    if ctx.env_true("JEKYLL_RS_DEBUG_HANG") {
+        let _ = ctx
+            .logger
+            .funcall::<_, _, Value>("info", (ctx.str("Render start:"), relative_path.clone()))?;
+    }
     log_debug(ctx, "Rendering:", relative_path)?;
 
     assign_page_payload(ctx, document, payload)?;
@@ -1570,5 +1720,11 @@ fn render_document(
         )?;
     }
 
+    if ctx.env_true("JEKYLL_RS_DEBUG_HANG") {
+        let path: Value = document.funcall::<_, _, Value>("relative_path", ())?;
+        let _ = ctx
+            .logger
+            .funcall::<_, _, Value>("info", (ctx.str("Render done:"), path))?;
+    }
     Ok(output)
 }

@@ -172,8 +172,7 @@ Got it—no runtime fallbacks to Ruby, no “compat flags,” and `jekyllrs` is 
 
   * [x] Discover Ruby converters (classes responding to `matches`/`convert`) once at startup and capture their priority.
   * [x] For each input ext, pick converter chain in Rust and invoke Ruby converters sequentially.
-  * [ ] Inline Rust implementations where you want speed: optional Markdown (`comrak`/`pulldown-cmark` with kramdown-compat shims), optional syntax highlight (`syntect`). (These are not runtime flags—pick an implementation and delete the Ruby equivalents when ready.)
-    - [~] Registered a `markdown: rust` converter shim (delegates to Kramdown for now; no new dependencies). Ready to swap for a native renderer when dependencies are allowed.
+  * [x] Inline Rust implementation for Markdown using `comrak` with kramdown‑compat options; no runtime flags. Ruby Markdown converter remains for API compatibility/tests but is skipped in the Rust pipeline.
     *Files:* `rust/jekyll-core/src/render.rs`.
 
 * **Sass**
