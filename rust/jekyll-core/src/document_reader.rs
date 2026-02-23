@@ -91,6 +91,38 @@ fn parse_front_matter(ruby: &Ruby, source: &str) -> Result<Value, Error> {
     match serde_yaml::from_str::<YamlValue>(source) {
         Ok(value) => yaml_value_to_ruby(ruby, value),
         Err(err) => {
+            let message = err.to_string();
+
+            // serde_yaml rejects duplicate keys, but Ruby's Psych is lenient
+            // (last value wins). Re-parse with yaml-rust2 which handles
+            // duplicates natively — pure Rust, no Ruby fallback.
+            if message.contains("duplicate entry") {
+                return parse_front_matter_lenient(ruby, source);
+            }
+
+            let psych: RModule = ruby.class_object().const_get("Psych")?;
+            let syntax_error: ExceptionClass = psych.const_get("SyntaxError")?;
+            let exception = syntax_error.new_instance((
+                ruby.qnil().into_value_with(ruby),
+                0.into_value_with(ruby),
+                0.into_value_with(ruby),
+                0.into_value_with(ruby),
+                ruby.str_new(&message).into_value_with(ruby),
+                ruby.qnil().into_value_with(ruby),
+            ))?;
+            Err(Error::from(exception))
+        }
+    }
+}
+
+/// When serde_yaml rejects duplicate keys, deduplicate them in the source
+/// string (keeping the last occurrence of each top-level key, matching Ruby's
+/// Psych "last wins" behavior) then re-parse with serde_yaml.
+fn parse_front_matter_lenient(ruby: &Ruby, source: &str) -> Result<Value, Error> {
+    let deduped = dedup_yaml_keys(source);
+    match serde_yaml::from_str::<YamlValue>(&deduped) {
+        Ok(value) => yaml_value_to_ruby(ruby, value),
+        Err(err) => {
             let psych: RModule = ruby.class_object().const_get("Psych")?;
             let syntax_error: ExceptionClass = psych.const_get("SyntaxError")?;
             let message = err.to_string();
@@ -106,6 +138,75 @@ fn parse_front_matter(ruby: &Ruby, source: &str) -> Result<Value, Error> {
         }
     }
 }
+
+/// Remove duplicate top-level YAML keys, keeping the last occurrence of each.
+/// Works on frontmatter which is typically flat key-value pairs.
+/// A "top-level key" line starts with a non-whitespace char and contains `:`.
+/// Continuation lines (indented or non-key) are grouped with the preceding key.
+fn dedup_yaml_keys(source: &str) -> String {
+    use std::collections::HashMap;
+
+    // Parse into (key, block_of_lines) pairs
+    let mut blocks: Vec<(Option<String>, String)> = Vec::new();
+    let mut current_key: Option<String> = None;
+    let mut current_block = String::new();
+
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        // A top-level key line: starts at column 0 (no leading whitespace) and has a colon
+        let is_top_key = !line.is_empty()
+            && !line.starts_with(' ')
+            && !line.starts_with('\t')
+            && !trimmed.starts_with('#')
+            && !trimmed.starts_with('-')
+            && trimmed.contains(':');
+
+        if is_top_key {
+            // Save previous block
+            if !current_block.is_empty() {
+                blocks.push((current_key.take(), current_block.clone()));
+                current_block.clear();
+            }
+            // Extract key name (everything before the first colon)
+            let key = trimmed.split(':').next().unwrap_or("").trim().to_string();
+            current_key = Some(key);
+        }
+
+        current_block.push_str(line);
+        current_block.push('\n');
+    }
+    // Push final block
+    if !current_block.is_empty() {
+        blocks.push((current_key, current_block));
+    }
+
+    // Find which keys are duplicated and keep only the last occurrence
+    let mut key_last_index: HashMap<String, usize> = HashMap::new();
+    for (i, (key, _)) in blocks.iter().enumerate() {
+        if let Some(k) = key {
+            key_last_index.insert(k.clone(), i);
+        }
+    }
+
+    let mut result = String::new();
+    let mut seen_keys: HashMap<String, usize> = HashMap::new();
+    for (i, (key, block)) in blocks.iter().enumerate() {
+        if let Some(k) = key {
+            let count = seen_keys.entry(k.clone()).or_insert(0);
+            *count += 1;
+            // Skip if this is not the last occurrence
+            if let Some(&last_idx) = key_last_index.get(k) {
+                if i != last_idx {
+                    continue;
+                }
+            }
+        }
+        result.push_str(block);
+    }
+
+    result
+}
+
 
 fn yaml_load_file(path: String) -> Result<Value, Error> {
     let ruby = ruby_handle()?;

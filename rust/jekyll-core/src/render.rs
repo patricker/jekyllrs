@@ -926,6 +926,7 @@ fn converter_chain_for_site(
 }
 
 pub(crate) fn render_site(site: Value) -> Result<(), Error> {
+    crate::liquid_engine::clear_liquid_cache();
     let ruby = ruby_handle()?;
     let ctx = RenderingContext::new(&ruby)?;
 
@@ -1107,19 +1108,32 @@ fn render_collections(
 
     let post_render_symbol = ctx.symbol("post_render");
 
-    collections.foreach(|_: Value, collection: Value| {
+    let jekyll_mod: RModule = ctx.ruby.class_object().const_get("Jekyll")?;
+    let rust_mod: RModule = jekyll_mod.const_get("Rust")?;
+    let bridge_mod: RModule = rust_mod.const_get("Bridge")?;
+
+    collections.foreach(|_label: Value, collection: Value| {
+        let label_str: String = collection.funcall::<_, _, String>("label", ())?;
         let docs_value: Value = collection.funcall::<_, _, Value>("docs", ())?;
         if let Some(docs) = RArray::from_value(docs_value) {
+            let total = docs.len();
+            let mut rendered = 0usize;
             for entry in docs.each() {
                 let document = entry?;
                 if should_render(&regenerator, document)? {
                     let output = render_document(ctx, site, document, payload, layouts)?;
                     document.funcall::<_, _, Value>("output=", (output,))?;
-                    let jekyll: RModule = ctx.ruby.class_object().const_get("Jekyll")?;
-                    let rust: RModule = jekyll.const_get("Rust")?;
-                    let bridge: RModule = rust.const_get("Bridge")?;
-                    let _ = bridge.funcall::<_, _, Value>("hook_trigger_document", (document, post_render_symbol, ctx.ruby.qnil().into_value_with(ctx.ruby)))?;
+                    let _ = bridge_mod.funcall::<_, _, Value>("hook_trigger_document", (document, post_render_symbol, ctx.ruby.qnil().into_value_with(ctx.ruby)))?;
+                    rendered += 1;
+                    if rendered % 100 == 0 {
+                        let msg = format!("Rendered {}/{} docs in '{}'", rendered, total, label_str);
+                        let _ = ctx.logger.funcall::<_, _, Value>("info", (ctx.str("  Rust:"), ctx.ruby.str_new(&msg)));
+                    }
                 }
+            }
+            if rendered > 0 {
+                let msg = format!("Rendered {}/{} docs in '{}'", rendered, total, label_str);
+                let _ = ctx.logger.funcall::<_, _, Value>("info", (ctx.str("  Rust:"), ctx.ruby.str_new(&msg)));
             }
         }
         Ok(ForEach::Continue)
@@ -1142,16 +1156,28 @@ fn render_pages(
 
     let post_render_symbol = ctx.symbol("post_render");
 
+    let jekyll_mod: RModule = ctx.ruby.class_object().const_get("Jekyll")?;
+    let rust_mod: RModule = jekyll_mod.const_get("Rust")?;
+    let bridge_mod: RModule = rust_mod.const_get("Bridge")?;
+    let total = pages.len();
+    let mut rendered = 0usize;
+
     for entry in pages.each() {
         let document = entry?;
         if should_render(&regenerator, document)? {
             let output = render_document(ctx, site, document, payload, layouts)?;
             document.funcall::<_, _, Value>("output=", (output,))?;
-            let jekyll: RModule = ctx.ruby.class_object().const_get("Jekyll")?;
-            let rust: RModule = jekyll.const_get("Rust")?;
-            let bridge: RModule = rust.const_get("Bridge")?;
-            let _ = bridge.funcall::<_, _, Value>("hook_trigger_document", (document, post_render_symbol, ctx.ruby.qnil().into_value_with(ctx.ruby)))?;
+            let _ = bridge_mod.funcall::<_, _, Value>("hook_trigger_document", (document, post_render_symbol, ctx.ruby.qnil().into_value_with(ctx.ruby)))?;
+            rendered += 1;
+            if rendered % 100 == 0 {
+                let msg = format!("Rendered {}/{} pages", rendered, total);
+                let _ = ctx.logger.funcall::<_, _, Value>("info", (ctx.str("  Rust:"), ctx.ruby.str_new(&msg)));
+            }
         }
+    }
+    if rendered > 0 {
+        let msg = format!("Rendered {}/{} pages total", rendered, total);
+        let _ = ctx.logger.funcall::<_, _, Value>("info", (ctx.str("  Rust:"), ctx.ruby.str_new(&msg)));
     }
 
     Ok(())
@@ -1378,11 +1404,18 @@ fn render_liquid_template(
         }
     }
 
-    // Update LiquidRenderer stats for this template when a path is known (profile output)
+    // Update LiquidRenderer stats for this template when a path is known (profile output).
+    // IMPORTANT: Only do this when profiling is explicitly enabled; otherwise this
+    // double-parses every template through Ruby Liquid just for stats, which is
+    // catastrophically slow on large sites (10K+ pages).
     if let Some(ref p) = path {
-        let liquid_renderer: Value = _site.funcall::<_, _, Value>("liquid_renderer", ())?;
-        let file = liquid_renderer.funcall::<_, _, Value>("file", (p.clone(),))?;
-        let _ = file.funcall::<_, _, Value>("parse", (content,))?;
+        let cfg: Value = _site.funcall::<_, _, Value>("config", ())?;
+        let profile_val: Value = cfg.funcall::<_, _, Value>("[]", (ctx.str("profile"),))?;
+        if profile_val.to_bool() {
+            let liquid_renderer: Value = _site.funcall::<_, _, Value>("liquid_renderer", ())?;
+            let file = liquid_renderer.funcall::<_, _, Value>("file", (p.clone(),))?;
+            let _ = file.funcall::<_, _, Value>("parse", (content,))?;
+        }
     }
 
     // Render using Rust Liquid engine (no Ruby Liquid fallback)
@@ -1664,9 +1697,13 @@ fn render_layout(
     let layout_content: Value = layout.funcall::<_, _, Value>("content", ())?;
     let layout_path: Value = layout.funcall::<_, _, Value>("path", ())?;
     // Update Ruby LiquidRenderer stats table for the layout path to preserve CLI output parity
-    let liquid_renderer: Value = site.funcall::<_, _, Value>("liquid_renderer", ())?;
-    let file = liquid_renderer.funcall::<_, _, Value>("file", (layout_path,))?;
-    let _ = file.funcall::<_, _, Value>("parse", (layout_content,))?;
+    let cfg: Value = site.funcall::<_, _, Value>("config", ())?;
+    let profile_val: Value = cfg.funcall::<_, _, Value>("[]", (ctx.str("profile"),))?;
+    if profile_val.to_bool() {
+        let liquid_renderer: Value = site.funcall::<_, _, Value>("liquid_renderer", ())?;
+        let file = liquid_renderer.funcall::<_, _, Value>("file", (layout_path,))?;
+        let _ = file.funcall::<_, _, Value>("parse", (layout_content,))?;
+    }
     render_liquid_template(
         ctx,
         site,

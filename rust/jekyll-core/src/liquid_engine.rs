@@ -197,6 +197,11 @@ thread_local! {
 
 thread_local! {
     static TEMPLATE_CACHE: RefCell<HashMap<u64, Rc<liquid::Template>>> = RefCell::new(HashMap::new());
+    static CONVERT_CACHE: RefCell<HashMap<i64, LiquidValue>> = RefCell::new(HashMap::new());
+}
+
+pub fn clear_liquid_cache() {
+    CONVERT_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
 #[derive(Clone, Debug)]
@@ -567,7 +572,15 @@ impl<'ruby> LiquidValueConverter<'ruby> {
         }
 
         if let Some(array) = RArray::from_value(value) {
+            let object_id: i64 = match i64::try_convert(value.funcall::<_, _, Value>("object_id", ())?) {
+                Ok(id) => id,
+                Err(_) => return Ok(LiquidValue::Nil),
+            };
+            if let Some(cached) = crate::liquid_engine::CONVERT_CACHE.with(|c| c.borrow().get(&object_id).cloned()) {
+                return Ok(cached);
+            }
             if let Some(result) = self.with_guard(value, |this| this.convert_array(array, depth))? {
+                crate::liquid_engine::CONVERT_CACHE.with(|c| c.borrow_mut().insert(object_id, result.clone()));
                 return Ok(result);
             }
             return Ok(LiquidValue::Nil);
@@ -588,9 +601,30 @@ impl<'ruby> LiquidValueConverter<'ruby> {
         }
 
         if value.is_kind_of(self.drop_class) {
+            let object_id: i64 = match i64::try_convert(value.funcall::<_, _, Value>("object_id", ())?) {
+                Ok(id) => id,
+                Err(_) => return Ok(LiquidValue::Nil),
+            };
+            let class_val: Value = value.funcall::<_, _, Value>("class", ()).ok().unwrap_or(self.ruby.qnil().into_value_with(self.ruby));
+            let class_name = if class_val.is_nil() {
+                String::new()
+            } else {
+                class_val.funcall::<_, _, RString>("name", ()).ok().and_then(|s| s.to_string().ok()).unwrap_or_default()
+            };
+            let is_cacheable = class_name != "Jekyll::Drops::SiteDrop" && class_name != "Jekyll::Drops::UnifiedPayloadDrop" && class_name != "Jekyll::Drops::JekyllDrop";
+            
+            if is_cacheable {
+                if let Some(cached) = crate::liquid_engine::CONVERT_CACHE.with(|c| c.borrow().get(&object_id).cloned()) {
+                    return Ok(cached);
+                }
+            }
+
             if let Some(result) = self
                 .with_guard(value, |this| this.convert_drop(value, depth))?
             {
+                if is_cacheable {
+                    crate::liquid_engine::CONVERT_CACHE.with(|c| c.borrow_mut().insert(object_id, result.clone()));
+                }
                 return Ok(result);
             }
             // On cycle, return Nil to match Ruby Liquid's lazy behavior
@@ -2144,8 +2178,14 @@ pub fn render_template(
 
     // Build LiquidValue globals from Ruby, then wrap in SafeValue for unknown key behavior.
     // Excerpt keys are skipped during convert_drop and resolved lazily by SafeValue.
+    let t0 = std::time::Instant::now();
     let mut converter = LiquidValueConverter::new(&ruby)?;
     let globals_value = converter.convert(payload)?;
+    let convert_ms = t0.elapsed().as_millis();
+    if convert_ms > 50 {
+        let cache_size = CONVERT_CACHE.with(|c| c.borrow().len());
+        eprintln!("[PERF] payload convert: {}ms (cache size: {})", convert_ms, cache_size);
+    }
     let globals_object = match globals_value {
         LiquidValue::Object(obj) => obj,
         other => {
