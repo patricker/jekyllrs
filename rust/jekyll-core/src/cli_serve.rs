@@ -277,7 +277,7 @@ fn run_server(ruby: &Ruby, opts: ServeOptions, options: Value) -> Result<(), Err
             tokio::select! {
                 res = &mut graceful => {
                     if let Err(err) = res {
-                        eprintln!("serve error: {err}");
+                        tracing::error!("serve error: {err}");
                     }
                     break;
                 }
@@ -288,7 +288,7 @@ fn run_server(ruby: &Ruby, opts: ServeOptions, options: Value) -> Result<(), Err
                 maybe_paths = rebuild_rx.recv(), if watch_enabled => {
                     if let Some(paths) = maybe_paths {
                         if let Err(err) = process_rebuild_event(options, &paths, livereload_cfg.as_ref()) {
-                            eprintln!("auto-regeneration failed: {err}");
+                            tracing::error!("auto-regeneration failed: {err}");
                         }
                     }
                 }
@@ -909,7 +909,7 @@ async fn run_livereload(config: LiveReloadConfig, mut shutdown: watch::Receiver<
     let listener = match TcpListener::bind(&bind_addr).await {
         Ok(listener) => listener,
         Err(err) => {
-            eprintln!("livereload bind error on {}: {}", bind_addr, err);
+            tracing::error!("livereload bind error on {}: {}", bind_addr, err);
             return;
         }
     };
@@ -923,12 +923,12 @@ async fn run_livereload(config: LiveReloadConfig, mut shutdown: watch::Receiver<
                         let mut rx = shutdown.clone();
                         tokio::spawn(async move {
                             if let Err(err) = handle_livereload_connection(stream, addr, cfg, &mut rx).await {
-                                eprintln!("livereload connection error: {}", err);
+                                tracing::warn!("livereload connection error: {}", err);
                             }
                         });
                     }
                     Err(err) => {
-                        eprintln!("livereload accept error: {}", err);
+                        tracing::error!("livereload accept error: {}", err);
                     }
                 }
             }
@@ -968,19 +968,19 @@ async fn run_file_watcher(
                         }
                     }
                 }
-                Err(err) => eprintln!("file watcher error: {}", err),
+                Err(err) => tracing::error!("file watcher error: {}", err),
             };
 
             let mut watcher = match RecommendedWatcher::new(handler, notify::Config::default()) {
                 Ok(watcher) => watcher,
                 Err(err) => {
-                    eprintln!("failed to start file watcher: {}", err);
+                    tracing::error!("failed to start file watcher: {}", err);
                     return;
                 }
             };
 
             if let Err(err) = watcher.watch(source.as_path(), RecursiveMode::Recursive) {
-                eprintln!("failed to watch {}: {}", source.display(), err);
+                tracing::error!("failed to watch {}: {}", source.display(), err);
                 return;
             }
 
@@ -1036,7 +1036,7 @@ async fn run_file_watcher(
 
     let _ = stop_tx.send(());
     if let Err(err) = watcher_thread.join() {
-        eprintln!("file watcher thread join error: {:?}", err);
+        tracing::error!("file watcher thread join error: {:?}", err);
     }
 }
 

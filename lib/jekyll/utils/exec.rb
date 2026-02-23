@@ -14,12 +14,9 @@ module Jekyll
       # Returns a Process::Status and a String of output in an array in
       # that order.
       def run(*args)
-        stdin, stdout, stderr, process = Open3.popen3(*args)
-        out = stdout.read.strip
-        err = stderr.read.strip
-
-        [stdin, stdout, stderr].each(&:close)
-        [process.value, out + err]
+        # Capture stdout and stderr together to avoid deadlocks when one pipe fills.
+        out, status = Open3.capture2e(*args)
+        [status, out.strip]
       end
     end
   end

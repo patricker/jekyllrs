@@ -1,4 +1,5 @@
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
+use std::rc::Rc;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
@@ -19,6 +20,7 @@ use liquid_core::runtime::{Expression, Runtime};
 use magnus::symbol::Symbol;
 use magnus::{
     prelude::*, Error, IntoValue, RArray, RClass, RHash, RModule, RString, Ruby, TryConvert, Value,
+    rb_sys::{AsRawValue, FromRawValue},
 };
 
 use crate::ruby_utils::ruby_handle;
@@ -194,9 +196,8 @@ thread_local! {
 }
 
 thread_local! {
-    static TEMPLATE_CACHE: RefCell<HashMap<u64, liquid::Template>> = RefCell::new(HashMap::new());
+    static TEMPLATE_CACHE: RefCell<HashMap<u64, Rc<liquid::Template>>> = RefCell::new(HashMap::new());
 }
-
 
 #[derive(Clone, Debug)]
 enum SafeValueInner {
@@ -206,33 +207,61 @@ enum SafeValueInner {
     Object(HashMap<KString, SafeValue>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct SafeValue {
     inner: SafeValueInner,
     nil: LiquidValue,
     strict: bool,
+    /// Raw Ruby VALUE pointer for a document-like drop.  When present,
+    /// `ObjectView::get("excerpt")` can lazily resolve the excerpt from
+    /// the Ruby drop instead of requiring it up-front.
+    ruby_drop_raw: Option<u64>,
+    /// Lazily-resolved excerpt cached on first access.
+    cached_excerpt: OnceCell<Box<SafeValue>>,
+}
+
+impl fmt::Debug for SafeValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SafeValue")
+            .field("inner", &self.inner)
+            .field("strict", &self.strict)
+            .field("ruby_drop_raw", &self.ruby_drop_raw)
+            .finish()
+    }
 }
 
 impl SafeValue {
+    fn new_nil(strict: bool) -> Self {
+        SafeValue { inner: SafeValueInner::Nil, nil: LiquidValue::Nil, strict, ruby_drop_raw: None, cached_excerpt: OnceCell::new() }
+    }
+
     fn wrap_with_strict(value: LiquidValue, strict: bool) -> Self {
         match value {
-            LiquidValue::Nil => SafeValue { inner: SafeValueInner::Nil, nil: LiquidValue::Nil, strict },
+            LiquidValue::Nil => Self::new_nil(strict),
             LiquidValue::State(state) => {
-                // Represent state as its string form for display; still treat as scalar-ish
                 let s = state.to_string();
-                SafeValue { inner: SafeValueInner::Scalar(liquid_model::Scalar::new(s)), nil: LiquidValue::Nil, strict }
+                SafeValue { inner: SafeValueInner::Scalar(liquid_model::Scalar::new(s)), nil: LiquidValue::Nil, strict, ruby_drop_raw: None, cached_excerpt: OnceCell::new() }
             }
-            LiquidValue::Scalar(s) => SafeValue { inner: SafeValueInner::Scalar(s), nil: LiquidValue::Nil, strict },
+            LiquidValue::Scalar(s) => SafeValue { inner: SafeValueInner::Scalar(s), nil: LiquidValue::Nil, strict, ruby_drop_raw: None, cached_excerpt: OnceCell::new() },
             LiquidValue::Array(arr) => {
                 let children = arr.into_iter().map(|v| SafeValue::wrap_with_strict(v, strict)).collect();
-                SafeValue { inner: SafeValueInner::Array(children), nil: LiquidValue::Nil, strict }
+                SafeValue { inner: SafeValueInner::Array(children), nil: LiquidValue::Nil, strict, ruby_drop_raw: None, cached_excerpt: OnceCell::new() }
             }
             LiquidValue::Object(obj) => {
                 let mut map = HashMap::with_capacity(obj.len());
+                // Check for a __ruby_drop_raw__ marker inserted by convert_drop.
+                // If present, extract the raw Ruby VALUE pointer for lazy excerpt resolution.
+                let mut drop_raw: Option<u64> = None;
                 for (k, v) in obj.iter() {
+                    if k.as_str() == "__ruby_drop_raw__" {
+                        if let LiquidValue::Scalar(ref s) = v {
+                            drop_raw = s.to_kstr().as_str().parse::<u64>().ok();
+                        }
+                        continue; // Don't include the marker in the SafeValue map
+                    }
                     map.insert(KString::from_ref(k.as_str()), SafeValue::wrap_with_strict(v.clone(), strict));
                 }
-                SafeValue { inner: SafeValueInner::Object(map), nil: LiquidValue::Nil, strict }
+                SafeValue { inner: SafeValueInner::Object(map), nil: LiquidValue::Nil, strict, ruby_drop_raw: drop_raw, cached_excerpt: OnceCell::new() }
             }
         }
     }
@@ -362,6 +391,16 @@ impl liquid_core::model::ObjectView for SafeValue {
         if let SafeValueInner::Object(map) = &self.inner {
             if let Some(v) = map.get(index) {
                 return Some(v as &dyn liquid_core::model::ValueView);
+            }
+            // Lazy excerpt resolution: if we have a Ruby drop and the requested
+            // key is "excerpt", resolve it now and cache the result.
+            if index == "excerpt" {
+                if let Some(raw) = self.ruby_drop_raw {
+                    let resolved = self.cached_excerpt.get_or_init(|| {
+                        Box::new(resolve_excerpt_from_drop(raw))
+                    });
+                    return Some(resolved.as_ref() as &dyn liquid_core::model::ValueView);
+                }
             }
             if self.strict { None } else { Some(&self.nil) }
         } else { None }
@@ -705,41 +744,20 @@ impl<'ruby> LiquidValueConverter<'ruby> {
                         }
                     }
 
-                    // Handle `excerpt` specially. Only materialize for posts to avoid
-                    // expensive nested rendering on arbitrary collection documents.
+                    // Skip `excerpt` during convert_drop to avoid recursive rendering.
+                    // The excerpt will be lazily resolved via SafeValue when a Liquid
+                    // template accesses `page.excerpt` or `post.excerpt`.
                     if method_name == "excerpt" {
-                        // Determine if this drop wraps a post (collection label == "posts")
-                        let is_post = (|| -> Result<bool, Error> {
-                            let obj: Value = drop.funcall("instance_variable_get", (self.ruby.str_new("@obj"),))?;
-                            let coll: Value = obj.funcall("collection", ())?;
-                            if coll.is_nil() { return Ok(false); }
-                            let label_val: Value = coll.funcall("label", ())?;
-                            if let Some(s) = RString::from_value(label_val) { return Ok(s.to_string()?.eq_ignore_ascii_case("posts")); }
-                            Ok(false)
-                        })().unwrap_or(false);
-
-                        if is_post {
-                            match drop.funcall::<_, _, Value>(method_name.as_str(), ()) {
-                                Ok(ex) => {
-                                    if let Ok(s) = ex.funcall::<_, _, RString>("to_s", ()) {
-                                        if let Ok(st) = s.to_string() {
-                                            object.insert(method_name.clone().into(), LiquidValue::scalar(st));
-                                            continue;
-                                        }
-                                    }
-                                    object.insert(method_name.clone().into(), LiquidValue::Nil);
-                                    continue;
-                                }
-                                Err(_) => {
-                                    object.insert(method_name.clone().into(), LiquidValue::Nil);
-                                    continue;
-                                }
-                            }
-                        } else {
-                            // Do not compute excerpts for non-post documents during payload projection
-                            object.insert(method_name.clone().into(), LiquidValue::Nil);
-                            continue;
+                        // Store the drop's raw VALUE pointer so SafeValue can
+                        // lazily resolve the excerpt on first access.
+                        if is_document_like_drop_method_phase {
+                            let raw_val = drop.as_raw() as u64;
+                            object.insert(
+                                "__ruby_drop_raw__".into(),
+                                LiquidValue::scalar(raw_val.to_string()),
+                            );
                         }
+                        continue;
                     }
 
                     let result = drop.funcall::<_, _, Value>(method_name.as_str(), ())?;
@@ -2009,6 +2027,49 @@ fn extract_all_simple_output_vars(s: &str) -> Vec<String> {
     out
 }
 
+/// Lazily resolve the excerpt string from a raw Ruby drop VALUE pointer.
+/// Called from `SafeValue::ObjectView::get("excerpt")` on first access.
+///
+/// # Safety
+/// The raw pointer is the `VALUE` of a Ruby drop object that was alive when
+/// `convert_drop` ran.  During Liquid template rendering the Ruby GC cannot
+/// collect it because the drop is reachable from the payload hash that the
+/// Ruby caller holds.  We reconstruct the `Value` here to call its `excerpt`
+/// method.
+fn resolve_excerpt_from_drop(raw: u64) -> SafeValue {
+    // Reconstruct the Ruby Value from the raw pointer.
+    let ruby = match ruby_handle() {
+        Ok(r) => r,
+        Err(_) => return SafeValue::new_nil(false),
+    };
+    // SAFETY: The raw VALUE is still live — it is reachable from the Ruby
+    // payload hash that our caller (`render_template`) holds on the Ruby
+    // stack.  Ruby's GC will not collect it during this render cycle.
+    let drop_val: Value = unsafe {
+        Value::from_raw(raw as _)
+    };
+
+    // Call drop["excerpt"] to get the Excerpt object, then .to_s for rendered HTML.
+    let excerpt_key = ruby.str_new("excerpt");
+    let excerpt_result: Result<Value, _> = drop_val.funcall("[]", (excerpt_key.into_value_with(&ruby),));
+    if let Ok(ex) = excerpt_result {
+        if !ex.is_nil() {
+            if let Ok(s) = ex.funcall::<_, _, RString>("to_s", ()) {
+                if let Ok(st) = s.to_string() {
+                    return SafeValue {
+                        inner: SafeValueInner::Scalar(liquid_model::Scalar::new(st)),
+                        nil: LiquidValue::Nil,
+                        strict: false,
+                        ruby_drop_raw: None,
+                        cached_excerpt: OnceCell::new(),
+                    };
+                }
+            }
+        }
+    }
+    SafeValue::new_nil(false)
+}
+
 pub fn render_template(
     content: &str,
     payload: Value,
@@ -2081,7 +2142,8 @@ pub fn render_template(
         false
     };
 
-    // Build LiquidValue globals from Ruby, then wrap in SafeValue for unknown key behavior
+    // Build LiquidValue globals from Ruby, then wrap in SafeValue for unknown key behavior.
+    // Excerpt keys are skipped during convert_drop and resolved lazily by SafeValue.
     let mut converter = LiquidValueConverter::new(&ruby)?;
     let globals_value = converter.convert(payload)?;
     let globals_object = match globals_value {
@@ -2092,6 +2154,7 @@ pub fn render_template(
             object
         }
     };
+
     let safe_root = SafeValue::wrap_with_strict(LiquidValue::Object(globals_object), strict_variables);
 
     let previous = RUBY_FILTER_CONTEXT.with(|cell| {
@@ -2104,13 +2167,15 @@ pub fn render_template(
     // Preprocess certain tags to preserve raw markup that Liquid's Rust grammar can't express.
     let content = preprocess_raw_tag_markup(content);
     let cache_key = template_cache_key_for(&ruby, &content, &filter_names, path.clone())?;
-    let template_render = TEMPLATE_CACHE.with(|cell| -> Result<String, Error> {
-        let mut cache = cell.borrow_mut();
+    // Look up or parse+cache the template while holding the borrow, but
+    // release the borrow before rendering so that nested render_template calls
+    // (e.g. lazy excerpt resolution) don't panic on a re-entrant borrow.
+    let template = TEMPLATE_CACHE.with(|cell| -> Result<Rc<liquid::Template>, Error> {
+        let cache = cell.borrow();
         if let Some(tpl) = cache.get(&cache_key) {
-            return tpl
-                .render(&safe_root)
-                .map_err(|err| Error::new(ruby.exception_runtime_error(), err.to_string()));
+            return Ok(Rc::clone(tpl));
         }
+        drop(cache);
 
         let parser = builder
             .build()
@@ -2118,20 +2183,23 @@ pub fn render_template(
         let tpl = parser
             .parse(&content)
             .map_err(|err| Error::new(ruby.exception_runtime_error(), err.to_string()))?;
+        let tpl = Rc::new(tpl);
 
         // Cap cache size to a modest number to avoid unbounded growth
         const MAX_CACHE_SIZE: usize = 256;
+        let mut cache = cell.borrow_mut();
         if cache.len() >= MAX_CACHE_SIZE {
             if let Some(evict_key) = cache.keys().next().cloned() {
                 cache.remove(&evict_key);
             }
         }
-        let rendered = tpl
-            .render(&safe_root)
-            .map_err(|err| Error::new(ruby.exception_runtime_error(), err.to_string()))?;
-        cache.insert(cache_key, tpl);
-        Ok(rendered)
+        cache.insert(cache_key, Rc::clone(&tpl));
+        Ok(tpl)
     })?;
+
+    let template_render = template
+        .render(&safe_root)
+        .map_err(|err| Error::new(ruby.exception_runtime_error(), err.to_string()))?;
 
     let result = Ok(template_render);
 

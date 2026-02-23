@@ -676,6 +676,198 @@ fn is_blank_value(_ruby: &magnus::Ruby, val: Value) -> Result<bool, Error> {
     Ok(false)
 }
 
+/// Evaluate a simple Liquid comparison expression for a single object.
+///
+/// Supports operators: ==, !=, >, <, >=, <=, contains
+/// `var_name` is the loop variable name. `obj` is the current element.
+/// Returns Ok(true/false) or Err if the expression is not parseable here.
+fn eval_where_exp_condition(
+    ruby: &Ruby,
+    var_name: &str,
+    obj: Value,
+    condition: &str,
+) -> Result<Option<bool>, Error> {
+    let prefix = format!("{}.", var_name);
+
+    // Determine operator and split
+    // Order matters: check >= and <= before > and <, and != before contains
+    let (lhs_raw, op, rhs_raw) = if let Some(pos) = condition.find(" contains ") {
+        (&condition[..pos], "contains", condition[pos + 10..].trim())
+    } else if let Some(pos) = condition.find(">=") {
+        (condition[..pos].trim(), ">=", condition[pos + 2..].trim())
+    } else if let Some(pos) = condition.find("<=") {
+        (condition[..pos].trim(), "<=", condition[pos + 2..].trim())
+    } else if let Some(pos) = condition.find("!=") {
+        (condition[..pos].trim(), "!=", condition[pos + 2..].trim())
+    } else if let Some(pos) = condition.find("==") {
+        (condition[..pos].trim(), "==", condition[pos + 2..].trim())
+    } else if let Some(pos) = condition.find('>') {
+        (condition[..pos].trim(), ">", condition[pos + 1..].trim())
+    } else if let Some(pos) = condition.find('<') {
+        (condition[..pos].trim(), "<", condition[pos + 1..].trim())
+    } else {
+        // Bare truthiness check: `item.published` (no operator)
+        let lhs = condition.trim();
+        if lhs.starts_with(&prefix) {
+            let prop = &lhs[prefix.len()..];
+            if prop.is_empty() {
+                return Ok(None);
+            }
+            let v = fetch_nested_prop(ruby, obj, prop)?;
+            // Liquid truthiness: nil and false are falsy, everything else truthy.
+            let truthy = !v.is_nil() && v.to_bool();
+            return Ok(Some(truthy));
+        }
+        return Ok(None);
+    };
+
+    let lhs = lhs_raw.trim();
+
+    // LHS must be a property access on the loop variable
+    if !lhs.starts_with(&prefix) {
+        return Ok(None);
+    }
+    let prop = &lhs[prefix.len()..];
+    if prop.is_empty() {
+        return Ok(None);
+    }
+
+    let v = fetch_nested_prop(ruby, obj, prop)?;
+    let rhs = rhs_raw.trim();
+
+    // Parse the RHS literal
+    enum RhsVal {
+        Nil,
+        Empty,
+        Blank,
+        Bool(bool),
+        Literal(String),
+    }
+    let rhs_val = if rhs == "nil" || rhs == "null" {
+        RhsVal::Nil
+    } else if rhs == "empty" {
+        RhsVal::Empty
+    } else if rhs == "blank" {
+        RhsVal::Blank
+    } else if rhs == "true" {
+        RhsVal::Bool(true)
+    } else if rhs == "false" {
+        RhsVal::Bool(false)
+    } else if (rhs.starts_with('\'') && rhs.ends_with('\''))
+        || (rhs.starts_with('"') && rhs.ends_with('"'))
+    {
+        RhsVal::Literal(rhs[1..rhs.len() - 1].to_string())
+    } else {
+        RhsVal::Literal(rhs.to_string())
+    };
+
+    // ----- contains -----
+    if op == "contains" {
+        let target = match &rhs_val {
+            RhsVal::Nil | RhsVal::Empty | RhsVal::Blank => return Ok(Some(false)),
+            RhsVal::Bool(b) => b.to_string(),
+            RhsVal::Literal(s) => s.clone(),
+        };
+        if v.is_nil() {
+            return Ok(Some(false));
+        }
+        // String contains substring
+        if let Some(rs) = RString::from_value(v) {
+            return Ok(Some(rs.to_string()?.contains(&target)));
+        }
+        // Array contains element
+        if let Some(arr) = RArray::from_value(v) {
+            let len: i64 = i64::try_convert(arr.funcall("length", ())?)?;
+            for idx in 0..len {
+                let el: Value = arr.funcall("[]", (idx,))?;
+                if !el.is_nil() {
+                    let el_s = value_to_string(el)?;
+                    if el_s == target {
+                        return Ok(Some(true));
+                    }
+                }
+            }
+            return Ok(Some(false));
+        }
+        return Ok(Some(false));
+    }
+
+    // ----- comparison operators -----
+    match &rhs_val {
+        RhsVal::Nil => {
+            let result = match op {
+                "==" => v.is_nil(),
+                "!=" => !v.is_nil(),
+                _ => false, // >, <, >=, <= with nil => false
+            };
+            Ok(Some(result))
+        }
+        RhsVal::Empty => {
+            let is_emp = if v.is_nil() { true } else { is_empty_value(ruby, v)? };
+            let result = match op {
+                "==" => is_emp,
+                "!=" => !is_emp,
+                _ => false,
+            };
+            Ok(Some(result))
+        }
+        RhsVal::Blank => {
+            let is_blk = is_blank_value(ruby, v)?;
+            let result = match op {
+                "==" => is_blk,
+                "!=" => !is_blk,
+                _ => false,
+            };
+            Ok(Some(result))
+        }
+        RhsVal::Bool(expected) => {
+            let v_bool = !v.is_nil() && v.to_bool();
+            let result = match op {
+                "==" => v_bool == *expected,
+                "!=" => v_bool != *expected,
+                _ => false,
+            };
+            Ok(Some(result))
+        }
+        RhsVal::Literal(ref s) => {
+            if v.is_nil() {
+                // nil compared with a literal
+                return Ok(Some(match op {
+                    "!=" => true,
+                    _ => false,
+                }));
+            }
+            // Try numeric comparison first
+            let vs_str = value_to_string(v)?;
+            let lhs_num = vs_str.trim().parse::<f64>().ok();
+            let rhs_num = s.trim().parse::<f64>().ok();
+            if let (Some(ln), Some(rn)) = (lhs_num, rhs_num) {
+                let result = match op {
+                    "==" => (ln - rn).abs() < f64::EPSILON,
+                    "!=" => (ln - rn).abs() >= f64::EPSILON,
+                    ">" => ln > rn,
+                    "<" => ln < rn,
+                    ">=" => ln >= rn,
+                    "<=" => ln <= rn,
+                    _ => false,
+                };
+                return Ok(Some(result));
+            }
+            // String comparison
+            let result = match op {
+                "==" => vs_str == *s,
+                "!=" => vs_str != *s,
+                ">" => vs_str.as_str() > s.as_str(),
+                "<" => (vs_str.as_str()) < s.as_str(),
+                ">=" => vs_str.as_str() >= s.as_str(),
+                "<=" => vs_str.as_str() <= s.as_str(),
+                _ => false,
+            };
+            Ok(Some(result))
+        }
+    }
+}
+
 fn where_exp_fast(input: Value, variable: Value, expression: Value) -> Result<Value, Error> {
     let ruby = ruby_handle()?;
     let arr = match RArray::from_value(input) {
@@ -688,100 +880,96 @@ fn where_exp_fast(input: Value, variable: Value, expression: Value) -> Result<Va
         .to_string()?;
     let expr = expr_s.trim();
 
-    // Bail on unsupported operators/keywords
-    if expr.contains(" contains ")
-        || expr.contains(" and ")
-        || expr.contains(" or ")
-        || expr.contains('>')
-        || expr.contains('<')
-        || expr.contains(" site.")
-    {
+    // Bail on `site.` references — these need the Liquid runtime context
+    // which we don't have access to in this code path.
+    if expr.contains(" site.") || expr.starts_with("site.") {
         return Ok(ruby.qnil().into_value_with(&ruby));
     }
 
-    let (lhs, op, rhs) = if let Some(pos) = expr.find("==") {
-        (expr[..pos].trim(), "==", expr[pos + 2..].trim())
-    } else if let Some(pos) = expr.find("!=") {
-        (expr[..pos].trim(), "!=", expr[pos + 2..].trim())
-    } else {
-        return Ok(ruby.qnil().into_value_with(&ruby));
-    };
-
-    let prefix = format!("{}.", var);
-    if !lhs.starts_with(&prefix) {
-        return Ok(ruby.qnil().into_value_with(&ruby));
-    }
-    let prop = &lhs[prefix.len()..];
-    if prop.is_empty() {
-        return Ok(ruby.qnil().into_value_with(&ruby));
-    }
-
-    enum RHS {
-        Nil,
-        Empty,
-        Blank,
-        Literal(String),
-    }
-    let rhs_kind = if rhs == "nil" || rhs == "null" {
-        RHS::Nil
-    } else if rhs == "empty" {
-        RHS::Empty
-    } else if rhs == "blank" {
-        RHS::Blank
-    } else if (rhs.starts_with('\'') && rhs.ends_with('\''))
-        || (rhs.starts_with('"') && rhs.ends_with('"'))
-    {
-        RHS::Literal(rhs[1..rhs.len() - 1].to_string())
-    } else {
-        RHS::Literal(rhs.to_string())
-    };
+    // Try to split on `and` / `or` connectors (only top-level, no nesting)
+    let has_and = expr.contains(" and ");
+    let has_or = expr.contains(" or ");
 
     let len: i64 = i64::try_convert(arr.funcall("length", ())?)?;
     let out = ruby.ary_new();
-    for i in 0..len {
-        let obj: Value = arr.funcall("[]", (i,))?;
-        let v = fetch_nested_prop(&ruby, obj, prop)?;
-        let matched = match &rhs_kind {
-            RHS::Nil => {
-                if op == "==" {
-                    v.is_nil()
-                } else {
-                    !v.is_nil()
-                }
-            }
-            RHS::Empty => {
-                let is_emp = is_empty_value(&ruby, v)?;
-                if op == "==" {
-                    is_emp
-                } else {
-                    !is_emp
-                }
-            }
-            RHS::Blank => {
-                let is_blk = is_blank_value(&ruby, v)?;
-                if op == "==" {
-                    is_blk
-                } else {
-                    !is_blk
-                }
-            }
-            RHS::Literal(ref s) => {
-                if v.is_nil() || v.is_kind_of(ruby.class_array()) || v.is_kind_of(ruby.class_hash())
-                {
-                    false
-                } else {
-                    let vs: RString = v.funcall("to_s", ())?;
-                    let vs_s = vs.to_string()?;
-                    if op == "==" {
-                        vs_s == *s
+
+    if has_and || has_or {
+        // Split on `and` / `or`. We handle a flat chain:
+        //   cond1 and cond2 and cond3
+        //   cond1 or cond2 or cond3
+        // Mixed `and`/`or` without parens: evaluate left-to-right (Liquid semantics).
+        // Split into clauses and connectors.
+        let mut clauses: Vec<&str> = Vec::new();
+        let mut connectors: Vec<&str> = Vec::new();
+        let mut remainder = expr;
+        loop {
+            let and_pos = remainder.find(" and ");
+            let or_pos = remainder.find(" or ");
+            match (and_pos, or_pos) {
+                (Some(ap), Some(op)) => {
+                    if ap < op {
+                        clauses.push(remainder[..ap].trim());
+                        connectors.push("and");
+                        remainder = &remainder[ap + 5..];
                     } else {
-                        vs_s != *s
+                        clauses.push(remainder[..op].trim());
+                        connectors.push("or");
+                        remainder = &remainder[op + 4..];
                     }
                 }
+                (Some(ap), None) => {
+                    clauses.push(remainder[..ap].trim());
+                    connectors.push("and");
+                    remainder = &remainder[ap + 5..];
+                }
+                (None, Some(op)) => {
+                    clauses.push(remainder[..op].trim());
+                    connectors.push("or");
+                    remainder = &remainder[op + 4..];
+                }
+                (None, None) => {
+                    clauses.push(remainder.trim());
+                    break;
+                }
             }
-        };
-        if matched {
-            out.push(obj)?;
+        }
+
+        for i in 0..len {
+            let obj: Value = arr.funcall("[]", (i,))?;
+            let mut result: Option<bool> = None;
+            for (idx, clause) in clauses.iter().enumerate() {
+                let clause_result = eval_where_exp_condition(&ruby, &var, obj, clause)?;
+                let Some(cr) = clause_result else {
+                    // Unsupported expression — bail to Ruby
+                    return Ok(ruby.qnil().into_value_with(&ruby));
+                };
+                if idx == 0 {
+                    result = Some(cr);
+                } else {
+                    let connector = connectors[idx - 1];
+                    let prev = result.unwrap_or(false);
+                    result = Some(if connector == "and" {
+                        prev && cr
+                    } else {
+                        prev || cr
+                    });
+                }
+            }
+            if result.unwrap_or(false) {
+                out.push(obj)?;
+            }
+        }
+    } else {
+        // Single condition
+        for i in 0..len {
+            let obj: Value = arr.funcall("[]", (i,))?;
+            let matched = eval_where_exp_condition(&ruby, &var, obj, expr)?;
+            let Some(m) = matched else {
+                return Ok(ruby.qnil().into_value_with(&ruby));
+            };
+            if m {
+                out.push(obj)?;
+            }
         }
     }
     Ok(out.into_value_with(&ruby))

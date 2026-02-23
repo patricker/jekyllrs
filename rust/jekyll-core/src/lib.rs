@@ -30,8 +30,23 @@ mod yaml_header;
 
 use magnus::{prelude::*, Error, RModule, Ruby};
 
+/// Initialize tracing subscriber for structured Rust-side logging.
+/// Controlled via `RUST_LOG` env var (e.g. `RUST_LOG=debug`).
+/// When Jekyll's `--trace` flag is used, `RUST_BACKTRACE=1` is set by the CLI
+/// which also enables verbose tracing output.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
+    init_tracing();
+
     let jekyll: RModule = match ruby.class_object().const_get::<_, RModule>("Jekyll") {
         Ok(module) => module,
         Err(_) => ruby.define_module("Jekyll")?,

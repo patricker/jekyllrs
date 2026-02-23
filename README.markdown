@@ -25,6 +25,40 @@ See: [https://jekyllrb.com/philosophy](https://jekyllrb.com/philosophy)
 * [Fork](https://github.com/jekyll/jekyll/fork) and [Contribute](https://jekyllrb.com/docs/contributing/) your own modifications
 * Have questions? Check out our official forum community [Jekyll Talk](https://talk.jekyllrb.com/) and [`#jekyll` Channel on Libera IRC](https://libera.chat)
 
+## Rust Engine
+
+Jekyll includes a native Rust core engine that accelerates Liquid rendering, Markdown conversion, file I/O, and the development server. The Rust engine is loaded automatically — no configuration needed.
+
+### `jekyllrs` Binary
+
+A standalone Rust CLI is available at `rust/target/{debug,release}/jekyllrs`:
+
+```sh
+# Build
+bash script/rust-build
+
+# Use
+jekyllrs build        # Build your site
+jekyllrs serve        # Build + live-reload dev server
+jekyllrs clean        # Clean build artifacts
+```
+
+`jekyllrs` embeds Ruby and loads your `Gemfile`, so existing plugins work unchanged.
+
+### Development
+
+```sh
+# Build the Rust library
+bash script/rust-build
+
+# Run tests with Rust engine
+bundle exec rake rust:test          # MiniTest
+bash script/cucumber --color        # Full Cucumber suite
+
+# Benchmark
+ruby benchmark/large-site.rb
+```
+
 ## Diving In
 
 * [Migrate](https://import.jekyllrb.com/docs/home/) from your previous system
