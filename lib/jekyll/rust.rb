@@ -48,6 +48,36 @@ module Jekyll
         { "tags" => tags, "blocks" => blocks }
       end
 
+      # Returns include directories and safe mode for native Rust include resolution.
+      # Called once during parser build and cached.
+      def include_config(site)
+        ensure_loaded!
+        dirs = site.includes_load_paths.map(&:to_s)
+        { "dirs" => dirs, "safe" => site.safe }
+      end
+
+      # Builds a lookup table mapping relative_path → url for all site files.
+      # Called once during parser build to enable native {% link %} resolution.
+      def link_lookup_table(site)
+        ensure_loaded!
+        table = {}
+        baseurl = site.config["baseurl"].to_s
+        site.each_site_file do |item|
+          rp = item.relative_path
+          # relative_url: prepend baseurl
+          url = if item.respond_to?(:url)
+                  item.url
+                else
+                  rp
+                end
+          full_url = baseurl.empty? ? url : "#{baseurl}#{url}"
+          table[rp] = full_url
+          # Also register with leading slash for static files
+          table["/#{rp}"] = full_url unless rp.start_with?("/")
+        end
+        table
+      end
+
       def prepare_liquid_filter_context(payload, info)
         ensure_loaded!
         info ||= {}

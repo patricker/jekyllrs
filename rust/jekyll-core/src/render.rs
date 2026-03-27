@@ -953,6 +953,7 @@ pub(crate) fn render_site(site: Value) -> Result<(), Error> {
     render_pages(&ctx, site, payload, layouts, regenerator)?;
 
     let _ = bridge.funcall::<_, _, Value>("hook_trigger_site", (site, post_render_symbol, payload))?;
+    crate::liquid_engine::dump_render_stats();
     Ok(())
 }
 
@@ -1343,8 +1344,9 @@ fn build_render_info(ctx: &RenderingContext, site: Value, payload: Value) -> Res
     let site_symbol = ctx.symbol("site");
     let page_symbol = ctx.symbol("page");
     let registers_symbol = ctx.symbol("registers");
-    let strict_filters_symbol = ctx.symbol("strict_filters");
-    let strict_variables_symbol = ctx.symbol("strict_variables");
+    // Use string keys so render_liquid_template can read them back with string lookups.
+    let strict_filters_key = ctx.str("strict_filters");
+    let strict_variables_key = ctx.str("strict_variables");
 
     registers.funcall::<_, _, Value>("[]=", (site_symbol, site))?;
     let page_value: Value = payload.funcall::<_, _, Value>("[]", (ctx.str("page"),))?;
@@ -1359,8 +1361,8 @@ fn build_render_info(ctx: &RenderingContext, site: Value, payload: Value) -> Res
 
     let registers_value = registers.into_value_with(ctx.ruby);
     info.funcall::<_, _, Value>("[]=", (registers_symbol, registers_value))?;
-    info.funcall::<_, _, Value>("[]=", (strict_filters_symbol, strict_filters))?;
-    info.funcall::<_, _, Value>("[]=", (strict_variables_symbol, strict_variables))?;
+    info.funcall::<_, _, Value>("[]=", (strict_filters_key, strict_filters))?;
+    info.funcall::<_, _, Value>("[]=", (strict_variables_key, strict_variables))?;
     Ok(info.into_value_with(ctx.ruby))
 }
 
@@ -1429,6 +1431,7 @@ fn render_liquid_template(
             Ok(rendered_value)
         }
         Err(err) => {
+
             // Excerpt recursion guard: if an excerpt render overflows, log and continue with raw content
             if let Some(ref pval) = path {
                 if let Ok(ps) = RString::try_convert(pval.funcall::<_, _, Value>("to_s", ())?) {
@@ -1446,18 +1449,48 @@ fn render_liquid_template(
 
             let msg_s = err.to_string();
 
-            // In non-strict mode, silently ignore unknown index/filter errors
-            // (matches Ruby Liquid's non-strict behavior of returning empty string)
+            // In non-strict mode, silently ignore unknown index/filter errors.
+            // Ruby Liquid's lax mode renders unknown variables as empty strings.
+            // Return an empty Ruby string — never return raw Liquid template source.
             if !strict_variables && msg_s.contains("Unknown index") {
-                return Ok(content);
+
+                return Ok(ctx.ruby.str_new("").into_value_with(ctx.ruby));
             }
             if !strict_filters && msg_s.contains("Unknown filter") {
-                return Ok(content);
+                return Ok(ctx.ruby.str_new("").into_value_with(ctx.ruby));
             }
 
-            // Format and log the Liquid error using Ruby's formatter
+            // Reformat strict mode errors to match Ruby Liquid's message format.
+            // Ruby Liquid produces: "Liquid error (line N): undefined variable X"
+            // Rust Liquid produces: "Unknown index\n  with:\n    variable=page\n    requested index=X\n ..."
             let mut cleaned = msg_s.replace("liquid: ", "");
             if let Some(s) = cleaned.strip_prefix("RuntimeError: ") { cleaned = s.to_string(); }
+
+            if cleaned.contains("Unknown index") {
+                // Extract the requested index name: "requested index=NAME"
+                let var_name = cleaned.find("requested index=")
+                    .map(|pos| {
+                        let rest = &cleaned[pos + 16..];
+                        let end = rest.find(|c: char| c == ' ' || c == '\n').unwrap_or(rest.len());
+                        rest[..end].to_string()
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
+                // Compute line number by finding the variable expression in the content
+                let line = find_line_of_expression(&content_string, &var_name);
+                cleaned = format!("Liquid error (line {}): undefined variable {}", line, var_name);
+            } else if cleaned.contains("Unknown filter") {
+                // Extract filter name: "requested filter=FILTERNAME"
+                let filter_name = cleaned.find("requested filter=")
+                    .map(|pos| {
+                        let rest = &cleaned[pos + 17..];
+                        let end = rest.find(|c: char| c == ' ' || c == '\n').unwrap_or(rest.len());
+                        rest[..end].to_string()
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
+                let line = find_line_of_expression(&content_string, &filter_name);
+                cleaned = format!("Liquid error (line {}): undefined filter {}", line, filter_name);
+            }
+
             let msg = ctx.ruby.str_new(&cleaned);
             let exception_obj = ctx
                 .ruby
@@ -1471,6 +1504,30 @@ fn render_liquid_template(
             Err(err)
         }
     }
+}
+
+/// Find the 1-based line number of a Liquid expression containing `name` in `content`.
+/// Searches for {{ ... name ... }} or | name patterns. Returns 1 if not found.
+fn find_line_of_expression(content: &str, name: &str) -> usize {
+    // Strip leading newline to match Ruby Liquid's line numbering (content
+    // after front matter typically starts with \n which Ruby doesn't count).
+    let content = content.strip_prefix('\n').unwrap_or(content);
+    // Search each line for the expression name inside {{ }}, {% %}, or after |
+    for (idx, line) in content.lines().enumerate() {
+        if line.contains(name) {
+            // Check if it's inside a Liquid expression context
+            if line.contains("{{") || line.contains("{%") || line.contains("|") {
+                return idx + 1;
+            }
+        }
+    }
+    // Fallback: just find the first line containing the name
+    for (idx, line) in content.lines().enumerate() {
+        if line.contains(name) {
+            return idx + 1;
+        }
+    }
+    1
 }
 
 fn convert_content(

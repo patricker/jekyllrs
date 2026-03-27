@@ -1,325 +1,219 @@
-Got it—no runtime fallbacks to Ruby, no “compat flags,” and `jekyllrs` is a **replacement**, not a sibling. Serve/watch is an early pickup. Rendering is the long pole. Below is a **concrete, phased TODO** that reflects those constraints and what’s already in your tree (`rust/jekyll-core`, `rust/jekyll-cli`, Ruby bridge in `lib/jekyll/rust.rb`, etc.).
+# Jekyll Rust Engine — Verified Status & TODO
+
+> **Last verified:** 2026-03-01 (against actual source code, not previous notes)
 
 ---
 
-## Phase 1 — Entrypoints & packaging (Rust by default, everywhere)
+## Cucumber Test Correctness
 
-**Goal:** `jekyll` and `jekyllrs` both execute the Rust engine (not “if available”—**always**). Remove env‑var coupling and Linux‑only dlopen assumptions.
+### Verified Fixes (in code)
 
-**TODO**
+1. **`render.rs` error handler (line 1454)** — Returns empty string on "Unknown index" in lax mode ✅
+   - Code confirmed at `render.rs:1454`: `return Ok(ctx.ruby.str_new("").into_value_with(ctx.ruby));`
 
-* **Load the cdylib without env vars**
+2. **`to_liquid_value()` eagerly resolves `excerpt`** — With `IN_EAGER_RESOLVE` recursion guard ✅
+   - Code confirmed at `liquid_engine.rs:682-740`
 
-  * [x] In `lib/jekyll/rust.rb`, switch `ensure_loaded!` to `require 'jekyll_core'` first; only then allow `JEKYLL_RUST_LIB` override as a dev escape hatch. Remove the hard error when env var is missing.
-    *Files:* `lib/jekyll/rust.rb`
-  * [x] Create a tiny Ruby extension gem wrapper for the cdylib (`ext/jekyll_core`) so `require 'jekyll_core'` works cross‑platform. Use `rb-sys` template to build the Rust `cdylib`.
-    *Files:* new `ext/` scaffold + gemspec changes.
+3. **`SafeValue::get()` returns nil for non-Object types in lax mode** ✅
+   - Code confirmed at `liquid_engine.rs:892`: `else if self.strict { None } else { Some(&self.nil) }`
 
-* **Cross‑platform library discovery for `jekyllrs`**
+4. **`SafeValue::contains_key()` returns true for non-Object types in lax mode** ✅
+   - Code confirmed at `liquid_engine.rs:841`: `_ => if self.strict { false } else { true }`
 
-  * [x] In `rust/jekyll-cli/src/main.rs`, make `locate_rust_lib()` probe `.so/.dylib/.dll` and both `libjekyll_core.*`/`jekyll_core.*`.
-    *Files:* `rust/jekyll-cli/src/main.rs`
-  * [x] Update `script/rust-build` to compute `LIB_EXT` per OS and echo the correct `JEKYLL_RUST_LIB=…`.
-    *Files:* `script/rust-build`
+### Known Bug: strict mode key mismatch
 
-* **CLI wiring (no Mercenary dependence for `jekyllrs`)**
+**`build_render_info` uses symbol keys** (`:strict_filters`, `:strict_variables`) to store in the info hash, but **`render_liquid_template` reads with string keys** (`"strict_filters"`, `"strict_variables"`). This means the primary read always fails, and only the fallback path (direct site.config.liquid read, lines 1396-1405) works. This should be fine for correctness but wastes FFI calls.
 
-  * [x] Keep your Rust arg parser in `jekyllrs` and ensure `--trace`, config selection, multiple `-c`/`--config`, and `--profile` semantics match.
-    *Files:* `rust/jekyll-cli/src/main.rs`
+- `build_render_info` at `render.rs:1347-1348`: symbol keys
+- `render_liquid_template` at `render.rs:1392-1393`: string keys
 
-* **Packaging**
+### Debug Output Still Present ⚠️
 
-  * [ ] Ship prebuilt native gems for common platforms (macOS x64/arm64, Linux x64/aarch64 gnu+musl, Windows x64).
-    *Build:* GH Actions matrix; cache cargo.
+Two debug `eprintln!` statements remain:
+- `render.rs:1433` — `eprintln!("RUST_DEBUG render_liquid_template error: ...")`
+- `render.rs:1455` — `eprintln!("RUST_DEBUG lax unknown index: ...")`
 
-**Acceptance**
+These should be removed before benchmarking/release.
 
-* `bundle exec jekyll build` engages Rust with **no env var** on macOS, Linux, Windows.
-* `jekyllrs build` works on all three OSes and finds the lib next to the binary.
-* Removing Rust (or breaking the lib) **breaks the command** (no fallback).
+### Test Status
 
----
-
-## Phase 2 — Serve & Watch in Rust (early win + reduce bridging)
-
-**Goal:** Replace Ruby’s `Serve`/`jekyll-watch` with Rust implementations, but still trigger Ruby plugins/hooks where expected.
-
-**TODO**
-
-* **HTTP server**
-
-  * [x] Implement a minimal static server in Rust (e.g., `hyper` or `axum`) with:
-
-    * [x] directory index support (toggle via config),
-    * [x] gzip/deflate/BR if requested,
-    * [x] Cache-Control + 404 fallback responses (500/TLS TODO),
-    * [x] baseurl handling.
-  * [x] Map Jekyll config → server settings (port/host/ssl options) per `lib/jekyll/commands/serve.rb` options.
-
-* **LiveReload**
-
-  * [x] Inject LiveReload script (Rust) or surface interim guidance if Injector missing.
-  * [x] WebSocket endpoint in Rust mirroring `livereload` semantics.
-  * [x] Implement `livereload_ignore` filtering identical to Ruby (`File.fnmatch?` parity). You can call back into Ruby initially (existing RRegexp/`fnmatch` bridge), then replace with a Rust `globset` implementation that matches Ruby’s flags.
-  * [x] Remove Ruby hook registration; broadcast post-build reloads directly from the Rust engine.
-
-
-
-* **Watch**
-
-  * [x] Use `notify` (debounced) with ignore rules honoring: `exclude`, `_site`, theme/vendor dirs, `.jekyll-metadata`, etc.
-  * [x] On change: call **Rust build** (`engine_build_process`) and then broadcast LiveReload diffs via the Rust LiveReload bridge.
-
-* **Command surface**
-
-* [x] Add `serve` subcommand to `jekyllrs` (you already parse `serving`/`watch` inside `cli_build.rs`; use a native watcher path instead of `Jekyll::Watcher`).
-    *Files:* `rust/jekyll-cli/src/main.rs`, new `rust/jekyll-core/src/cli_serve.rs` (or fold into `cli_build.rs`).
-  * [x] Register `jekyll serve` via `Jekyll::CLI::ServeCommand` so the Ruby CLI just shells into the Rust bridge.
-    *Files:* `exe/jekyll`, `lib/jekyll/cli/serve_command.rb`
-
-* **Remove Ruby watchers from hot path**
-
-* [x] Stop requiring `jekyll-watch` in `cli_build.rs` (currently invoked when `watch` true). Replace with noop there; watcher lives in Rust serve path.
-    *Files:* `rust/jekyll-core/src/cli_build.rs`
-
-**Acceptance**
-
-* `jekyll serve` and `jekyllrs serve` start the Rust server; file changes rebuild and reload on all three OSes.
-* Cucumber serve/watch behaviors pass (same flags, same user‑visible behavior).
-* No Ruby `Watcher` threads spawned.
+**Last known:** 14 failures (down from 20). Not re-verified in this review.
+```
+STILL FAILING (14 tests — last known, needs re-run to confirm):
+  collections.feature:424         — sort by title
+  create_sites.feature:204        — related posts
+  include_tag.feature:6, 108      — include params (still hitting Ruby path)
+  incremental_rebuild.feature:55, 70 — incremental rebuild
+  markdown.feature:6, 20          — for loop content/excerpt
+  post_data.feature:383           — page.next.title / page.previous.title
+  rendering.feature:66, 85        — strict mode not propagating error to exit code
+  rendering.feature:211           — page.content in for loop
+  site_data.feature:79, 90        — site.tags iteration
+```
 
 ---
 
-## Phase 3 — Rendering orchestration in Rust (keep Ruby Liquid for the moment)
+## Phase 1: Native Include Tag — Status
 
-**Goal:** Move all orchestration (layout chain, payload shaping, document sequencing) into Rust; keep **actual Liquid evaluation** in Ruby for this phase. No runtime switch—remove old Ruby orchestration as you land Rust.
+### Step 1a: Copy Jekyll include tag — PARTIALLY DONE (via different approach)
 
-**TODO**
+- `liquid-lib` with `jekyll` feature **IS** in Cargo.toml dependencies (`liquid-lib = { version = "0.26", features = ["jekyll"] }`)
+- However, there is **no `JekyllIncludeTag`** registered in the parser builder
+- Instead, includes are handled via `RubyTagRenderable::render_to()` fast-path (lines 2842-2864): when `self.name == "include"` and the markup is a simple filename (no params, no `{{`, no spaces), it uses `runtime.partials().get(trimmed)` to render via the Rust PartialStore
+- **Complex includes with params** still go through Ruby
 
-* **Layout chain & payload**
+### Step 1b: JekyllIncludeSource (PartialSource) — ✅ COMPLETE
 
-  * [x] Build the layout resolution and rendering order in Rust (`engine.rs`) and call Ruby Liquid once per step.
-  * [x] Create Rust structs for site/page/post payloads and only convert to Ruby once per render call (minimize object churn).
-    *Files:* `rust/jekyll-core/src/engine.rs` (extend), new payload module.
+- `JekyllIncludeSource` struct implemented at `liquid_engine.rs:237-274`
+- Implements `PartialSource` trait with `contains()`, `names()`, `try_get()`
+- `try_get()` includes preprocessing via `preprocess_raw_tag_markup()` ✅
+- Includes symlink safety check for safe mode ✅
 
-* **Includes**
+### Step 1c: Wire into parser builder with LazyCompiler — ✅ COMPLETE
 
-  * [x] Resolve `{% include %}` and `{% include_relative %}` paths in Rust; pass final strings/data into Ruby Liquid.
+- `fetch_include_config()` fetches include dirs from Ruby at `liquid_engine.rs:277-314`
+- `LazyCompiler::new(include_source)` created at line 3303
+- Parser built with `.partials(partials)` at line 3306
+- Parser is cached in `PARSER_CACHE` thread_local ✅
 
-* **Filters registry**
+### Step 1d: Remove "include" from preprocessor needs_raw — ❌ NOT DONE
 
-  * [x] Register Ruby filters **once** per render cycle in a hub (see next phase), not per page.
+- `include` is **still** in the `needs_raw` list at line 65:
+  ```rust
+  let needs_raw = matches!(name.as_str(), "post_url" | "include" | "include_relative" | "link");
+  ```
+- This means `{% include %}` markup is hex-encoded before the parser sees it
+- The native include fast-path in `RubyTagRenderable::render_to()` decodes the hex first, then does the partial lookup
+- This works but is suboptimal — the ideal approach would remove `include` from `needs_raw` and register a proper `JekyllIncludeTag` that parses the raw syntax directly
 
-* **Remove duplicated logic in Ruby**
+### Step 1e: Skip RubyTagParser for "include" — ❌ NOT DONE
 
-  * [x] Delete/mothball Ruby code in `lib/jekyll/renderer.rb` that orchestrates phases already handled in Rust (keep only compatibility shims that call the Rust bridge).
+- At line 3345-3350, ALL tag names from `fetch_tag_kinds()` get registered as `RubyTagParser` (except `assign`)
+- `include` is NOT excluded — it gets a `RubyTagParser` which overrides whatever the stdlib registered
+- The fast-path works only because `RubyTagRenderable::render_to()` intercepts `include` before calling Ruby
 
-**Acceptance**
+### Current Include Architecture (actual, not planned)
 
-* Rendering correctness tests pass against your current suite, with render time reduced vs. current master due to fewer Ruby crossings.
+```
+Rust preprocessor hex-encodes {% include filename.html %}
+  → RubyTagParser("include") parses hex-encoded markup
+  → RubyTagRenderable::render_to() is called
+    → Decodes hex markup
+    → If simple (no params, no {{, no spaces):
+        → Looks up partial via runtime.partials() (LazyCompiler → JekyllIncludeSource)
+        → Renders partial in Rust ✅
+    → If complex (params/variables):
+        → Falls through to Ruby FFI ❌ (still slow)
+```
 
----
-
-## Phase 4 — Liquid engine in Rust (with Ruby filter/tag bridge)
-
-**Goal:** Replace Ruby Liquid with a Rust Liquid implementation and **bridge** to Ruby for user‑defined filters/tags. This is not a fallback—Ruby filters/tags are a **first‑class** part of the Rust engine via a stable FFI boundary.
-
-**TODO**
-
-* **Engine**
-
-  * [x] Integrate `liquid` (Rust) and extend in‑tree.
-  * [x] Implement core Jekyll behaviors in Rust engine:
-    - `strict_filters`/`strict_variables` respected natively in Rust (no Ruby delegation),
-    - `{% highlight %}` passthrough via synthetic block,
-    - template caching keyed by path/mtime/filters.
-    - Note: whitespace trim semantics tracked separately if diffs arise in tests.
-
-* **Ruby bridge for filters/tags**
-
-  * [x] Filters: for filters not implemented in Rust, marshal args to Ruby and run the Ruby filter (arity resolved by Liquid), fast‑path common scalars/arrays/maps.
-  * [x] Tags: tag provider that defers to Ruby’s tag class with body capture when needed.
-  * [x] Implement core Jekyll filters natively in Rust (`map`, `join`, `where`, `where_exp`, `sort`, `group_by`, URL helpers) and keep the bridge for everything else.
-    - Implemented: `map`, `join`, `where`, `where_exp`, `sort` (with `nils:` positional and keyword), `group_by`, `find`, URL helpers (`absolute_url`, `relative_url`, `strip_index`), and collection utilities (`uniq`, `compact`).
-    *Files:* `rust/jekyll-core/src/liquid_engine.rs`, `rust/jekyll-core/src/utils.rs`.
-
-* **Drop semantics**
-
-  * [x] Convert Ruby Drops/Hashes to Liquid values with cycle‑guard; expose stable projections for `SiteDrop`/`DocumentDrop` keys while deferring heavy keys.
-  * [x] Optional: `RubyDrop` adapter -- not needed; Ruby Drops handled via `SafeValue` with on‑demand forwarding when needed.
-
-* **Template caching**
-
-  * [x] Cache parsed templates (keyed by path + mtime + filters); invalidate on path/mtime change; cap cache size.
-
-* **Remove Ruby Liquid**
-
-  * [x] Remove Ruby Liquid from render path entirely. Removed strict mode delegation and unknown filter/index fallbacks; Rust Liquid engine handles all rendering.
-
-**Acceptance**
-
-* All render‑related features pass. Any remaining differences are addressed in Rust (no “flip back to Ruby Liquid” escape).
+**Impact:** Simple parameterless includes (the majority for www.ruby-lang.org) render in Rust. Includes with parameters still go through Ruby.
 
 ---
 
-## Phase 5 — Converters pipeline in Rust (wrapping Ruby converters/plugins)
+## Phase 2: Native Link Tag — COMPLETE (via hex-encoded approach)
 
-**Goal:** Orchestrate conversion in Rust; **call Ruby converters/plugins through a dedicated bridge**, but the pipeline control lives in Rust.
+### NativeLinkTag struct exists but is NOT registered in the parser builder
 
-**TODO**
+- `NativeLinkTag` defined at `liquid_engine.rs:364-440` with full `ParseTag` implementation
+- **NOT registered** in the parser builder — it's never called
+- `link` is still in `needs_raw` (hex-encoded in preprocessor)
+- Instead, `RubyTagRenderable::render_to()` has a fast-path for `link` at lines 2867-2894 that does the lookup from `LINK_TABLE`
 
-* **Converter registry in Rust**
+### Link lookup table — ✅ COMPLETE
 
-  * [x] Discover Ruby converters (classes responding to `matches`/`convert`) once at startup and capture their priority.
-  * [x] For each input ext, pick converter chain in Rust and invoke Ruby converters sequentially.
-  * [x] Inline Rust implementation for Markdown using `comrak` with kramdown‑compat options; no runtime flags. Ruby Markdown converter remains for API compatibility/tests but is skipped in the Rust pipeline.
-    *Files:* `rust/jekyll-core/src/render.rs`.
+- `LINK_TABLE` thread_local cache at line 322
+- `get_link_table()` populates from Ruby via `link_lookup_table` method (one-time, cached)
+- Called at line 3380 during template rendering
+- Supports exact match, with/without leading slash
 
-* **Sass**
-
-  * [ ] Keep calling `jekyll-sass-converter` initially; later, consider `grass` with parity layer.
-
-**Acceptance**
-
-* Converter tests pass. Measured drop in per‑page render time due to fewer Ruby crossings.
+**Net result:** Link tags work natively in Rust via the hex-encoded path. The `NativeLinkTag` struct is dead code.
 
 ---
 
-## Phase 6 — Reader & data pipeline completion (finish removing Ruby from I/O)
+## Native Filters — Status
 
-**Goal:** Eliminate remaining Ruby in the hot I/O path.
+### Verified as registered in parser builder (lines 3311-3339):
 
-**TODO**
+| Filter | Status | Notes |
+|--------|--------|-------|
+| `map` | ✅ Native | `MapFilterParser` |
+| `join` | ✅ Native | `JoinFilterParser` |
+| `where` | ✅ Native | `WhereFilterParser` |
+| `where_exp` | ✅ Native | `WhereExpFilterParser` |
+| `sort` | ✅ Native | `SortFilterParser` |
+| `group_by` | ✅ Native | `GroupByFilterParser` |
+| `find` | ✅ Native | `FindFilterParser` |
+| `absolute_url` | ✅ Native | `AbsoluteUrlFilterParser` |
+| `relative_url` | ✅ Native | `RelativeUrlFilterParser` |
+| `strip_index` | ✅ Native | `StripIndexFilterParser` |
+| `uniq` | ✅ Native | `UniqFilterParser` |
+| `compact` | ✅ Native | `CompactFilterParser` |
+| `xml_escape` | ✅ Native | `XmlEscapeFilterParser` |
+| `cgi_escape` | ✅ Native | `CgiEscapeFilterParser` |
+| `uri_escape` | ✅ Native | `UriEscapeFilterParser` |
+| `normalize_whitespace` | ✅ Native | `NormalizeWhitespaceFilterParser` |
+| `number_of_words` | ✅ Native | `NumberOfWordsFilterParser` |
+| `jsonify` | ✅ Native | `JsonifyFilterParser` |
+| `array_to_sentence_string` | ✅ Native | `ArrayToSentenceStringFilterParser` |
+| `push` | ✅ Native | `PushFilterParser` |
+| `pop` | ✅ Native | `PopFilterParser` |
+| `shift` | ✅ Native | `ShiftFilterParser` |
+| `unshift` | ✅ Native | `UnshiftFilterParser` |
+| `to_integer` | ✅ Native | `ToIntegerFilterParser` |
+| `inspect` | ✅ Native | `InspectFilterParser` |
+| `markdownify` | ✅ Native | `MarkdownifyFilterParser` (comrak) |
 
-* **Front matter & YAML**
+**Total native: 26 filters**
 
-  * [x] Port front matter parsing from `SafeYAML` calls to Rust (`serde_yaml`) with the same rules (BOM handling already in `yaml_header.rs`; preserve booleans, dates, and aliases semantics).
-    *Files:* `rust/jekyll-core/src/document_reader.rs` (replace SafeYAML call)
-  * [x] Normalize date/time parsing to match Ruby’s behavior (your `dates.rs`/`time_utils.rs` can centralize this).
+### Still Ruby-only (not found in Rust source):
 
-* **Reader**
-
-  * [x] Walker/classifier parity; `EntryFilter` parity for dotfiles/`exclude` rules implemented fully in Rust; removed Ruby filtering branches.
-    *Files:* `rust/jekyll-core/src/entry_filter.rs`, `fs_walk.rs`, `reader.rs`
-
-* **Static file writes**
-
-  * [x] Ensure single-file writes use tmp+rename, permission mirroring, and mtime updates across OSes.
-    *Files:* `rust/jekyll-core/src/static_file.rs`
-  * [x] Ensure batch writer reuses atomic semantics and reapplies mtimes after parallel copy.
-    *Files:* `rust/jekyll-core/src/static_file.rs`
-
-**Acceptance**
-
-* All cucumber “read/scan/write” features green across OS matrix.
-
----
-
-## Phase 7 — Plugin hook hub & data model stabilization
-
-**Goal:** Centralize all plugin calls in one Rust module; minimize Ruby object construction and ensure ordering matches Jekyll.
-
-**TODO**
-
-* **Hook hub**
-
-  * [x] A single Rust module (`hook_hub.rs`) fires all hooks via centralized dispatch:
-    - [x] Site-level `:pre_render`/`:post_render` routed via `Bridge.hook_trigger_site` (centralized + profiled)
-    - [x] Site-level `:post_write` routed via `Bridge.hook_trigger_site` from Rust `engine` after the write phase; removed direct Ruby trigger in `lib/jekyll/site.rb#write` to avoid double firing.
-    - [x] Site-level `:after_reset` and `:post_read` fired from Rust `engine` after `reset` and `read` phases; removed direct Ruby triggers in `lib/jekyll/site.rb`.
-  * [x] Object identity preserved: Ruby objects passed by reference through magnus `Value`; no reconstruction needed.
-
-* **Profiling**
-
-  * [x] Attribute timings to each plugin/hook; surface summary at the end of build (`--profile`).
-    - Implemented aggregation and summary table (enable via `config['profile_hooks']` or debug logging).
-    *Files:* `lib/jekyll/rust.rb`, `rust/jekyll-core/src/engine.rs`.
-
-* **Generators**
-
-  * [x] Drive Ruby generators from Rust; ensure new pages/documents they create are fed back through the Rust pipeline.
-    - Implemented timing + invocation from Rust; outputs re-rendered in Rust pipeline.
-    *Files:* `rust/jekyll-core/src/engine.rs`.
-
-**Acceptance**
-
-* Popular plugins (pagination, feeds, SEO, Sass) pass their tests unmodified.
+- `date_to_string`, `date_to_long_string`, `date_to_xmlschema`, `date_to_rfc822`
+- `smartify`, `sassify`, `scssify`
+- `slugify` (exists in `slugify.rs` but NOT wired as a Liquid filter)
+- `sample`, `find_exp`, `group_by_exp`
 
 ---
 
-## Phase 8 — Test, perf, and platform polish
+## Build Tooling — Status
 
-**Goal:** Lock correctness and squeeze render time.
+### `script/rust-build` — ✅ COMPLETE
 
-**TODO**
+- Script exists at `script/rust-build` (35 lines)
+- Supports `release` (default) and `debug` modes
+- Builds Rust extension and copies to `lib/jekyll_core.so`
 
-* **Dual-run harness (build vs. serve)**
+### Native Markdown converter (comrak) — ✅ COMPLETE
 
-  * [x] Run the full cucumber suite in CI for macOS/Linux/Windows (Ruby 3.1, 3.3, 3.4).
-    - Updated `rust-ci.yml` to run all features with Ruby version matrix and cargo caching.
-  * [x] Add a large real-world site fixture; record wall time and top hotspots per phase.
-    - Added `benchmark/large-site.rb` generating ~500 pages with posts, collections, includes.
-
-* **String/Path interning**
-
-  * [x] Pre-cache frequently used Ruby strings/symbols in `RenderingContext` (content, layout, page, site, etc.).
-
-* **Parallelism (careful)**
-
-  * [ ] Optional: render pages in parallel if plugins are thread‑safe. Default to 1; add a single config knob in code (not a user‑visible “compat” flag).
-
-* **Logging/trace**
-
-  * [x] Standardized on `tracing` crate. Replaced all `eprintln!` with `tracing::{error,warn}!`. Subscriber init on lib load via `RUST_LOG`.
-
-**Acceptance**
-
-* Stable CI times; a documented delta vs. pre‑Phase‑3 baseline, with flamegraphs for “render” showing Rust Liquid taking the bulk.
+- `RustMarkdownNativeConverter` in `render.rs` (line 252+)
+- Uses comrak with config mapped from Jekyll's kramdown options
+- Registered as an alternative to Ruby's Kramdown converter
 
 ---
 
-## Phase 9 — Cleanout & release cut‑over
+## Remaining Work (Priority Order)
 
-**Goal:** Remove dead Ruby code and publish the replacement package.
+### Immediate
 
-**TODO**
+1. **Remove debug `eprintln!` statements** — `render.rs:1433,1455`
+2. **Fix strict mode key mismatch** — `build_render_info` uses symbol keys, `render_liquid_template` reads string keys
+3. **Re-run cucumber suite** to get current failure count
 
-* **Delete superseded Ruby**
+### Short-term
 
-  * [x] Drop the Ruby serve command and WEBrick helpers now that CLI delegation lives in Rust.
-    *Files:* `exe/jekyll`, `lib/jekyll/cli/serve_command.rb`, removed `lib/jekyll/commands/serve*`
-  * [x] Ruby renderer orchestration already removed. `lib/jekyll/renderer.rb` is a thin delegation wrapper; kept for API compat.
+4. **Clean up dead code** — `NativeLinkTag` struct is unused (link resolution happens via `RubyTagRenderable`)
+5. **Fix `include` with params in Rust** — Currently only simple `{% include filename.html %}` works natively; params fall through to Ruby
+6. **Remove `include` from preprocessor `needs_raw`** and register proper `JekyllIncludeTag` — would simplify the flow
+7. **Wire `slugify` as a Liquid filter** — Implementation exists in `slugify.rs` but not registered
 
-* **`jekyllrs` as the replacement package**
+### Medium-term (correctness)
 
-  * [ ] Publish a `jekyllrs` gem that **provides the `jekyll` executable** (and optionally a `jekyllrs` alias) and depends on the native `jekyll_core` extension.
-  * [ ] Mark explicit **conflict** with the legacy `jekyll` gem so users “swap,” not co‑install.
-  * [x] Ruby plugin surface stable (same `Jekyll::Plugin`/hooks API).
+8. **Fix `page.content` in for loops** (`rendering.feature:211`, `markdown.feature:6,20`)
+9. **Fix `site.tags` iteration** (`site_data.feature:79,90`)
+10. **Fix strict mode propagation** (`rendering.feature:66,85`) — likely related to the symbol/string key mismatch
 
-* **Docs**
+### Long-term (performance)
 
-  * [x] Updated `README.markdown` with Rust Engine section documenting `jekyllrs` usage and development workflow.
-
-**Acceptance**
-
-* Fresh machine install with only `jekyllrs` runs `jekyll build/serve` using your Rust core.
-* No code path exists that can “fall back” to Ruby implementations of core phases.
-
----
-
-## Bite‑size tasks you can land immediately
-
-* [x] **Mac/Windows dlopen** in `jekyllrs` (`.dylib`/`.dll`) and `script/rust-build` OS detection.
-* [x] `--trace` ⇒ set `RUST_BACKTRACE=1` in `rust/jekyll-cli/src/main.rs`.
-* [x] Move the **watch** decision entirely out of Ruby by deleting the `jekyll-watch` calls in `cli_build.rs` and stubbing them until Phase 2 server lands.
-* [x] Add a **Liquid hot-path benchmark** (render N posts with layouts and includes) to CI to track progress through Phases 3–4.
-  * Script added: `benchmark/build-small-site.rb` to generate a small site and time `site.process` via Rust engine.
-* [x] In `entry_filter.rs`, finish the Rust‑side `fnmatch` parity and remove Ruby `RRegexp` reliance after tests are green.
-
----
-
-## Notes keyed to current code
-
-* Your `engine_build_process` (Rust) already drives phases and watcher decisions; redirect all watch/server logic there once the Rust server exists (`cli_build.rs` → no `Jekyll::Watcher`).
-* YAML: `yaml_header.rs` has header detection; `document_reader.rs` still requires `safe_yaml`—that’s the choke‑point to replace.
-* You already have fast filters (`group_by_fast`, `where_*_fast`, etc.) and path/url/slugify in Rust. They can be reused by the Rust Liquid engine as **native filters**.
+11. **Include output caching** — Cache rendered includes keyed by context hash
+12. **Native date filters** — Port `date_to_string` etc.
+13. **Rust data model** (Phase 1 from RUST_OPTIMIZATION_PLAN.md)
+14. **Parallel rendering** with rayon

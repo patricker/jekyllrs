@@ -28,3 +28,8 @@ test/dest
 tmp/*
 
 rust/target/
+
+# Compiled Rust extension (built by script/rust-build)
+lib/jekyll_core.so
+lib/jekyll_core.dylib
+lib/jekyll_core.dll

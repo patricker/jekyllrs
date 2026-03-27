@@ -4,6 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
+use std::borrow::Cow;
+use std::path::PathBuf;
 
 use kstring::KString;
 use liquid::model::{self as liquid_model, Value as LiquidValue};
@@ -17,6 +19,7 @@ use liquid_core::parser::{
     Filter, FilterArguments, FilterReflection, ParameterReflection, ParseFilter,
 };
 use liquid_core::runtime::{Expression, Runtime};
+use liquid_core::partials::{LazyCompiler, PartialSource};
 use magnus::symbol::Symbol;
 use magnus::{
     prelude::*, Error, IntoValue, RArray, RClass, RHash, RModule, RString, Ruby, TryConvert, Value,
@@ -54,8 +57,11 @@ fn preprocess_raw_tag_markup(content: &str) -> String {
                     while let Some(ch) = chars.next() {
                         if ch.is_alphanumeric() || ch == '_' { name.push(ch); } else { break; }
                     }
-                    // Tags whose markup should be preserved as raw and passed to Ruby intact
+                    // Tags whose markup should be preserved as raw and passed to Ruby intact.
                     // Use a hex wrapper to keep the Rust parser happy even with quotes/spaces.
+                    // 'include' and 'link' are hex-encoded here, then intercepted in
+                    // RubyTagRenderable::render_to for fast Rust-side resolution.
+                    // Complex cases (params, variable names) fall through to Ruby.
                     let needs_raw = matches!(name.as_str(), "post_url" | "include" | "include_relative" | "link");
                     if needs_raw {
                         // raw markup after name, preserve exactly
@@ -198,10 +204,333 @@ thread_local! {
 thread_local! {
     static TEMPLATE_CACHE: RefCell<HashMap<u64, Rc<liquid::Template>>> = RefCell::new(HashMap::new());
     static CONVERT_CACHE: RefCell<HashMap<i64, LiquidValue>> = RefCell::new(HashMap::new());
+    /// Cache for the expensive immutable parts of the payload (site, jekyll, theme, etc.).
+    /// Stored as an Rc<SafeValue> wrapping the converted Object, keyed by site drop object_id.
+    /// This is shared across all render_template calls without cloning.
+    static PAYLOAD_SITE_CACHE: RefCell<Option<(i64, Rc<SafeValue>)>> = RefCell::new(None);
+    /// Cached Liquid parser (filters + tags don't change during a build)
+    static PARSER_CACHE: RefCell<Option<Rc<liquid::Parser>>> = RefCell::new(None);
+    /// Cached set of extra payload keys from fallback_data (typically empty)
+    static FALLBACK_KEYS_CACHE: RefCell<Option<Vec<String>>> = RefCell::new(None);
 }
 
 pub fn clear_liquid_cache() {
     CONVERT_CACHE.with(|cache| cache.borrow_mut().clear());
+    PAYLOAD_SITE_CACHE.with(|cache| *cache.borrow_mut() = None);
+    PARSER_CACHE.with(|cache| *cache.borrow_mut() = None);
+    FALLBACK_KEYS_CACHE.with(|cache| *cache.borrow_mut() = None);
+    clear_link_table();
+}
+
+pub fn dump_render_stats() {
+    // No-op: profiling removed
+}
+
+// ---------------------------------------------------------------------------
+// Native include support via liquid crate's PartialSource / LazyCompiler
+// ---------------------------------------------------------------------------
+
+/// A PartialSource that resolves include file names from Jekyll's _includes
+/// directories. File contents are read from disk and preprocessed (to handle
+/// tags like {% post_url %} and {% highlight %} that still go through Ruby).
+#[derive(Debug, Clone)]
+struct JekyllIncludeSource {
+    include_dirs: Vec<PathBuf>,
+    safe: bool,
+}
+
+impl PartialSource for JekyllIncludeSource {
+    fn contains(&self, name: &str) -> bool {
+        self.include_dirs.iter().any(|dir| dir.join(name).is_file())
+    }
+
+    fn names(&self) -> Vec<&str> {
+        // LazyCompiler only uses names() for error messages when a partial
+        // is not found. Returning an empty list is fine for normal operation.
+        vec![]
+    }
+
+    fn try_get<'a>(&'a self, name: &str) -> Option<Cow<'a, str>> {
+        for dir in &self.include_dirs {
+            let path = dir.join(name);
+            if !path.is_file() {
+                continue;
+            }
+            if self.safe {
+                let dir_real = std::fs::canonicalize(dir).ok()?;
+                let file_real = std::fs::canonicalize(&path).ok()?;
+                if !file_real.starts_with(&dir_real) {
+                    continue;
+                }
+            }
+            let raw = std::fs::read_to_string(&path).ok()?;
+            // Preprocess the include content so that tags like {% post_url %}
+            // and {% highlight %} get hex-encoded for the Ruby fallback path.
+            let preprocessed = preprocess_raw_tag_markup(&raw);
+            return Some(Cow::Owned(preprocessed));
+        }
+        None
+    }
+}
+
+/// Fetch include directories and safe mode from Ruby site object (one-time).
+fn fetch_include_config(ruby: &Ruby, rust_module: RModule, info: Value) -> Result<(Vec<PathBuf>, bool), Error> {
+    // Get site from info registers
+    let registers: Value = {
+        if let Some(hash) = RHash::from_value(info) {
+            let key_str = ruby.str_new("registers").into_value_with(ruby);
+            let key_sym = ruby.to_symbol("registers").into_value_with(ruby);
+            let val: Value = hash.aref(key_str)?;
+            if val.is_nil() { hash.aref(key_sym)? } else { val }
+        } else {
+            ruby.qnil().into_value_with(ruby)
+        }
+    };
+    if registers.is_nil() {
+        return Ok((vec![], false));
+    }
+    let site_key = ruby.to_symbol("site").into_value_with(ruby);
+    let site: Value = registers.funcall::<_, _, Value>("[]", (site_key,))?;
+    if site.is_nil() {
+        return Ok((vec![], false));
+    }
+
+    let config: Value = rust_module.funcall::<_, _, Value>("include_config", (site,))?;
+    if let Some(hash) = RHash::from_value(config) {
+        let dirs_val: Value = hash.aref(ruby.str_new("dirs").into_value_with(ruby))?;
+        let safe_val: Value = hash.aref(ruby.str_new("safe").into_value_with(ruby))?;
+        let mut dirs = Vec::new();
+        if let Some(arr) = RArray::from_value(dirs_val) {
+            for entry in arr.each() {
+                let s = String::try_convert(entry?)?;
+                dirs.push(PathBuf::from(s));
+            }
+        }
+        let safe = safe_val.to_bool();
+        Ok((dirs, safe))
+    } else {
+        Ok((vec![], false))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Native {% link %} tag
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Cached lookup table: relative_path → url.  Built once from Ruby site data.
+    static LINK_TABLE: RefCell<Option<HashMap<String, String>>> = RefCell::new(None);
+}
+
+/// Fetch the link lookup table from Ruby (one-time, cached).
+fn get_link_table(ruby: &Ruby, rust_module: RModule, info: Value) -> Result<(), Error> {
+    LINK_TABLE.with(|cell| {
+        if cell.borrow().is_some() { return Ok(()); }
+
+        let registers: Value = {
+            if let Some(hash) = RHash::from_value(info) {
+                let key_str = ruby.str_new("registers").into_value_with(ruby);
+                let key_sym = ruby.to_symbol("registers").into_value_with(ruby);
+                let val: Value = hash.aref(key_str)?;
+                if val.is_nil() { hash.aref(key_sym)? } else { val }
+            } else {
+                return Ok(());
+            }
+        };
+        if registers.is_nil() { return Ok(()); }
+        let site_key = ruby.to_symbol("site").into_value_with(ruby);
+        let site: Value = registers.funcall::<_, _, Value>("[]", (site_key,))?;
+        if site.is_nil() { return Ok(()); }
+
+        let table_val: Value = rust_module.funcall::<_, _, Value>("link_lookup_table", (site,))?;
+        let mut table = HashMap::new();
+        if let Some(hash) = RHash::from_value(table_val) {
+            hash.foreach(|k: String, v: String| {
+                table.insert(k, v);
+                Ok(magnus::r_hash::ForEach::Continue)
+            })?;
+        }
+        *cell.borrow_mut() = Some(table);
+        Ok(())
+    })
+}
+
+/// Clear link table cache (called from clear_liquid_cache).
+fn clear_link_table() {
+    LINK_TABLE.with(|cell| *cell.borrow_mut() = None);
+}
+
+// NativeLinkTag removed — link resolution is handled by RubyTagRenderable::render_to fast-path.
+
+
+// ---------------------------------------------------------------------------
+// Native markdownify filter (using comrak)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct MarkdownifyFilterParser;
+impl FilterReflection for MarkdownifyFilterParser {
+    fn name(&self) -> &str { "markdownify" }
+    fn description(&self) -> &str { "Convert markdown to HTML using comrak" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+
+impl ParseFilter for MarkdownifyFilterParser {
+    fn parse(&self, _arguments: FilterArguments<'_>) -> LiquidResult<Box<dyn Filter>> {
+        Ok(Box::new(MarkdownifyFilter))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+
+#[derive(Debug)]
+struct MarkdownifyFilter;
+
+impl std::fmt::Display for MarkdownifyFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "markdownify")
+    }
+}
+
+impl Filter for MarkdownifyFilter {
+    fn evaluate(
+        &self,
+        input: &dyn liquid_core::model::ValueView,
+        _runtime: &dyn Runtime,
+    ) -> LiquidResult<LiquidValue> {
+        let input_str = input.to_kstr();
+        let mut opts = comrak::Options::default();
+        opts.extension.table = true;
+        opts.extension.strikethrough = true;
+        opts.extension.autolink = true;
+        opts.render.unsafe_ = true; // allow raw HTML passthrough
+        let html = comrak::markdown_to_html(input_str.as_str(), &opts);
+        Ok(LiquidValue::scalar(html))
+    }
+}
+
+/// then falls back to a shared base. This allows us to cache the expensive
+/// site-level data and only re-convert per-document keys (page, content, etc.)
+/// for each render, without cloning the site data.
+struct LayeredGlobals {
+    /// Per-render overlay (page, content, layout, paginator)
+    overlay: SafeValue,
+    /// Shared base (site, jekyll, theme, etc.) — Rc-shared, never cloned
+    base: Rc<SafeValue>,
+}
+
+impl fmt::Debug for LayeredGlobals {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LayeredGlobals").finish()
+    }
+}
+
+impl liquid_core::model::ValueView for LayeredGlobals {
+    fn as_debug(&self) -> &dyn fmt::Debug { self }
+    fn render(&self) -> liquid_core::model::DisplayCow<'_> {
+        liquid_core::model::DisplayCow::Owned(Box::new(String::from("{LayeredGlobals}")))
+    }
+    fn source(&self) -> liquid_core::model::DisplayCow<'_> {
+        liquid_core::model::DisplayCow::Owned(Box::new(String::from("{LayeredGlobals}")))
+    }
+    fn type_name(&self) -> &'static str { "object" }
+    fn query_state(&self, state: liquid_core::model::State) -> bool {
+        match state {
+            liquid_core::model::State::Truthy => true,
+            liquid_core::model::State::DefaultValue => false,
+            liquid_core::model::State::Empty => false,
+            liquid_core::model::State::Blank => false,
+        }
+    }
+    fn to_kstr(&self) -> liquid_core::model::KStringCow<'_> {
+        liquid_core::model::KStringCow::from_static("{}")
+    }
+    fn to_value(&self) -> LiquidValue {
+        // Merge base and overlay into a single Object (expensive, rarely called)
+        let mut obj = liquid_model::Object::new();
+        if let SafeValueInner::Object(ref base_map) = self.base.inner {
+            for (k, v) in base_map.iter() {
+                obj.insert(k.clone(), v.to_value());
+            }
+        }
+        if let SafeValueInner::Object(ref overlay_map) = self.overlay.inner {
+            for (k, v) in overlay_map.iter() {
+                obj.insert(k.clone(), v.to_value());
+            }
+        }
+        LiquidValue::Object(obj)
+    }
+    fn as_object(&self) -> Option<&dyn liquid_core::model::ObjectView> {
+        Some(self)
+    }
+}
+
+impl liquid_core::model::ObjectView for LayeredGlobals {
+    fn as_value(&self) -> &dyn liquid_core::model::ValueView { self }
+
+    fn size(&self) -> i64 {
+        let base_size = match &self.base.inner {
+            SafeValueInner::Object(map) => map.len(),
+            _ => 0,
+        };
+        let overlay_size = match &self.overlay.inner {
+            SafeValueInner::Object(map) => map.len(),
+            _ => 0,
+        };
+        (base_size + overlay_size) as i64
+    }
+
+    fn keys<'k>(&'k self) -> Box<dyn Iterator<Item = liquid_core::model::KStringCow<'k>> + 'k> {
+        let mut all_keys = Vec::new();
+        if let SafeValueInner::Object(ref map) = self.overlay.inner {
+            for k in map.keys() {
+                all_keys.push(liquid_core::model::KStringCow::from_ref(k.as_str()));
+            }
+        }
+        if let SafeValueInner::Object(ref map) = self.base.inner {
+            for k in map.keys() {
+                let ks = k.as_str();
+                if !all_keys.iter().any(|existing| existing.as_str() == ks) {
+                    all_keys.push(liquid_core::model::KStringCow::from_ref(ks));
+                }
+            }
+        }
+        Box::new(all_keys.into_iter())
+    }
+
+    fn values<'k>(&'k self) -> Box<dyn Iterator<Item = &'k dyn liquid_core::model::ValueView> + 'k> {
+        Box::new(std::iter::empty())
+    }
+
+    fn iter<'k>(&'k self) -> Box<dyn Iterator<Item = (liquid_core::model::KStringCow<'k>, &'k dyn liquid_core::model::ValueView)> + 'k> {
+        Box::new(std::iter::empty())
+    }
+
+    fn contains_key(&self, index: &str) -> bool {
+        if let SafeValueInner::Object(ref map) = self.overlay.inner {
+            if map.contains_key(index) { return true; }
+        }
+        if let SafeValueInner::Object(ref map) = self.base.inner {
+            if map.contains_key(index) { return true; }
+        }
+        !self.overlay.strict
+    }
+
+    fn get<'s>(&'s self, index: &str) -> Option<&'s dyn liquid_core::model::ValueView> {
+        // Check overlay first (per-document keys)
+        if let SafeValueInner::Object(ref map) = self.overlay.inner {
+            if let Some(v) = map.get(index) {
+                return Some(v as &dyn liquid_core::model::ValueView);
+            }
+        }
+        // Check base (cached site-level keys)
+        if let SafeValueInner::Object(ref map) = self.base.inner {
+            if let Some(v) = map.get(index) {
+                return Some(v as &dyn liquid_core::model::ValueView);
+            }
+        }
+        if self.overlay.strict { None } else { Some(&self.overlay.nil) }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -218,11 +547,13 @@ struct SafeValue {
     nil: LiquidValue,
     strict: bool,
     /// Raw Ruby VALUE pointer for a document-like drop.  When present,
-    /// `ObjectView::get("excerpt")` can lazily resolve the excerpt from
-    /// the Ruby drop instead of requiring it up-front.
+    /// `ObjectView::get()` can lazily resolve properties from the Ruby drop.
     ruby_drop_raw: Option<u64>,
     /// Lazily-resolved excerpt cached on first access.
     cached_excerpt: OnceCell<Box<SafeValue>>,
+    /// General lazy property cache for Ruby drop resolution.
+    /// Properties are resolved from the Ruby drop on first access and cached here.
+    lazy_cache: RefCell<HashMap<String, SafeValue>>,
 }
 
 impl fmt::Debug for SafeValue {
@@ -237,7 +568,7 @@ impl fmt::Debug for SafeValue {
 
 impl SafeValue {
     fn new_nil(strict: bool) -> Self {
-        SafeValue { inner: SafeValueInner::Nil, nil: LiquidValue::Nil, strict, ruby_drop_raw: None, cached_excerpt: OnceCell::new() }
+        SafeValue { inner: SafeValueInner::Nil, nil: LiquidValue::Nil, strict, ruby_drop_raw: None, cached_excerpt: OnceCell::new(), lazy_cache: RefCell::new(HashMap::new()) }
     }
 
     fn wrap_with_strict(value: LiquidValue, strict: bool) -> Self {
@@ -245,12 +576,12 @@ impl SafeValue {
             LiquidValue::Nil => Self::new_nil(strict),
             LiquidValue::State(state) => {
                 let s = state.to_string();
-                SafeValue { inner: SafeValueInner::Scalar(liquid_model::Scalar::new(s)), nil: LiquidValue::Nil, strict, ruby_drop_raw: None, cached_excerpt: OnceCell::new() }
+                SafeValue { inner: SafeValueInner::Scalar(liquid_model::Scalar::new(s)), nil: LiquidValue::Nil, strict, ruby_drop_raw: None, cached_excerpt: OnceCell::new(), lazy_cache: RefCell::new(HashMap::new()) }
             }
-            LiquidValue::Scalar(s) => SafeValue { inner: SafeValueInner::Scalar(s), nil: LiquidValue::Nil, strict, ruby_drop_raw: None, cached_excerpt: OnceCell::new() },
+            LiquidValue::Scalar(s) => SafeValue { inner: SafeValueInner::Scalar(s), nil: LiquidValue::Nil, strict, ruby_drop_raw: None, cached_excerpt: OnceCell::new(), lazy_cache: RefCell::new(HashMap::new()) },
             LiquidValue::Array(arr) => {
                 let children = arr.into_iter().map(|v| SafeValue::wrap_with_strict(v, strict)).collect();
-                SafeValue { inner: SafeValueInner::Array(children), nil: LiquidValue::Nil, strict, ruby_drop_raw: None, cached_excerpt: OnceCell::new() }
+                SafeValue { inner: SafeValueInner::Array(children), nil: LiquidValue::Nil, strict, ruby_drop_raw: None, cached_excerpt: OnceCell::new(), lazy_cache: RefCell::new(HashMap::new()) }
             }
             LiquidValue::Object(obj) => {
                 let mut map = HashMap::with_capacity(obj.len());
@@ -266,13 +597,17 @@ impl SafeValue {
                     }
                     map.insert(KString::from_ref(k.as_str()), SafeValue::wrap_with_strict(v.clone(), strict));
                 }
-                SafeValue { inner: SafeValueInner::Object(map), nil: LiquidValue::Nil, strict, ruby_drop_raw: drop_raw, cached_excerpt: OnceCell::new() }
+                SafeValue { inner: SafeValueInner::Object(map), nil: LiquidValue::Nil, strict, ruby_drop_raw: drop_raw, cached_excerpt: OnceCell::new(), lazy_cache: RefCell::new(HashMap::new()) }
             }
         }
     }
     // Removed unused helper to avoid dead_code warning
 
     fn to_liquid_value(&self) -> LiquidValue {
+        thread_local! {
+            static IN_EAGER_RESOLVE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+            static IN_CONTENT_RESOLVE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+        }
         match &self.inner {
             SafeValueInner::Nil => LiquidValue::Nil,
             SafeValueInner::Scalar(s) => LiquidValue::Scalar(s.clone()),
@@ -283,7 +618,93 @@ impl SafeValue {
             SafeValueInner::Object(map) => {
                 let mut obj = liquid_model::Object::new();
                 for (k, v) in map.iter() {
-                    obj.insert(KString::from_ref(k.as_str()), v.to_liquid_value());
+                    obj.insert(k.clone(), v.to_liquid_value());
+                }
+                // When this SafeValue wraps a Ruby drop (has ruby_drop_raw), eagerly
+                // resolve lazy properties into the output object. This is needed
+                // because to_value() is called by liquid-core's for tag on loop
+                // variables, stripping the SafeValue wrapper and losing lazy
+                // resolution. Without this, properties like excerpt/content/next/
+                // previous become unavailable in for loops.
+                //
+                // Use a recursion guard to prevent infinite chains via next/previous.
+                let already_resolving = IN_EAGER_RESOLVE.with(|c| c.get());
+                if let Some(raw) = self.ruby_drop_raw {
+                    if !already_resolving {
+                        IN_EAGER_RESOLVE.with(|c| c.set(true));
+                    }
+                    // Include already-resolved lazy_cache entries
+                    let cache = self.lazy_cache.borrow();
+                    for (ck, cv) in cache.iter() {
+                        if !obj.contains_key(ck.as_str()) {
+                            obj.insert(KString::from_string(ck.clone()), cv.to_liquid_value());
+                        }
+                    }
+                    drop(cache);
+
+                    if !already_resolving {
+                        // Top-level eager resolution: resolve all commonly used
+                        // properties including cascading ones (next/previous).
+                        let eager_keys: &[&str] = &[
+                            "excerpt",
+                            "next", "previous",
+                            "tags", "categories",
+                            "title", "url", "path", "date", "slug", "name",
+                            "dir", "id", "collection", "ext",
+                        ];
+                        for &prop in eager_keys {
+                            let key = KString::from_ref(prop);
+                            if !obj.contains_key(&key) {
+                                let resolved = resolve_property_from_drop(raw, prop, false);
+                                if !matches!(resolved.inner, SafeValueInner::Nil) {
+                                    obj.insert(key, resolved.to_liquid_value());
+                                }
+                            }
+                        }
+                        // content/output are resolved separately with a dedicated
+                        // re-entrancy guard. They can trigger Ruby rendering which
+                        // may re-enter this function for the same or different pages.
+                        let content_already = IN_CONTENT_RESOLVE.with(|c| c.get());
+                        if !content_already {
+                            IN_CONTENT_RESOLVE.with(|c| c.set(true));
+                            for &prop in &["content", "output"] {
+                                let key = KString::from_ref(prop);
+                                if !obj.contains_key(&key) {
+                                    let resolved = resolve_property_from_drop(raw, prop, false);
+                                    if !matches!(resolved.inner, SafeValueInner::Nil) {
+                                        obj.insert(key, resolved.to_liquid_value());
+                                    }
+                                }
+                            }
+                            IN_CONTENT_RESOLVE.with(|c| c.set(false));
+                        }
+                        IN_EAGER_RESOLVE.with(|c| c.set(false));
+                    } else {
+                        // Under recursion guard: only resolve lightweight scalar
+                        // properties (NOT content/output/next/previous/excerpt).
+                        // This allows post.next.title to work without infinite chains.
+                        let safe_keys: &[&str] = &[
+                            "title", "url", "path", "date", "slug", "name",
+                            "dir", "id", "collection", "ext",
+                            "tags", "categories",
+                        ];
+                        for &prop in safe_keys {
+                            let key = KString::from_ref(prop);
+                            if !obj.contains_key(&key) {
+                                let resolved = resolve_property_from_drop(raw, prop, false);
+                                if !matches!(resolved.inner, SafeValueInner::Nil) {
+                                    obj.insert(key, resolved.to_liquid_value());
+                                }
+                            }
+                        }
+                    }
+                }
+                // If the cached_excerpt was resolved, include it
+                if let Some(ref boxed) = self.cached_excerpt.get() {
+                    let key = KString::from_static("excerpt");
+                    if !obj.contains_key(&key) {
+                        obj.insert(key, boxed.to_liquid_value());
+                    }
                 }
                 LiquidValue::Object(obj)
             }
@@ -389,7 +810,7 @@ impl liquid_core::model::ObjectView for SafeValue {
             SafeValueInner::Object(map) => {
                 if self.strict { map.contains_key(index) } else { true }
             }
-            _ => false,
+            _ => if self.strict { false } else { true },
         }
     }
     fn get<'s>(&'s self, index: &str) -> Option<&'s dyn liquid_core::model::ValueView> {
@@ -397,8 +818,7 @@ impl liquid_core::model::ObjectView for SafeValue {
             if let Some(v) = map.get(index) {
                 return Some(v as &dyn liquid_core::model::ValueView);
             }
-            // Lazy excerpt resolution: if we have a Ruby drop and the requested
-            // key is "excerpt", resolve it now and cache the result.
+            // Lazy excerpt resolution (special case for excerpt rendering)
             if index == "excerpt" {
                 if let Some(raw) = self.ruby_drop_raw {
                     let resolved = self.cached_excerpt.get_or_init(|| {
@@ -407,8 +827,41 @@ impl liquid_core::model::ObjectView for SafeValue {
                     return Some(resolved.as_ref() as &dyn liquid_core::model::ValueView);
                 }
             }
+            // General lazy property resolution from Ruby drop.
+            // If we have a Ruby drop pointer, resolve the property on-demand.
+            if let Some(raw) = self.ruby_drop_raw {
+                // Check lazy_cache first
+                {
+                    let cache = self.lazy_cache.borrow();
+                    if cache.contains_key(index) {
+                        // SAFETY: We return a reference into the lazy_cache HashMap.
+                        // The HashMap is only grown (never shrunk or rehashed after
+                        // an entry is inserted) during the lifetime of this SafeValue,
+                        // so existing references remain valid.
+                        let cache_ptr = &*cache as *const HashMap<String, SafeValue>;
+                        unsafe {
+                            if let Some(v) = (*cache_ptr).get(index) {
+                                return Some(v as &dyn liquid_core::model::ValueView);
+                            }
+                        }
+                    }
+                }
+                // Not in cache — resolve from Ruby
+                let resolved = resolve_property_from_drop(raw, index, self.strict);
+                let mut cache = self.lazy_cache.borrow_mut();
+                cache.insert(index.to_string(), resolved);
+                drop(cache);
+                // Return reference from the now-populated cache
+                let cache = self.lazy_cache.borrow();
+                let cache_ptr = &*cache as *const HashMap<String, SafeValue>;
+                unsafe {
+                    if let Some(v) = (*cache_ptr).get(index) {
+                        return Some(v as &dyn liquid_core::model::ValueView);
+                    }
+                }
+            }
             if self.strict { None } else { Some(&self.nil) }
-        } else { None }
+        } else if self.strict { None } else { Some(&self.nil) }
     }
 }
 
@@ -515,18 +968,68 @@ pub struct LiquidValueConverter<'ruby> {
     ruby: &'ruby Ruby,
     drop_class: RClass,
     visited: HashSet<i64>,
+    /// Cached class lookups (avoids repeated const_get FFI)
+    document_drop_class: Option<RClass>,
+    excerpt_drop_class: Option<RClass>,
+    site_drop_class: Option<RClass>,
+    unified_payload_drop_class: Option<RClass>,
+    jekyll_drop_class: Option<RClass>,
+}
+
+/// Cached class lookups stored in thread-local to avoid FFI per render
+struct CachedClasses {
+    drop_class: RClass,
+    document_drop_class: Option<RClass>,
+    excerpt_drop_class: Option<RClass>,
+    site_drop_class: Option<RClass>,
+    unified_payload_drop_class: Option<RClass>,
+    jekyll_drop_class: Option<RClass>,
+}
+
+thread_local! {
+    static CLASS_CACHE: RefCell<Option<CachedClasses>> = RefCell::new(None);
 }
 
 impl<'ruby> LiquidValueConverter<'ruby> {
     /// Create a new converter bound to the provided Ruby handle.
     pub fn new(ruby: &'ruby Ruby) -> Result<Self, Error> {
-        let liquid: RModule = ruby.class_object().const_get("Liquid")?;
-        let drop_class: RClass = liquid.const_get("Drop")?;
+        // Try to reuse cached class lookups
+        let classes = CLASS_CACHE.with(|cell| -> Result<(RClass, Option<RClass>, Option<RClass>, Option<RClass>, Option<RClass>, Option<RClass>), Error> {
+            if let Some(ref cached) = *cell.borrow() {
+                return Ok((cached.drop_class, cached.document_drop_class, cached.excerpt_drop_class, cached.site_drop_class, cached.unified_payload_drop_class, cached.jekyll_drop_class));
+            }
+            let liquid: RModule = ruby.class_object().const_get("Liquid")?;
+            let drop_class: RClass = liquid.const_get("Drop")?;
+            let jekyll_mod = ruby.class_object().const_get::<_, RModule>("Jekyll").ok();
+            let drops_mod = jekyll_mod.as_ref().and_then(|j| j.const_get::<_, RModule>("Drops").ok());
+            let document_drop_class = drops_mod.as_ref().and_then(|d| d.const_get::<_, RClass>("DocumentDrop").ok());
+            let excerpt_drop_class = drops_mod.as_ref().and_then(|d| d.const_get::<_, RClass>("ExcerptDrop").ok());
+            let site_drop_class = drops_mod.as_ref().and_then(|d| d.const_get::<_, RClass>("SiteDrop").ok());
+            let unified_payload_drop_class = drops_mod.as_ref().and_then(|d| d.const_get::<_, RClass>("UnifiedPayloadDrop").ok());
+            let jekyll_drop_class = drops_mod.as_ref().and_then(|d| d.const_get::<_, RClass>("JekyllDrop").ok());
+            *cell.borrow_mut() = Some(CachedClasses {
+                drop_class, document_drop_class, excerpt_drop_class,
+                site_drop_class, unified_payload_drop_class, jekyll_drop_class,
+            });
+            Ok((drop_class, document_drop_class, excerpt_drop_class, site_drop_class, unified_payload_drop_class, jekyll_drop_class))
+        })?;
+        let (drop_class, document_drop_class, excerpt_drop_class, site_drop_class, unified_payload_drop_class, jekyll_drop_class) = classes;
         Ok(Self {
             ruby,
             drop_class,
             visited: HashSet::new(),
+            document_drop_class,
+            excerpt_drop_class,
+            site_drop_class,
+            unified_payload_drop_class,
+            jekyll_drop_class,
         })
+    }
+
+    /// Check if a value is a document-like drop (DocumentDrop or ExcerptDrop)
+    fn is_document_like_drop(&self, value: Value) -> bool {
+        self.document_drop_class.as_ref().is_some_and(|cls| value.is_kind_of(*cls))
+            || self.excerpt_drop_class.as_ref().is_some_and(|cls| value.is_kind_of(*cls))
     }
 
     /// Convert a Ruby value into a Liquid value representation.
@@ -605,13 +1108,12 @@ impl<'ruby> LiquidValueConverter<'ruby> {
                 Ok(id) => id,
                 Err(_) => return Ok(LiquidValue::Nil),
             };
-            let class_val: Value = value.funcall::<_, _, Value>("class", ()).ok().unwrap_or(self.ruby.qnil().into_value_with(self.ruby));
-            let class_name = if class_val.is_nil() {
-                String::new()
-            } else {
-                class_val.funcall::<_, _, RString>("name", ()).ok().and_then(|s| s.to_string().ok()).unwrap_or_default()
-            };
-            let is_cacheable = class_name != "Jekyll::Drops::SiteDrop" && class_name != "Jekyll::Drops::UnifiedPayloadDrop" && class_name != "Jekyll::Drops::JekyllDrop";
+            // Drops that are per-render singletons (SiteDrop, UnifiedPayloadDrop, JekyllDrop)
+            // should NOT be cached since their state changes per-render. All other drops
+            // (DocumentDrop, CollectionDrop, etc.) are safe to cache.
+            let is_cacheable = !self.site_drop_class.as_ref().is_some_and(|cls| value.is_kind_of(*cls))
+                && !self.unified_payload_drop_class.as_ref().is_some_and(|cls| value.is_kind_of(*cls))
+                && !self.jekyll_drop_class.as_ref().is_some_and(|cls| value.is_kind_of(*cls));
             
             if is_cacheable {
                 if let Some(cached) = crate::liquid_engine::CONVERT_CACHE.with(|c| c.borrow().get(&object_id).cloned()) {
@@ -739,28 +1241,7 @@ impl<'ruby> LiquidValueConverter<'ruby> {
         };
 
         // Detect document-like drops to avoid materializing expensive properties (e.g., output/content)
-        let is_document_like_drop_method_phase = {
-            let jekyll_mod = self
-                .ruby
-                .class_object()
-                .const_get::<_, RModule>("Jekyll")
-                .ok();
-            let drops_mod = jekyll_mod
-                .as_ref()
-                .and_then(|j| j.const_get::<_, RModule>("Drops").ok());
-            let document_drop_class = drops_mod
-                .as_ref()
-                .and_then(|d| d.const_get::<_, RClass>("DocumentDrop").ok());
-            let excerpt_drop_class = drops_mod
-                .as_ref()
-                .and_then(|d| d.const_get::<_, RClass>("ExcerptDrop").ok());
-            document_drop_class
-                .as_ref()
-                .is_some_and(|cls| drop.is_kind_of(*cls))
-                || excerpt_drop_class
-                    .as_ref()
-                    .is_some_and(|cls| drop.is_kind_of(*cls))
-        };
+        let is_document_like_drop_method_phase = self.is_document_like_drop(drop);
 
         let mut object = liquid_model::Object::new();
         if let Some(methods_value) = methods_value {
@@ -770,27 +1251,40 @@ impl<'ruby> LiquidValueConverter<'ruby> {
                     let method_string: Value = method_value.funcall::<_, _, Value>("to_s", ())?;
                     let method_name = String::try_convert(method_string)?;
 
-                    // Avoid expensive materialization on document-like drops. Allow 'output'
-                    // (already computed during render), but skip 'content' and 'to_s'.
+                    // Avoid expensive materialization on document-like drops. Skip:
+                    // - 'next'/'previous'/'next_doc'/'previous_doc': reference OTHER documents,
+                    //   causing cascading conversion chains
+                    // These can be lazily resolved via SafeValue if actually accessed.
                     if is_document_like_drop_method_phase {
-                        if method_name == "content" || method_name == "to_s" {
+                        if method_name == "to_s"
+                            || method_name == "next" || method_name == "previous"
+                            || method_name == "next_doc" || method_name == "previous_doc"
+                        {
                             continue;
                         }
                     }
 
-                    // Skip `excerpt` during convert_drop to avoid recursive rendering.
-                    // The excerpt will be lazily resolved via SafeValue when a Liquid
-                    // template accesses `page.excerpt` or `post.excerpt`.
-                    if method_name == "excerpt" {
-                        // Store the drop's raw VALUE pointer so SafeValue can
-                        // lazily resolve the excerpt on first access.
-                        if is_document_like_drop_method_phase {
-                            let raw_val = drop.as_raw() as u64;
-                            object.insert(
-                                "__ruby_drop_raw__".into(),
-                                LiquidValue::scalar(raw_val.to_string()),
-                            );
-                        }
+                    // Skip `content`, `output`, and `excerpt` for ALL drops.
+                    // These are expensive (rendered HTML, may trigger re-entrant
+                    // rendering) and are lazily resolved via ruby_drop_raw.
+                    // This covers both DocumentDrop and Page drops.
+                    if method_name == "content" || method_name == "output" || method_name == "excerpt" {
+                        let raw_val = drop.as_raw() as u64;
+                        object.insert(
+                            "__ruby_drop_raw__".into(),
+                            LiquidValue::scalar(raw_val.to_string()),
+                        );
+                        continue;
+                    }
+
+                    // Skip `related_posts` — it depends on @current_document which
+                    // varies per render. Must be lazily resolved via ruby_drop_raw.
+                    if method_name == "related_posts" {
+                        let raw_val = drop.as_raw() as u64;
+                        object.insert(
+                            "__ruby_drop_raw__".into(),
+                            LiquidValue::scalar(raw_val.to_string()),
+                        );
                         continue;
                     }
 
@@ -802,18 +1296,7 @@ impl<'ruby> LiquidValueConverter<'ruby> {
         }
 
         // For DocumentDrop, ensure commonly used attributes like `relative_path` are present
-        let jekyll_mod = self
-            .ruby
-            .class_object()
-            .const_get::<_, RModule>("Jekyll")
-            .ok();
-        let drops_mod = jekyll_mod
-            .as_ref()
-            .and_then(|j| j.const_get::<_, RModule>("Drops").ok());
-        let document_drop_class = drops_mod
-            .as_ref()
-            .and_then(|d| d.const_get::<_, RClass>("DocumentDrop").ok());
-        if let Some(doc_cls) = document_drop_class {
+        if let Some(doc_cls) = self.document_drop_class {
             if drop.is_kind_of(doc_cls) {
                 let rel_key = KString::from_ref("relative_path");
                 if !object.contains_key(&rel_key) {
@@ -850,27 +1333,7 @@ impl<'ruby> LiquidValueConverter<'ruby> {
 
         // Avoid calling generic `to_h` on document-like drops to prevent recursion/huge graphs.
         // For other drops (e.g., JekyllDrop), `to_h` exposes a stable, small set of keys.
-        let is_document_like_drop = {
-            let jekyll_mod = self
-                .ruby
-                .class_object()
-                .const_get::<_, RModule>("Jekyll")
-                .ok();
-            let drops_mod = jekyll_mod
-                .and_then(|j| j.const_get::<_, RModule>("Drops").ok());
-            let document_drop_class = drops_mod
-                .as_ref()
-                .and_then(|d| d.const_get::<_, RClass>("DocumentDrop").ok());
-            let excerpt_drop_class = drops_mod
-                .as_ref()
-                .and_then(|d| d.const_get::<_, RClass>("ExcerptDrop").ok());
-            document_drop_class
-                .as_ref()
-                .is_some_and(|cls| drop.is_kind_of(*cls))
-                || excerpt_drop_class
-                    .as_ref()
-                    .is_some_and(|cls| drop.is_kind_of(*cls))
-        };
+        let is_document_like_drop = self.is_document_like_drop(drop);
 
         if drop.respond_to("to_h", false)? && !is_document_like_drop {
             // Some drops (e.g., JekyllDrop) expose a complete hash via `to_h`
@@ -949,14 +1412,7 @@ impl<'ruby> LiquidValueConverter<'ruby> {
         }
 
         // Special-case SiteDrop: expose config keys and defaults
-        let site_drop_class = self
-            .ruby
-            .class_object()
-            .const_get::<_, RModule>("Jekyll")
-            .ok()
-            .and_then(|j| j.const_get::<_, RModule>("Drops").ok())
-            .and_then(|d| d.const_get::<_, RClass>("SiteDrop").ok());
-        if let Some(site_cls) = site_drop_class {
+        if let Some(site_cls) = self.site_drop_class {
             if drop.is_kind_of(site_cls) {
                 // Access original site's configuration via the underlying @obj, since SiteDrop#config returns nil
                 let site_obj: Value = drop.funcall::<_, _, Value>("instance_variable_get", (self.ruby.str_new("@obj"),))?;
@@ -1592,6 +2048,471 @@ impl Filter for CompactFilter {
 }
 
 
+// ─── Shared parameter reflection for single-arg filters ───
+static SINGLE_PARAM: &[ParameterReflection] = &[ParameterReflection {
+    name: "value",
+    description: "",
+    is_optional: false,
+}];
+static OPT_PARAM: &[ParameterReflection] = &[ParameterReflection {
+    name: "value",
+    description: "",
+    is_optional: true,
+}];
+
+// ─── xml_escape ───
+#[derive(Clone)]
+struct XmlEscapeFilterParser;
+impl FilterReflection for XmlEscapeFilterParser {
+    fn name(&self) -> &str { "xml_escape" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for XmlEscapeFilterParser {
+    fn parse(&self, _arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        Ok(Box::new(XmlEscapeFilter))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct XmlEscapeFilter;
+impl fmt::Display for XmlEscapeFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "xml_escape") } }
+impl Filter for XmlEscapeFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, _runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        let s = input.to_kstr();
+        let escaped = s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;");
+        Ok(LiquidValue::scalar(escaped))
+    }
+}
+
+// ─── cgi_escape ───
+#[derive(Clone)]
+struct CgiEscapeFilterParser;
+impl FilterReflection for CgiEscapeFilterParser {
+    fn name(&self) -> &str { "cgi_escape" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for CgiEscapeFilterParser {
+    fn parse(&self, _arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        Ok(Box::new(CgiEscapeFilter))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct CgiEscapeFilter;
+impl fmt::Display for CgiEscapeFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "cgi_escape") } }
+impl Filter for CgiEscapeFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, _runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        let s = input.to_kstr();
+        let mut out = String::with_capacity(s.len());
+        for byte in s.as_bytes() {
+            match *byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' |
+                b'-' | b'_' | b'.' | b'*' => out.push(*byte as char),
+                b' ' => out.push('+'),
+                _ => { out.push('%'); out.push_str(&format!("{:02X}", byte)); }
+            }
+        }
+        Ok(LiquidValue::scalar(out))
+    }
+}
+
+// ─── uri_escape ───
+#[derive(Clone)]
+struct UriEscapeFilterParser;
+impl FilterReflection for UriEscapeFilterParser {
+    fn name(&self) -> &str { "uri_escape" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for UriEscapeFilterParser {
+    fn parse(&self, _arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        Ok(Box::new(UriEscapeFilter))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct UriEscapeFilter;
+impl fmt::Display for UriEscapeFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "uri_escape") } }
+impl Filter for UriEscapeFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, _runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        let s = input.to_kstr();
+        let mut out = String::with_capacity(s.len());
+        for byte in s.as_bytes() {
+            match *byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' |
+                b'-' | b'_' | b'.' | b'~' |
+                b':' | b'/' | b'?' | b'#' | b'[' | b']' | b'@' |
+                b'!' | b'$' | b'&' | b'\'' | b'(' | b')' |
+                b'*' | b'+' | b',' | b';' | b'=' => out.push(*byte as char),
+                _ => { out.push('%'); out.push_str(&format!("{:02X}", byte)); }
+            }
+        }
+        Ok(LiquidValue::scalar(out))
+    }
+}
+
+// ─── normalize_whitespace ───
+#[derive(Clone)]
+struct NormalizeWhitespaceFilterParser;
+impl FilterReflection for NormalizeWhitespaceFilterParser {
+    fn name(&self) -> &str { "normalize_whitespace" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for NormalizeWhitespaceFilterParser {
+    fn parse(&self, _arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        Ok(Box::new(NormalizeWhitespaceFilter))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct NormalizeWhitespaceFilter;
+impl fmt::Display for NormalizeWhitespaceFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "normalize_whitespace") } }
+impl Filter for NormalizeWhitespaceFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, _runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        let s = input.to_kstr();
+        let normalized: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        Ok(LiquidValue::scalar(normalized))
+    }
+}
+
+// ─── number_of_words ───
+#[derive(Clone)]
+struct NumberOfWordsFilterParser;
+impl FilterReflection for NumberOfWordsFilterParser {
+    fn name(&self) -> &str { "number_of_words" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for NumberOfWordsFilterParser {
+    fn parse(&self, _arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        Ok(Box::new(NumberOfWordsFilter))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct NumberOfWordsFilter;
+impl fmt::Display for NumberOfWordsFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "number_of_words") } }
+impl Filter for NumberOfWordsFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, _runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        let s = input.to_kstr();
+        let count = s.split_whitespace().count();
+        Ok(LiquidValue::scalar(count as i64))
+    }
+}
+
+// ─── jsonify ───
+#[derive(Clone)]
+struct JsonifyFilterParser;
+impl FilterReflection for JsonifyFilterParser {
+    fn name(&self) -> &str { "jsonify" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for JsonifyFilterParser {
+    fn parse(&self, _arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        Ok(Box::new(JsonifyFilter))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct JsonifyFilter;
+impl fmt::Display for JsonifyFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "jsonify") } }
+
+fn liquid_value_to_json(val: &dyn liquid::model::ValueView) -> serde_json::Value {
+    if val.is_nil() {
+        serde_json::Value::Null
+    } else if let Some(s) = val.as_scalar() {
+        if let Some(b) = s.to_bool() {
+            serde_json::Value::Bool(b)
+        } else if let Some(i) = s.to_integer() {
+            serde_json::json!(i)
+        } else if let Some(f) = s.to_float() {
+            serde_json::json!(f)
+        } else {
+            serde_json::Value::String(s.to_kstr().to_string())
+        }
+    } else if let Some(arr) = val.as_array() {
+        let items: Vec<serde_json::Value> = (0..arr.size())
+            .filter_map(|i| arr.get(i))
+            .map(|v| liquid_value_to_json(&*v))
+            .collect();
+        serde_json::Value::Array(items)
+    } else if let Some(obj) = val.as_object() {
+        let mut map = serde_json::Map::new();
+        for k in obj.keys() {
+            if let Some(v) = obj.get(k.as_str()) {
+                map.insert(k.to_string(), liquid_value_to_json(&*v));
+            }
+        }
+        serde_json::Value::Object(map)
+    } else {
+        serde_json::Value::String(val.to_kstr().to_string())
+    }
+}
+
+impl Filter for JsonifyFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, _runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        let json_val = liquid_value_to_json(input);
+        let json_str = serde_json::to_string(&json_val).unwrap_or_else(|_| "null".to_string());
+        Ok(LiquidValue::scalar(json_str))
+    }
+}
+
+// ─── array_to_sentence_string ───
+#[derive(Clone)]
+struct ArrayToSentenceStringFilterParser;
+impl FilterReflection for ArrayToSentenceStringFilterParser {
+    fn name(&self) -> &str { "array_to_sentence_string" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { OPT_PARAM }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for ArrayToSentenceStringFilterParser {
+    fn parse(&self, mut arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        let connector = arguments.positional.next();
+        Ok(Box::new(ArrayToSentenceStringFilter { connector }))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct ArrayToSentenceStringFilter { connector: Option<Expression> }
+impl fmt::Display for ArrayToSentenceStringFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "array_to_sentence_string") } }
+impl Filter for ArrayToSentenceStringFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        let connector_val = self.connector.as_ref().map(|e| e.evaluate(runtime)).transpose()?;
+        let connector = connector_val
+            .as_ref()
+            .map(|v| v.to_kstr().to_string())
+            .unwrap_or_else(|| "and".to_string());
+        let arr = match input.as_array() {
+            Some(a) => a,
+            None => return Ok(input.to_value()),
+        };
+        let items: Vec<String> = (0..arr.size())
+            .filter_map(|i| arr.get(i))
+            .map(|v| v.to_kstr().to_string())
+            .collect();
+        let result = match items.len() {
+            0 => String::new(),
+            1 => items[0].clone(),
+            2 => format!("{} {} {}", items[0], connector, items[1]),
+            _ => {
+                let last = &items[items.len() - 1];
+                let rest = &items[..items.len() - 1];
+                format!("{}, {} {}", rest.join(", "), connector, last)
+            }
+        };
+        Ok(LiquidValue::scalar(result))
+    }
+}
+
+// ─── push ───
+#[derive(Clone)]
+struct PushFilterParser;
+impl FilterReflection for PushFilterParser {
+    fn name(&self) -> &str { "push" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { SINGLE_PARAM }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for PushFilterParser {
+    fn parse(&self, mut arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        let item = arguments.positional.next().expect("push requires 1 argument");
+        Ok(Box::new(PushFilter { item }))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct PushFilter { item: Expression }
+impl fmt::Display for PushFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "push") } }
+impl Filter for PushFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        let val = self.item.evaluate(runtime)?;
+        let mut items: Vec<LiquidValue> = if let Some(arr) = input.as_array() {
+            (0..arr.size()).filter_map(|i| arr.get(i)).map(|v| v.to_value()).collect()
+        } else {
+            vec![input.to_value()]
+        };
+        items.push(val.to_value());
+        Ok(LiquidValue::array(items))
+    }
+}
+
+// ─── pop ───
+#[derive(Clone)]
+struct PopFilterParser;
+impl FilterReflection for PopFilterParser {
+    fn name(&self) -> &str { "pop" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { OPT_PARAM }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for PopFilterParser {
+    fn parse(&self, mut arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        let num = arguments.positional.next();
+        Ok(Box::new(PopFilter { num }))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct PopFilter { num: Option<Expression> }
+impl fmt::Display for PopFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "pop") } }
+impl Filter for PopFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        let n = self.num.as_ref()
+            .and_then(|e| e.evaluate(runtime).ok())
+            .and_then(|v| v.as_scalar().and_then(|s| s.to_integer()))
+            .unwrap_or(1) as usize;
+        if let Some(arr) = input.as_array() {
+            let len = arr.size() as usize;
+            let keep = len.saturating_sub(n);
+            let items: Vec<LiquidValue> = (0..keep as i64).filter_map(|i| arr.get(i)).map(|v| v.to_value()).collect();
+            Ok(LiquidValue::array(items))
+        } else {
+            Ok(LiquidValue::array(Vec::<LiquidValue>::new()))
+        }
+    }
+}
+
+// ─── shift ───
+#[derive(Clone)]
+struct ShiftFilterParser;
+impl FilterReflection for ShiftFilterParser {
+    fn name(&self) -> &str { "shift" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { OPT_PARAM }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for ShiftFilterParser {
+    fn parse(&self, mut arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        let num = arguments.positional.next();
+        Ok(Box::new(ShiftFilter { num }))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct ShiftFilter { num: Option<Expression> }
+impl fmt::Display for ShiftFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "shift") } }
+impl Filter for ShiftFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        let n = self.num.as_ref()
+            .and_then(|e| e.evaluate(runtime).ok())
+            .and_then(|v| v.as_scalar().and_then(|s| s.to_integer()))
+            .unwrap_or(1) as usize;
+        if let Some(arr) = input.as_array() {
+            let len = arr.size() as usize;
+            let skip = n.min(len);
+            let items: Vec<LiquidValue> = (skip as i64..arr.size()).filter_map(|i| arr.get(i)).map(|v| v.to_value()).collect();
+            Ok(LiquidValue::array(items))
+        } else {
+            Ok(LiquidValue::array(Vec::<LiquidValue>::new()))
+        }
+    }
+}
+
+// ─── unshift ───
+#[derive(Clone)]
+struct UnshiftFilterParser;
+impl FilterReflection for UnshiftFilterParser {
+    fn name(&self) -> &str { "unshift" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { SINGLE_PARAM }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for UnshiftFilterParser {
+    fn parse(&self, mut arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        let item = arguments.positional.next().expect("unshift requires 1 argument");
+        Ok(Box::new(UnshiftFilter { item }))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct UnshiftFilter { item: Expression }
+impl fmt::Display for UnshiftFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "unshift") } }
+impl Filter for UnshiftFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        let val = self.item.evaluate(runtime)?;
+        let mut items = vec![val.to_value()];
+        if let Some(arr) = input.as_array() {
+            for i in 0..arr.size() {
+                if let Some(v) = arr.get(i) { items.push(v.to_value()); }
+            }
+        }
+        Ok(LiquidValue::array(items))
+    }
+}
+
+// ─── to_integer ───
+#[derive(Clone)]
+struct ToIntegerFilterParser;
+impl FilterReflection for ToIntegerFilterParser {
+    fn name(&self) -> &str { "to_integer" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for ToIntegerFilterParser {
+    fn parse(&self, _arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        Ok(Box::new(ToIntegerFilter))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct ToIntegerFilter;
+impl fmt::Display for ToIntegerFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "to_integer") } }
+impl Filter for ToIntegerFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, _runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        if let Some(s) = input.as_scalar() {
+            if let Some(i) = s.to_integer() { return Ok(LiquidValue::scalar(i)); }
+            if let Some(f) = s.to_float() { return Ok(LiquidValue::scalar(f as i64)); }
+            let str_val = s.to_kstr();
+            if let Ok(i) = str_val.trim().parse::<i64>() { return Ok(LiquidValue::scalar(i)); }
+            if let Ok(f) = str_val.trim().parse::<f64>() { return Ok(LiquidValue::scalar(f as i64)); }
+        }
+        Ok(LiquidValue::scalar(0i64))
+    }
+}
+
+// ─── inspect ───
+#[derive(Clone)]
+struct InspectFilterParser;
+impl FilterReflection for InspectFilterParser {
+    fn name(&self) -> &str { "inspect" }
+    fn description(&self) -> &str { "" }
+    fn positional_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+    fn keyword_parameters(&self) -> &'static [ParameterReflection] { EMPTY_PARAMS }
+}
+impl ParseFilter for InspectFilterParser {
+    fn parse(&self, _arguments: FilterArguments) -> LiquidResult<Box<dyn Filter>> {
+        Ok(Box::new(InspectFilter))
+    }
+    fn reflection(&self) -> &dyn FilterReflection { self }
+}
+#[derive(Debug)]
+struct InspectFilter;
+impl fmt::Display for InspectFilter { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "inspect") } }
+impl Filter for InspectFilter {
+    fn evaluate(&self, input: &dyn liquid::model::ValueView, _runtime: &dyn Runtime) -> LiquidResult<LiquidValue> {
+        let json_val = liquid_value_to_json(input);
+        let inspected = serde_json::to_string(&json_val).unwrap_or_else(|_| "nil".to_string());
+        Ok(LiquidValue::scalar(inspected))
+    }
+}
+
+
 struct RubyFilter {
     name: String,
     positional: Vec<Expression>,
@@ -1680,8 +2601,18 @@ impl Filter for RubyFilter {
 }
 
 fn rust_bridge_module(ruby: &Ruby) -> Result<RModule, Error> {
-    let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
-    jekyll.const_get("Rust")
+    thread_local! {
+        static BRIDGE_MOD: RefCell<Option<RModule>> = RefCell::new(None);
+    }
+    BRIDGE_MOD.with(|cell| {
+        if let Some(m) = *cell.borrow() {
+            return Ok(m);
+        }
+        let jekyll: RModule = ruby.class_object().const_get("Jekyll")?;
+        let m: RModule = jekyll.const_get("Rust")?;
+        *cell.borrow_mut() = Some(m);
+        Ok(m)
+    })
 }
 
 fn fetch_filter_names(_ruby: &Ruby, rust_module: RModule) -> Result<Vec<String>, Error> {
@@ -1886,6 +2817,71 @@ impl LiquidRenderable for RubyTagRenderable {
         } else {
             self.markup.clone()
         };
+        // Fast-path: {% include filename.html %} — render via Rust PartialStore
+        // Only for simple includes (no params, no variable filenames).
+        // Complex includes with params or {{ }} fall through to Ruby.
+        if self.name == "include" {
+            let trimmed = markup_to_send.trim();
+            // Validate include path: Jekyll requires that include paths do not
+            // start with ./ or // or contain .. sequences.
+            if !trimmed.is_empty() {
+                let has_invalid_path = trimmed.starts_with(".")
+                    || trimmed.starts_with("//")
+                    || trimmed.contains("..");
+                if has_invalid_path {
+                    return Err(LiquidError::with_msg(
+                        format!("Invalid syntax for include tag. File contains invalid characters or sequences: '{}'", trimmed)
+                    ));
+                }
+            }
+            let is_simple = !trimmed.contains('=')
+                && !trimmed.contains("{{")
+                && !trimmed.contains(' ');
+            if is_simple && !trimmed.is_empty() {
+                // Access the PartialStore via the current runtime
+                let partial_store = _runtime.partials();
+                match partial_store.get(trimmed) {
+                    Ok(partial) => {
+                        // Render the partial with the current runtime context
+                        // (inherits page, site, and all other variables)
+                        partial.render_to(writer, _runtime)?;
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        // Partial not found — fall through to Ruby for error reporting
+                    }
+                }
+            }
+        }
+        // The markup is the raw path string (already hex-decoded above).
+        if self.name == "link" {
+            let relative_path = markup_to_send.trim();
+            let url = LINK_TABLE.with(|cell| {
+                let table = cell.borrow();
+                if let Some(ref t) = *table {
+                    if let Some(u) = t.get(relative_path) {
+                        return Some(u.clone());
+                    }
+                    // Try with leading slash
+                    let with_slash = format!("/{}", relative_path);
+                    if let Some(u) = t.get(&with_slash) {
+                        return Some(u.clone());
+                    }
+                    // Try without leading slash
+                    let stripped = relative_path.strip_prefix('/').unwrap_or(relative_path);
+                    if let Some(u) = t.get(stripped) {
+                        return Some(u.clone());
+                    }
+                }
+                None
+            });
+            if let Some(u) = url {
+                write!(writer, "{}", u)
+                    .map_err(|e| LiquidError::with_msg(e.to_string()))?;
+                return Ok(());
+            }
+            // Not found in table — fall through to Ruby for error reporting
+        }
         // Special-case our synthetic highlight block: payload is hex-encoded markup and body
         let mut ruby_tag_name = self.name.as_str();
         if self.name == "jekyll_highlight_block" {
@@ -2096,12 +3092,177 @@ fn resolve_excerpt_from_drop(raw: u64) -> SafeValue {
                         strict: false,
                         ruby_drop_raw: None,
                         cached_excerpt: OnceCell::new(),
+                        lazy_cache: RefCell::new(HashMap::new()),
                     };
                 }
             }
         }
     }
     SafeValue::new_nil(false)
+}
+
+/// Lazily resolve a property from a Ruby drop and return it as a SafeValue.
+/// Returns lazy proxies for complex types (drops, hashes, arrays) and only
+/// eagerly converts scalars (strings, numbers, booleans, nil).
+fn resolve_property_from_drop(raw: u64, key: &str, strict: bool) -> SafeValue {
+    let ruby = match ruby_handle() {
+        Ok(r) => r,
+        Err(_) => return SafeValue::new_nil(strict),
+    };
+    // SAFETY: The raw VALUE is still live — reachable from the Ruby payload
+    // hash held on the Ruby stack during render.
+    let drop_val: Value = unsafe {
+        Value::from_raw(raw as _)
+    };
+
+    // Call drop[key] to get the Ruby value
+    let rb_key = ruby.str_new(key);
+    let result: Result<Value, _> = drop_val.funcall("[]", (rb_key.into_value_with(&ruby),));
+    if let Ok(val) = result {
+        if !val.is_nil() {
+            return ruby_value_to_safe_value(&ruby, val, strict);
+        }
+    }
+    SafeValue::new_nil(strict)
+}
+
+/// Convert a Ruby value to a SafeValue, using lazy proxies for complex types.
+/// Scalars are converted eagerly; drops, hashes, and arrays become lazy proxies
+/// that resolve properties on-demand from Ruby.
+fn ruby_value_to_safe_value(ruby: &Ruby, val: Value, strict: bool) -> SafeValue {
+    // Check for nil
+    if val.is_nil() {
+        return SafeValue::new_nil(strict);
+    }
+    
+    // Booleans
+    if val.equal(ruby.qtrue().into_value_with(ruby)).unwrap_or(false) {
+        return SafeValue {
+            inner: SafeValueInner::Scalar(liquid_model::Scalar::new(true)),
+            nil: LiquidValue::Nil, strict, ruby_drop_raw: None,
+            cached_excerpt: OnceCell::new(), lazy_cache: RefCell::new(HashMap::new()),
+        };
+    }
+    if val.equal(ruby.qfalse().into_value_with(ruby)).unwrap_or(false) {
+        return SafeValue {
+            inner: SafeValueInner::Scalar(liquid_model::Scalar::new(false)),
+            nil: LiquidValue::Nil, strict, ruby_drop_raw: None,
+            cached_excerpt: OnceCell::new(), lazy_cache: RefCell::new(HashMap::new()),
+        };
+    }
+    
+    // Integers
+    if val.is_kind_of(ruby.class_integer()) {
+        if let Ok(i) = i64::try_convert(val) {
+            return SafeValue {
+                inner: SafeValueInner::Scalar(liquid_model::Scalar::new(i)),
+                nil: LiquidValue::Nil, strict, ruby_drop_raw: None,
+                cached_excerpt: OnceCell::new(), lazy_cache: RefCell::new(HashMap::new()),
+            };
+        }
+    }
+    
+    // Floats
+    if val.is_kind_of(ruby.class_float()) {
+        if let Ok(f) = f64::try_convert(val) {
+            return SafeValue {
+                inner: SafeValueInner::Scalar(liquid_model::Scalar::new(f)),
+                nil: LiquidValue::Nil, strict, ruby_drop_raw: None,
+                cached_excerpt: OnceCell::new(), lazy_cache: RefCell::new(HashMap::new()),
+            };
+        }
+    }
+    
+    // Strings and symbols → eagerly convert (they're cheap)
+    if let Some(s) = RString::from_value(val) {
+        if let Ok(st) = s.to_string() {
+            return SafeValue {
+                inner: SafeValueInner::Scalar(liquid_model::Scalar::new(st)),
+                nil: LiquidValue::Nil, strict, ruby_drop_raw: None,
+                cached_excerpt: OnceCell::new(), lazy_cache: RefCell::new(HashMap::new()),
+            };
+        }
+    }
+    if let Some(sym) = Symbol::from_value(val) {
+        if let Ok(name) = sym.name() {
+            return SafeValue {
+                inner: SafeValueInner::Scalar(liquid_model::Scalar::new(name.to_string())),
+                nil: LiquidValue::Nil, strict, ruby_drop_raw: None,
+                cached_excerpt: OnceCell::new(), lazy_cache: RefCell::new(HashMap::new()),
+            };
+        }
+    }
+    
+    // Arrays → create a SafeValue array where each element is a lazy proxy
+    if let Some(arr) = RArray::from_value(val) {
+        let mut elements = Vec::with_capacity(arr.len());
+        for entry in arr.each() {
+            if let Ok(elem) = entry {
+                elements.push(ruby_value_to_safe_value(ruby, elem, strict));
+            }
+        }
+        return SafeValue {
+            inner: SafeValueInner::Array(elements),
+            nil: LiquidValue::Nil, strict, ruby_drop_raw: None,
+            cached_excerpt: OnceCell::new(), lazy_cache: RefCell::new(HashMap::new()),
+        };
+    }
+    
+    // Drops (respond_to to_liquid or content_methods) → lazy proxy
+    if val.respond_to("to_liquid", false).unwrap_or(false) {
+        let liquidified = val.funcall::<_, _, Value>("to_liquid", ()).unwrap_or(val);
+        // If to_liquid returned a different object, try to convert it
+        if !liquidified.equal(val).unwrap_or(true) {
+            return ruby_value_to_safe_value(ruby, liquidified, strict);
+        }
+    }
+    
+    // Check if it's a Drop-like object (has content_methods or keys)
+    let is_drop_like = val.respond_to("content_methods", false).unwrap_or(false)
+        || (val.respond_to("[]", false).unwrap_or(false) 
+            && val.respond_to("keys", false).unwrap_or(false));
+    
+    if is_drop_like {
+        let raw_ptr = val.as_raw() as u64;
+        let placeholder = HashMap::new();
+        return SafeValue {
+            inner: SafeValueInner::Object(placeholder),
+            nil: LiquidValue::Nil, strict,
+            ruby_drop_raw: Some(raw_ptr),
+            cached_excerpt: OnceCell::new(), lazy_cache: RefCell::new(HashMap::new()),
+        };
+    }
+    
+    // Hashes → eagerly convert keys but lazily resolve values
+    if let Some(hash) = RHash::from_value(val) {
+        let mut map = HashMap::new();
+        // We need to iterate the hash to get keys, but values become lazy proxies
+        hash.foreach(|k: Value, v: Value| {
+            if let Ok(key_str) = String::try_convert(k.funcall::<_, _, Value>("to_s", ()).unwrap_or(k)) {
+                let sv = ruby_value_to_safe_value(ruby, v, strict);
+                map.insert(KString::from_string(key_str), sv);
+            }
+            Ok(magnus::r_hash::ForEach::Continue)
+        }).ok();
+        return SafeValue {
+            inner: SafeValueInner::Object(map),
+            nil: LiquidValue::Nil, strict, ruby_drop_raw: None,
+            cached_excerpt: OnceCell::new(), lazy_cache: RefCell::new(HashMap::new()),
+        };
+    }
+    
+    // Fallback: convert to string
+    if let Ok(s) = val.funcall::<_, _, RString>("to_s", ()) {
+        if let Ok(st) = s.to_string() {
+            return SafeValue {
+                inner: SafeValueInner::Scalar(liquid_model::Scalar::new(st)),
+                nil: LiquidValue::Nil, strict, ruby_drop_raw: None,
+                cached_excerpt: OnceCell::new(), lazy_cache: RefCell::new(HashMap::new()),
+            };
+        }
+    }
+    
+    SafeValue::new_nil(strict)
 }
 
 pub fn render_template(
@@ -2112,58 +3273,101 @@ pub fn render_template(
 ) -> Result<String, Error> {
     let ruby = ruby_handle()?;
     let rust_module = rust_bridge_module(&ruby)?;
-    let filter_names = fetch_filter_names(&ruby, rust_module)?;
     let context_value = prepare_filter_context(&ruby, rust_module, payload, info)?;
 
-    let mut builder = ParserBuilder::with_stdlib();
-    for name in &filter_names {
-        builder = builder.filter(RubyFilterParser::new(name.clone()));
-    }
-    // Register native Jekyll filters implemented via Rust fast paths
-    builder = builder
-        .filter(MapFilterParser)
-        .filter(JoinFilterParser)
-        .filter(WhereFilterParser)
-        .filter(WhereExpFilterParser)
-        .filter(SortFilterParser)
-        .filter(GroupByFilterParser)
-        .filter(FindFilterParser)
-        .filter(AbsoluteUrlFilterParser)
-        .filter(RelativeUrlFilterParser)
-        .filter(StripIndexFilterParser)
-        .filter(UniqFilterParser)
-        .filter(CompactFilterParser);
-    let (mut tag_names, mut block_names) = fetch_tag_kinds(&ruby, rust_module)?;
-    // Ensure core Jekyll blocks are recognized even if not present in Liquid::Template.tags yet
-    if !block_names.iter().any(|n| n.eq_ignore_ascii_case("highlight")) {
-        block_names.push("highlight".to_string());
-    }
-    for name in tag_names.drain(..) {
-        // Avoid bridging stdlib tags that mutate runtime (e.g., 'assign')
-        if name.eq_ignore_ascii_case("assign") {
-            continue;
+    // Get or build the parser (cached for the entire build cycle)
+    let parser: Rc<liquid::Parser> = PARSER_CACHE.with(|cell| -> Result<Rc<liquid::Parser>, Error> {
+        if let Some(ref cached) = *cell.borrow() {
+            return Ok(Rc::clone(cached));
         }
-        builder = builder.tag(RubyTagParser::new(name));
-    }
-    // Register synthetic helper tags used by the preprocessor
-    builder = builder.tag(RubyTagParser::new("jekyll_highlight_block".to_string()));
-    let stdlib_blocks = [
-        "raw",
-        "if",
-        "unless",
-        "ifchanged",
-        "for",
-        "tablerow",
-        "comment",
-        "capture",
-        "case",
-    ];
-    for name in block_names.drain(..) {
-        if stdlib_blocks.iter().any(|s| s.eq_ignore_ascii_case(&name)) {
-            continue;
+        // Build parser on first call
+        let filter_names = fetch_filter_names(&ruby, rust_module)?;
+
+        // Fetch include directories from the site for native include resolution.
+        // This is called once and the parser (with its LazyCompiler) is cached.
+        let (include_dirs, site_safe) = fetch_include_config(&ruby, rust_module, info)?;
+        let include_source = JekyllIncludeSource {
+            include_dirs,
+            safe: site_safe,
+        };
+        let partials = LazyCompiler::new(include_source);
+
+        let mut builder = ParserBuilder::with_stdlib()
+            .partials(partials);
+        for name in &filter_names {
+            builder = builder.filter(RubyFilterParser::new(name.clone()));
         }
-        builder = builder.block(RubyBlockParser::new(name));
-    }
+        // Register native Jekyll filters implemented via Rust fast paths
+        builder = builder
+            .filter(MapFilterParser)
+            .filter(JoinFilterParser)
+            .filter(WhereFilterParser)
+            .filter(WhereExpFilterParser)
+            .filter(SortFilterParser)
+            .filter(GroupByFilterParser)
+            .filter(FindFilterParser)
+            .filter(AbsoluteUrlFilterParser)
+            .filter(RelativeUrlFilterParser)
+            .filter(StripIndexFilterParser)
+            .filter(UniqFilterParser)
+            .filter(CompactFilterParser)
+            // New native Rust filters
+            .filter(XmlEscapeFilterParser)
+            .filter(CgiEscapeFilterParser)
+            .filter(UriEscapeFilterParser)
+            .filter(NormalizeWhitespaceFilterParser)
+            .filter(NumberOfWordsFilterParser)
+            .filter(JsonifyFilterParser)
+            .filter(ArrayToSentenceStringFilterParser)
+            .filter(PushFilterParser)
+            .filter(PopFilterParser)
+            .filter(ShiftFilterParser)
+            .filter(UnshiftFilterParser)
+            .filter(ToIntegerFilterParser)
+            .filter(InspectFilterParser)
+            // Native markdownify using comrak (avoids FFI to Ruby Kramdown)
+            .filter(MarkdownifyFilterParser);
+        let (mut tag_names, mut block_names) = fetch_tag_kinds(&ruby, rust_module)?;
+        // Ensure core Jekyll blocks are recognized even if not present in Liquid::Template.tags yet
+        if !block_names.iter().any(|n| n.eq_ignore_ascii_case("highlight")) {
+            block_names.push("highlight".to_string());
+        }
+        for name in tag_names.drain(..) {
+            // Avoid bridging stdlib tags that mutate runtime (e.g., 'assign')
+            if name.eq_ignore_ascii_case("assign") {
+                continue;
+            }
+            builder = builder.tag(RubyTagParser::new(name));
+        }
+        // Register synthetic helper tags used by the preprocessor
+        builder = builder.tag(RubyTagParser::new("jekyll_highlight_block".to_string()));
+        let stdlib_blocks = [
+            "raw",
+            "if",
+            "unless",
+            "ifchanged",
+            "for",
+            "tablerow",
+            "comment",
+            "capture",
+            "case",
+        ];
+        for name in block_names.drain(..) {
+            if stdlib_blocks.iter().any(|s| s.eq_ignore_ascii_case(&name)) {
+                continue;
+            }
+            builder = builder.block(RubyBlockParser::new(name));
+        }
+        let parser = builder
+            .build()
+            .map_err(|err| Error::new(ruby.exception_runtime_error(), err.to_string()))?;
+        let rc = Rc::new(parser);
+        *cell.borrow_mut() = Some(Rc::clone(&rc));
+        Ok(rc)
+    })?;
+
+    // Build the link lookup table (one-time, cached) for native {% link %} tags
+    get_link_table(&ruby, rust_module, info)?;
 
     // Determine strictness to configure SafeValue behavior
     let strict_variables = if let Some(hash) = RHash::from_value(info) {
@@ -2178,24 +3382,160 @@ pub fn render_template(
 
     // Build LiquidValue globals from Ruby, then wrap in SafeValue for unknown key behavior.
     // Excerpt keys are skipped during convert_drop and resolved lazily by SafeValue.
-    let t0 = std::time::Instant::now();
+    //
+    // PERFORMANCE OPTIMIZATION: The payload is a UnifiedPayloadDrop with:
+    //   - Immutable keys (same across all renders): site, jekyll, theme, 
+    //     highlighter_prefix, highlighter_suffix
+    //   - Mutable keys (change per document): page, content, layout, paginator
+    // We cache the expensive immutable parts as an Rc<SafeValue> and use a
+    // LayeredGlobals view that combines the cached base with a per-render overlay.
+    // This eliminates the O(N) deep clone of the site data on every render.
     let mut converter = LiquidValueConverter::new(&ruby)?;
-    let globals_value = converter.convert(payload)?;
-    let convert_ms = t0.elapsed().as_millis();
-    if convert_ms > 50 {
-        let cache_size = CONVERT_CACHE.with(|c| c.borrow().len());
-        eprintln!("[PERF] payload convert: {}ms (cache size: {})", convert_ms, cache_size);
-    }
-    let globals_object = match globals_value {
-        LiquidValue::Object(obj) => obj,
-        other => {
-            let mut object = liquid_model::Object::new();
-            object.insert("page".into(), other);
-            object
+    
+    // We need to determine if we can use the layered approach
+    let use_layered = payload.respond_to("site", false)?;
+    
+    let layered_globals: Option<LayeredGlobals>;
+    let simple_root: Option<SafeValue>;
+    
+    if use_layered {
+        // Payload is a Drop (UnifiedPayloadDrop) — use zero-copy layered caching
+        let site_val: Value = payload.funcall::<_, _, Value>("site", ())?;
+        let site_id: i64 = i64::try_convert(site_val.funcall::<_, _, Value>("object_id", ())?).unwrap_or(0);
+        
+        let static_keys = ["site", "jekyll", "theme", "highlighter_prefix", "highlighter_suffix"];
+        let dynamic_keys = ["page", "content", "layout", "paginator"];
+        
+        // Get or build cached base (expensive site-level data)
+        let base: Rc<SafeValue> = {
+            let cached = PAYLOAD_SITE_CACHE.with(|cell| {
+                let borrow = cell.borrow();
+                if let Some((cached_id, ref rc_sv)) = *borrow {
+                    if cached_id == site_id {
+                        return Some(Rc::clone(rc_sv));
+                    }
+                }
+                None
+            });
+            
+            if let Some(rc) = cached {
+                rc
+            } else {
+                let mut obj = liquid_model::Object::new();
+                for key in static_keys {
+                    if payload.respond_to(key, false).unwrap_or(false) {
+                        let val: Value = payload.funcall::<_, _, Value>(key, ())?;
+                        if !val.is_nil() {
+                            // Eagerly convert via LiquidValueConverter.
+                            // convert_drop already skips heavy properties (content, output,
+                            // next, previous, excerpt) and CONVERT_CACHE deduplicates
+                            // DocumentDrops by object_id, so this is efficient.
+                            let converted = converter.convert(val)?;
+                            obj.insert(KString::from_ref(key), converted);
+                        }
+                    }
+                }
+                let sv = SafeValue::wrap_with_strict(LiquidValue::Object(obj), strict_variables);
+                let rc = Rc::new(sv);
+                PAYLOAD_SITE_CACHE.with(|cell| {
+                    *cell.borrow_mut() = Some((site_id, Rc::clone(&rc)));
+                });
+                // Keep CONVERT_CACHE alive — document drops cached during site
+                // payload build will be reused when each page is rendered,
+                // avoiding redundant FFI calls. The cache is only cleared at
+                // the start of render_site via clear_liquid_cache().
+                rc
+            }
+        };
+        
+        // Invalidate `related_posts` in the cached site base. This property
+        // depends on @current_document which changes per render, so any
+        // lazily-resolved value from a previous render would be stale.
+        if let SafeValueInner::Object(ref map) = base.inner {
+            if let Some(site_sv) = map.get("site") {
+                site_sv.lazy_cache.borrow_mut().remove("related_posts");
+            }
         }
+        
+        // Build lightweight overlay with per-document data.
+        // Page drops are eagerly converted, but convert_drop skips heavy/cascading
+        // properties (content, output, next, previous, excerpt), keeping this fast.
+        // Skipped properties are lazily resolved via ruby_drop_raw if accessed.
+        let mut overlay_obj = liquid_model::Object::new();
+        for key in dynamic_keys {
+            // UnifiedPayloadDrop always has page/content/layout/paginator — skip respond_to
+            let val: Value = payload.funcall::<_, _, Value>(key, ())?;
+            if val.is_nil() {
+                continue;
+            }
+            let converted = converter.convert(val)?;
+            overlay_obj.insert(KString::from_ref(key), converted);
+        }
+        
+        // Pick up any fallback_data keys not already in overlay or base.
+        // Cache the set of extra key names from the first render so subsequent
+        // renders avoid the full keys() iteration (typically 0 extra keys).
+        let extra_keys: Vec<String> = FALLBACK_KEYS_CACHE.with(|cell| -> Result<Vec<String>, Error> {
+            if let Some(ref cached) = *cell.borrow() {
+                return Ok(cached.clone());
+            }
+            let mut extras = Vec::new();
+            if payload.respond_to("keys", false).unwrap_or(false) {
+                let keys_val: Value = payload.funcall::<_, _, Value>("keys", ())?;
+                if let Some(keys_arr) = RArray::from_value(keys_val) {
+                    let all_known: HashSet<&str> = static_keys.iter().chain(dynamic_keys.iter()).copied().collect();
+                    for entry in keys_arr.each() {
+                        let key_val = entry?;
+                        let key_str = String::try_convert(key_val.funcall::<_, _, Value>("to_s", ())?)?;
+                        if !all_known.contains(key_str.as_str()) {
+                            extras.push(key_str);
+                        }
+                    }
+                }
+            }
+            *cell.borrow_mut() = Some(extras.clone());
+            Ok(extras)
+        })?;
+        for key_str in &extra_keys {
+            let key_kstr = KString::from_ref(key_str.as_str());
+            if !overlay_obj.contains_key(&key_kstr) {
+                let in_base = if let SafeValueInner::Object(ref bm) = base.inner {
+                    bm.contains_key(&key_kstr)
+                } else { false };
+                if !in_base {
+                    let key_sym = ruby.str_new(key_str.as_str()).into_value_with(&ruby);
+                    let val: Value = payload.funcall::<_, _, Value>("[]", (key_sym,))?;
+                    if !val.is_nil() {
+                        let converted = converter.convert(val)?;
+                        overlay_obj.insert(key_str.clone().into(), converted);
+                    }
+                }
+            }
+        }
+        
+        let overlay = SafeValue::wrap_with_strict(LiquidValue::Object(overlay_obj), strict_variables);
+        layered_globals = Some(LayeredGlobals { overlay, base });
+        simple_root = None;
+    } else {
+        // Payload is a plain hash — convert normally (fallback)
+        let globals_value = converter.convert(payload)?;
+        let globals_object = match globals_value {
+            LiquidValue::Object(obj) => obj,
+            other => {
+                let mut object = liquid_model::Object::new();
+                object.insert("page".into(), other);
+                object
+            }
+        };
+        simple_root = Some(SafeValue::wrap_with_strict(LiquidValue::Object(globals_object), strict_variables));
+        layered_globals = None;
     };
 
-    let safe_root = SafeValue::wrap_with_strict(LiquidValue::Object(globals_object), strict_variables);
+    let render_root: &dyn liquid_core::model::ObjectView = if let Some(ref lg) = layered_globals {
+        lg
+    } else {
+        simple_root.as_ref().unwrap()
+    };
 
     let previous = RUBY_FILTER_CONTEXT.with(|cell| {
         let mut slot = cell.borrow_mut();
@@ -2206,7 +3546,7 @@ pub fn render_template(
 
     // Preprocess certain tags to preserve raw markup that Liquid's Rust grammar can't express.
     let content = preprocess_raw_tag_markup(content);
-    let cache_key = template_cache_key_for(&ruby, &content, &filter_names, path.clone())?;
+    let cache_key = template_cache_key_for(&ruby, &content, &[], path.clone())?;
     // Look up or parse+cache the template while holding the borrow, but
     // release the borrow before rendering so that nested render_template calls
     // (e.g. lazy excerpt resolution) don't panic on a re-entrant borrow.
@@ -2217,9 +3557,6 @@ pub fn render_template(
         }
         drop(cache);
 
-        let parser = builder
-            .build()
-            .map_err(|err| Error::new(ruby.exception_runtime_error(), err.to_string()))?;
         let tpl = parser
             .parse(&content)
             .map_err(|err| Error::new(ruby.exception_runtime_error(), err.to_string()))?;
@@ -2238,7 +3575,7 @@ pub fn render_template(
     })?;
 
     let template_render = template
-        .render(&safe_root)
+        .render(render_root)
         .map_err(|err| Error::new(ruby.exception_runtime_error(), err.to_string()))?;
 
     let result = Ok(template_render);
@@ -2265,17 +3602,40 @@ fn template_cache_key_for(
     filters: &[String],
     path: Option<Value>,
 ) -> Result<u64, Error> {
+    thread_local! {
+        static FILE_CLASS: RefCell<Option<Value>> = RefCell::new(None);
+        static MTIME_CACHE: RefCell<HashMap<String, i64>> = RefCell::new(HashMap::new());
+    }
     if let Some(p) = path {
-        // Key: path + integer mtime + filters; fall back to content if mtime fails.
-        let file: Value = ruby.class_object().const_get("File")?;
-        let path_s: RString = p.funcall("to_s", ())?;
+        let path_str = String::try_convert(p.funcall::<_, _, Value>("to_s", ())?)?;
+        // Check mtime cache first
+        if let Some(mtime_int) = MTIME_CACHE.with(|c| c.borrow().get(&path_str).copied()) {
+            let mut hasher = DefaultHasher::new();
+            path_str.hash(&mut hasher);
+            mtime_int.hash(&mut hasher);
+            for f in filters {
+                f.hash(&mut hasher);
+            }
+            return Ok(hasher.finish());
+        }
+        // Cache miss — do FFI
+        let file = FILE_CLASS.with(|cell| -> Result<Value, Error> {
+            if let Some(v) = *cell.borrow() {
+                return Ok(v);
+            }
+            let v: Value = ruby.class_object().const_get("File")?;
+            *cell.borrow_mut() = Some(v);
+            Ok(v)
+        })?;
+        let path_s = ruby.str_new(&path_str);
         let exists: Value = file.funcall("exist?", (path_s.clone(),))?;
         if exists.to_bool() {
             let mtime: Value = file.funcall("mtime", (path_s.clone(),))?;
             let mtime_i: Value = mtime.funcall("to_i", ())?;
             let mtime_int = i64::try_convert(mtime_i)?;
+            MTIME_CACHE.with(|c| c.borrow_mut().insert(path_str.clone(), mtime_int));
             let mut hasher = DefaultHasher::new();
-            path_s.to_string()?.hash(&mut hasher);
+            path_str.hash(&mut hasher);
             mtime_int.hash(&mut hasher);
             for f in filters {
                 f.hash(&mut hasher);

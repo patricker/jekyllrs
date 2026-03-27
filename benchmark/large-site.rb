@@ -209,7 +209,7 @@ def run_benchmark
     puts "Generating #{NUM_POSTS} posts, #{NUM_PAGES} pages, #{NUM_COLLECTION} collection items..."
     generate_site(dir)
 
-    engine = ENV["JEKYLL_RUST_LIB"] ? "Rust" : "Ruby"
+    engine = File.exist?(File.expand_path("../lib/jekyll_core.so", __dir__)) ? "Rust" : "Ruby"
     puts "Engine: #{engine}"
     puts "Building site..."
 

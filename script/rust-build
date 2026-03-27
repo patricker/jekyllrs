@@ -1,89 +1,34 @@
 #!/usr/bin/env bash
+# Build the Rust Jekyll core extension and install it where Ruby can find it.
+#
+# Usage:
+#   script/rust-build          # release build (default)
+#   script/rust-build debug    # debug build (faster compile, slower runtime)
+#
 set -euo pipefail
 
-REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-PROFILE=${RUST_PROFILE:-debug}
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+RUST_DIR="$PROJECT_ROOT/rust"
+LIB_DST="$PROJECT_ROOT/lib/jekyll_core.so"
 
-# Try to embed Ruby's libdir as an rpath so `jekyllrs` can find libruby at runtime
-RUBY_LIBDIR=""
-if command -v ruby >/dev/null 2>&1; then
-  RUBY_LIBDIR=$(ruby -rrbconfig -e 'print RbConfig::CONFIG["libdir"]' 2>/dev/null || true)
-fi
+PROFILE="${1:-release}"
 
-if [[ -n "${RUBY_LIBDIR}" && -d "${RUBY_LIBDIR}" ]]; then
-  # Use an rpath to Ruby's libdir; keep any existing RUSTFLAGS
-  export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-rpath,${RUBY_LIBDIR}"
-  echo "Embedding rpath to Ruby libdir: ${RUBY_LIBDIR}"
+if [ "$PROFILE" = "debug" ]; then
+    echo "Building Rust extension (debug)..."
+    (cd "$RUST_DIR" && cargo build 2>&1)
+    LIB_SRC="$RUST_DIR/target/debug/libjekyll_core.so"
 else
-  echo "note: could not resolve Ruby libdir for rpath; falling back to default linker search path" >&2
+    echo "Building Rust extension (release)..."
+    (cd "$RUST_DIR" && cargo build --release 2>&1)
+    LIB_SRC="$RUST_DIR/target/release/libjekyll_core.so"
 fi
 
-pushd "$REPO_ROOT/rust" > /dev/null
-
-BUILD_ARGS=(build --offline)
-if [[ "$PROFILE" == "release" ]]; then
-  BUILD_ARGS+=(--release)
-  cargo "${BUILD_ARGS[@]}"
-  PROFILE_DIR=release
-else
-  cargo "${BUILD_ARGS[@]}"
-  PROFILE_DIR=debug
-fi
-popd > /dev/null
-
-HOST_TRIPLE=$(rustc -vV | sed -n 's/^host: //p')
-DEFAULT_EXT=".so"
-if [[ "$HOST_TRIPLE" == *"windows"* ]]; then
-  DEFAULT_EXT=".dll"
-elif [[ "$HOST_TRIPLE" == *"apple-darwin"* ]]; then
-  DEFAULT_EXT=".dylib"
+if [ ! -f "$LIB_SRC" ]; then
+    echo "ERROR: Build failed — $LIB_SRC not found"
+    exit 1
 fi
 
-EXTS=()
-EXTS+=("$DEFAULT_EXT")
-for extra in ".so" ".dylib" ".dll"; do
-  add=true
-  for existing in "${EXTS[@]}"; do
-    if [[ "$existing" == "$extra" ]]; then
-      add=false
-      break
-    fi
-  done
-  if $add; then
-    EXTS+=("$extra")
-  fi
-done
-
-LIB_PATH=""
-for base in "libjekyll_core" "jekyll_core"; do
-  for ext in "${EXTS[@]}"; do
-    candidate="$REPO_ROOT/rust/target/$PROFILE_DIR/${base}${ext}"
-    if [[ -f "$candidate" ]]; then
-      LIB_PATH="$candidate"
-      break 2
-    fi
-  done
-done
-
-if [[ -z "$LIB_PATH" ]]; then
-  echo "error: could not find built jekyll_core cdylib under rust/target/$PROFILE_DIR" >&2
-  exit 1
-fi
-
-echo "Rust build complete. Export this before running Ruby tests:"
-echo "  export JEKYLL_RUST_LIB=$LIB_PATH"
-
-DLEXT=""
-if command -v ruby >/dev/null 2>&1; then
-  DLEXT=$(ruby -rrbconfig -e 'print RbConfig::CONFIG["DLEXT"]' 2>/dev/null || true)
-fi
-
-if [[ -n "$DLEXT" ]]; then
-  DEST_DIR="$REPO_ROOT/lib"
-  mkdir -p "$DEST_DIR"
-  DEST_PATH="$DEST_DIR/jekyll_core.$DLEXT"
-  cp "$LIB_PATH" "$DEST_PATH"
-  echo "Copied native library to $DEST_PATH for require 'jekyll_core'"
-else
-  echo "note: unable to determine Ruby DLEXT; skipping copy into lib/" >&2
-fi
+cp "$LIB_SRC" "$LIB_DST"
+SRC_SIZE=$(stat -c%s "$LIB_SRC" 2>/dev/null || stat -f%z "$LIB_SRC")
+echo "Installed $(( SRC_SIZE / 1024 ))KB → lib/jekyll_core.so"
